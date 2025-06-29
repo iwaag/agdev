@@ -7,6 +7,9 @@ ingress:
   enabled: true
   hosts:
     - host: planka.example.dev
+      className: nginx  # Modern way
+      annotations:
+        kubernetes.io/ingress.class: nginx  # Legacy way for compatibility
       paths:
         - path: /
           pathType: ImplementationSpecific
@@ -15,3 +18,8 @@ ingress:
     - secretName: planka-tls # existing TLS secret in k8s
       hosts:
         - planka.example.dev
+postgresql:
+  auth:
+    username: planka
+    password: "planka"
+    database: planka
