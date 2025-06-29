@@ -1,0 +1,49 @@
+image:
+  repository: fluent/fluent-bit
+  tag: 3.0.0 # Always use a specific, stable tag
+  pullPolicy: IfNotPresent
+rbac:
+  create: true
+  serviceAccountName: fluent-bit
+kind: Deployment
+fluentbit:
+  config: |
+    [SERVICE]
+        Log_Level info
+        Daemon Off
+
+    [INPUT]
+        Name   http
+        Listen 0.0.0.0
+        Port   8888
+        Tag    http.log
+
+    [OUTPUT]
+        Name         http
+        Match        *
+        Host         ${EVENT_HUB_HOST}
+        Format       json
+        Json_Date_Key date
+        Json_Date_Format iso8601
+
+    [OUTPUT]
+        Name         stdout
+        Match        *
+        Format       json_lines
+
+  # # Volumes required to access host logs
+  # volumes:
+  #   - name: varlog
+  #     hostPath:
+  #       path: /var/log
+  #   - name: varlibdockercontainers
+  #     hostPath:
+  #       path: /var/lib/docker/containers
+
+  # # Volume mounts for the Fluent Bit container
+  # volumeMounts:
+  #   - name: varlog
+  #     mountPath: /var/log
+  #   - name: varlibdockercontainers
+  #     mountPath: /var/lib/docker/containers
+  #     readOnly: true
