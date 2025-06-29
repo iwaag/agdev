@@ -1,0 +1,22 @@
+# Core FastAPI dependencies
+fastapi
+uvicorn
+python-multipart
+
+# Async file operations
+aiofiles
+fsspec
+s3fs
+gcsfs
+paramiko
+
+# Cloud storage backends
+aiobotocore
+google-cloud-storage
+
+# Additional useful packages
+pydantic-settings
+python-dotenv
+
+# Database
+aiosqlite
