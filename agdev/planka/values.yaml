@@ -1,0 +1,17 @@
+admin_email: "demo@demo.demo" # Do not remove if you want to prevent this user from being edited/deleted
+admin_password: "demo"
+admin_name: "Demo Demo"
+admin_username: "demo"
+
+ingress:
+  enabled: true
+  hosts:
+    - host: planka.example.dev
+      paths:
+        - path: /
+          pathType: ImplementationSpecific
+
+  tls:
+    - secretName: planka-tls # existing TLS secret in k8s
+      hosts:
+        - planka.example.dev

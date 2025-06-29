@@ -1,0 +1,13 @@
+repositories:
+  - name: bitnami
+    url: https://charts.bitnami.com/bitnami
+  - name: planka
+    url: https://plankanban.github.io/planka
+
+releases:
+  - name: planka
+    chart: planka/planka
+    version: 1.0.3
+    values:
+      - values/planka/values.yaml      # Regular config
+      - values/planka/secrets.yaml     # Sensitive values
