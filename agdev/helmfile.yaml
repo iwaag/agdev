@@ -9,5 +9,5 @@ releases:
     chart: planka/planka
     version: 1.0.3
     values:
-      - values/planka/values.yaml      # Regular config
-      - values/planka/secrets.yaml     # Sensitive values
+      - planka/values.yaml      # Regular config
+      - planka/secret.yaml     # Sensitive values
