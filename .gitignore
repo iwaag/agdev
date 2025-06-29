@@ -1,0 +1,42 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# C extensions
+*.so
+
+# Distribution / packaging
+.Python
+env/
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+share/
+pip-log.txt
+pip-download-cache/
+*.egg-info/
+*.egg
+# IDE-specific files
+.idea/
+.vscode/
+*.swp
+*~
+#standard git ignore for next.js projects
+# dependencies
+/node_modules
+# next.js
+/.next/
+/out/
+#Misc
+.DS_Store
+secret.yaml
