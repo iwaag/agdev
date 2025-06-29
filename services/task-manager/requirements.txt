@@ -1,0 +1,5 @@
+fastAPI
+uvicorn
+lmstudio
+python-multipart
+openai
