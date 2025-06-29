@@ -3,6 +3,8 @@ repositories:
     url: https://charts.bitnami.com/bitnami
   - name: planka
     url: https://plankanban.github.io/planka
+  - name: ingress-nginx
+    url: https://kubernetes.github.io/ingress-nginx
 
 releases:
   - name: planka
@@ -11,3 +13,9 @@ releases:
     values:
       - planka/values.yaml      # Regular config
       - planka/secret.yaml     # Sensitive values
+  - name: ingress-nginx
+    chart: ingress-nginx/ingress-nginx
+    version: 4.0.6
+    # values:
+      # - ingress-nginx/values.yaml # Regular config
+      # - ingress-nginx/secret.yaml  # Sensitive values
