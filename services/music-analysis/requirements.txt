@@ -1,6 +1,0 @@
-fastAPI
-uvicorn
-python-multipart
-librosa
-torch
-soundfile
