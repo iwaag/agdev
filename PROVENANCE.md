@@ -34,3 +34,7 @@ time from GitHub.
 
 Projects an installation develops (warden, ponderer, aghangout, …) are separate repositories with
 their own development; they are summoned from a summonplan, not part of this tree.
+
+The core refers to one project by URL and exact commit, not by content: the summoner, in
+`install/bootstrap/summonplan.yaml` (`https://github.com/iwaag/pj-summoner`). It is fetched when an
+installation runs `agdevctl bootstrap-projects` without a plan of its own.

@@ -11,7 +11,7 @@
 #   scripts/wfe-release.sh deploy   <area> [<commit>]  build, then activate
 #   scripts/wfe-release.sh status   <area>             current release, service and launcher
 #
-# <area> is the operating area (pj-agdev/.local/agdev): its registry.json is the
+# <area> is the operating area (an installation's data/area): its registry.json is the
 # catalog, and it holds the installed system code beside the workspaces:
 #
 #   <area>/service/releases/<core commit>/   workflow_editor/ at that commit, built, RELEASE.json;

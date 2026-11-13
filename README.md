@@ -31,12 +31,17 @@ has them, live elsewhere.
 2. Install it from your own inputs: copy `install/instance.example.toml` and follow
    [docs/install.md](docs/install.md). [Transfer to a new owner](docs/transfer.md) and
    [adopting an existing installation's state](docs/migration.md) are separate guides.
-3. Summon projects from a summonplan, typically from a mind repository such as
-   [iwaag/agdev-mind](https://github.com/iwaag/agdev-mind) (its `catalog.yaml` lists warden,
-   ponderer and aghangout, public at `iwaag/pj-warden`, `iwaag/pj-ponderer`, `iwaag/pj-aghangout`):
-   `agdevctl bootstrap-projects --plan <summonplan>`
-   ([workflow_editor/docs/summon.md](workflow_editor/docs/summon.md),
-   [workflow_editor/docs/mind.md](workflow_editor/docs/mind.md)).
+3. Receive the summoner: `agdevctl bootstrap-projects`. With no plan yet, it applies the core's
+   one reference, `install/bootstrap/summonplan.yaml`: the summoner
+   ([iwaag/pj-summoner](https://github.com/iwaag/pj-summoner)) at an exact commit.
+4. Say what you want: write a braindump (for example "reproduce iwaag's development style and
+   start developing") and request `summoner/propose` with it. It reads catalogs of shared projects
+   such as [iwaag/agdev-mind](https://github.com/iwaag/agdev-mind) (warden, ponderer and
+   aghangout, public at `iwaag/pj-warden`, `iwaag/pj-ponderer`, `iwaag/pj-aghangout`), proposes a
+   summonplan with its reasons, asks you, and applies it once you agree
+   ([docs/install.md](docs/install.md), [workflow_editor/docs/summon.md](workflow_editor/docs/summon.md),
+   [workflow_editor/docs/mind.md](workflow_editor/docs/mind.md)). A plan of your own works too:
+   `agdevctl bootstrap-projects --plan <summonplan>`.
 
 ## What has been tried
 
@@ -47,7 +52,7 @@ reproductions. Measurements and what is not covered: [docs/install.md](docs/inst
 
 ## Notes for a reader
 
-- Some documents cite development episode labels (for example `cluster_teamwork p5`); that
+- Some documents cite development episode labels (for example `summoner p2`); that
   development history is not published.
 - `agent/` holds the guides the core's own agents use; they describe a development setup of one
   main installation with children, which is one way to run it.

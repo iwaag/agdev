@@ -4,7 +4,7 @@
 installation's operations use: what each one is, which account it authenticates as and where, why it exists,
 who is responsible for it, which operations use it, where it is stored, and what happened when it was last
 checked and used. It answers "which credential does this operation use, as whom, and is it still good?"
-without searching folders for secrets (improve_multinodes p5).
+without searching folders for secrets.
 
 ## What is kept where
 

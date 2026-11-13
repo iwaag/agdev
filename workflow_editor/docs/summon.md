@@ -182,6 +182,17 @@ repository, `wfe mind plan put` and `plan use` for the file, the dry run, then
 `roles.json` with a restart. Without `--plan` it applies the plan the mind
 repository names, and continues an interrupted apply ([install.md](../../docs/install.md)).
 
+When the mind names no plan yet, `bootstrap-projects` without `--plan` uses the
+core's one reference, `install/bootstrap/summonplan.yaml`: one `summoned` entry,
+the **summoner** (`https://github.com/iwaag/pj-summoner`), at an exact commit,
+with no roles and no grounds. It is written as the plan named after the
+installation's slug. The summoner's `propose` workflow then turns the person's
+braindumps into the rest of the plan: it reads catalogs (`<user>/agdev-mind`),
+proposes, asks, and only after agreement calls `wfe mind plan put` and
+`wfe summon apply`. That is the only project the core names. Moving the
+reference to a newer summoner is a change of that file's `commit`, published
+with the core.
+
 ## Surfaces
 
 | CLI | API | |

@@ -53,8 +53,8 @@ uv run python -m agautolab.wfexec          # the loop (launchd: com.agdev.agauto
 uv run python -m agautolab.wfexec --once   # until nothing is left to do (trials)
 ```
 
-The launchd template is `pj-agdev/devenv/launchd/com.agdev.agautolab-wfexec.plist.in`
-(`agent/wfexec.sh`). Restart it only between attempts: a restart ends the
+An installation runs it as a native service that `install/agdevctl` writes (a launchd agent on
+macOS, a systemd unit on Linux; `agent/wfexec.sh`). Restart it only between attempts: a restart ends the
 running agent's process, which WFE records as an interruption.
 
 The installation's Gitea (`install/`) is where WFE creates managed

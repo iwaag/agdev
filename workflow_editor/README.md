@@ -7,8 +7,8 @@ agdev, and is built and deployed by agdev's own scripts
 not a project of the catalog it manages: it has no `project.yaml`, no
 workflow, no workspace and no registration, and the operating service refuses
 to register or execute anything on its source, its releases or its control
-data. Its history up to p4 is `pj-agdev/experiments/workflow_editor` (frozen)
-and an earlier repository (retired; imported here).
+data. Its early history was kept in earlier repositories, which are retired and
+not published.
 
 **The service in use is an installed release, never a source tree.** A
 release is built from one agdev commit, checked, and only then made
@@ -47,7 +47,7 @@ for whoever chooses to work in one (`wfe workspace status|sync`).
 ## agdev operation (p4)
 
 The operating instance serves the **agdev dashboard** (`#/`) and the Project
-Editor for the operating area's registry (`pj-agdev/.local/agdev/`, ignored):
+Editor for the operating area's registry (an installation's `data/area/`):
 
 | File | Content |
 | --- | --- |
@@ -139,7 +139,7 @@ for talking with the project agents; workflow_editor p15).
 
 ### Execution by autolab
 
-`agautolab.wfexec` (in `pj-agdev/agautolab`, through the area's installed `bin/wfe`) is the executor: one slot, the
+`agautolab.wfexec` (`agautolab/` of the core, through the area's installed `bin/wfe`) is the executor: one slot, the
 agent launched in the project's workspace in its own process group with
 `WFE_ATTEMPT`, its guide `agautolab/agent/guides/wfrun/guide.md`, its role
 `wfrun` in `agents.toml`. It reaches this host's execution management only

@@ -1,6 +1,6 @@
 # Adopting an existing installation's state
 
-> **History (cluster_teamwork p5).** This adoption was done while installations used Zulip; Zulip was retired since, and `provision-zulip`, `zulip.json` and `[dependencies] zulip` no longer exist. The procedure stays as the record of how A was adopted; a new adoption continues on the same Gitea only.
+> **History.** This adoption was done while installations used Zulip; Zulip was retired since, and `provision-zulip`, `zulip.json` and `[dependencies] zulip` no longer exist. The procedure stays as the record of how A was adopted; a new adoption continues on the same Gitea only.
 
 The contract for a successor installation that **continues** an existing installation's
 operation on the same Gitea and Zulip: same projects, runs, conversations, receipts and

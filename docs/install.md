@@ -7,7 +7,7 @@ Linux or as the user's LaunchAgents on macOS. The web origin (nginx) runs in Doc
 Gitea is either the installation's own, in Docker, or an existing service it attaches to
 ([Attached Gitea](#attached-gitea)). People work with it through WFE's conversation and run views; the
 owner's alerts go to a destination of their own ([Alerts](#the-owners-alerts)). There is no chat
-service: Zulip was retired in cluster_teamwork p5.
+service: Zulip was retired.
 Everything specific to it comes from one input file and is generated under its root;
 nothing here names a host. On Linux, run agents inside a VM dedicated to the installation:
 the VM is their isolation boundary.
@@ -83,7 +83,30 @@ sudo -u <core account> -H env PATH=<claude bin>:<node bin>:/usr/bin:/bin claude 
 ```
 
 The stack works without this, but no agent can run. Finally, the projects arrive from a
-summonplan ([workflow_editor/docs/summon.md](../workflow_editor/docs/summon.md)):
+summonplan ([workflow_editor/docs/summon.md](../workflow_editor/docs/summon.md)). A new
+installation starts with the **summoner**, the one project the core refers to
+(`install/bootstrap/summonplan.yaml`: its public URL and exact commit):
+
+```sh
+$A bootstrap-projects --dry-run   # no plan yet: the core's reference becomes plan <slug>; shows the one entry
+$A bootstrap-projects             # the summoner is acquired, registered and obtained; it fills no role
+```
+
+Then say what you want. Write a braindump, for example "reproduce iwaag's development style
+and start developing", and request the summoner's `propose` workflow with it, in the WFE page
+(project **summoner** → *Request a run* → `propose`) or:
+
+```sh
+wfe request propose --workspace summoner --author <you> --braindump <file>
+```
+
+The run reads your braindumps, the installation's plan and the catalogs your wish points at
+(`<user>/agdev-mind`, `catalog.yaml`; it knows `iwaag/agdev-mind`), proposes a revised plan
+with the reasons for each project, and asks you. When you agree, it adds your wish to the mind
+as a braindump, writes the plan and runs `wfe summon apply`. If apply says the observer must be
+restarted (the recovery role became filled), run `$A services-config --restart`.
+
+With a plan of your own instead:
 
 ```sh
 $A bootstrap-projects --plan <summonplan.yaml> --dry-run   # what would arrive and which roles it fills
@@ -96,8 +119,8 @@ It creates or attaches the mind repository (`wfe mind init`), writes the plan th
 and submodules), registered and obtained; the roles are recorded in `area/roles.json`, the
 keys they own in `workers.json`, `conversations.json` and `submitters.json` follow, the
 conversation page is deployed, and the Observer's `[recovery]` is rendered from the roles.
-Without `--plan` it applies the plan the mind repository names; repeating it continues an
-interrupted apply. A source that needs a credential to read takes it from `agdev-cred`
+Without `--plan` it applies the plan the mind repository names, or, when it names none, the
+core's reference above; repeating it continues an interrupted apply. A source that needs a credential to read takes it from `agdev-cred`
 (an active `gitea-token` entry whose target is the source's origin).
 
 Until a plan fills them, the roles are absent: no recovery (the Observer tells the owner),
@@ -298,7 +321,7 @@ development host repairs with `agdevctl` (or `agdev-remote repair`), or by deplo
 ## Managing a child installation over the agdev link
 
 An installation can be the operational parent of another and update it without shell access to it
-(improve_multinodes p3; contract and recovery: `workflow_editor/docs/management.md`).
+(contract and recovery: `workflow_editor/docs/management.md`).
 
 1. **Prerequisites (operator, once per host):** the installation is installed and healthy; the link realm,
    channel and one bot per installation exist (`workflow_editor/docs/peers.md`, *Setting up a link*); each
@@ -409,7 +432,7 @@ On one VM with 4 vCPU, 8 GiB RAM and 4 GiB swap, the whole stack ran.
 - A removal and recreation from `export-sources` bundles, with a new slug and root, took about
   40 minutes and kept the accounts and the model login.
 
-A development host and a candidate (agedev_selfassembly p3): the VM above as the development
+A development host and a candidate: the VM above as the development
 host, and a laptop (16 threads, 15 GiB RAM, 0.5 GiB swap, Ubuntu 24.04) as the candidate built from
 the VM's repository.
 
@@ -432,7 +455,7 @@ What is not covered: nothing notifies the owner while the clock gate holds the m
 while the alert destination (Slack) is unreachable — alerts then stay queued. Both show in `agdevctl status`, so look there. Whole-VM or
 parent loss has no independent check.
 
-A Mac (agedev_selfassembly p4): macOS 26.2, Apple silicon, 32 cores, OrbStack for Docker.
+A Mac: macOS 26.2, Apple silicon, 32 cores, OrbStack for Docker.
 
 - Two installations ran at once under one user's LaunchAgents, one with its own Gitea and Zulip and one
   attached to them with its projects on another volume. Release builds took about 18–25 minutes (two
@@ -442,7 +465,7 @@ A Mac (agedev_selfassembly p4): macOS 26.2, Apple silicon, 32 cores, OrbStack fo
 - Adopting a snapshot of a 108 GB, 2.4 M-file area with 22 workspaces took about 16 minutes on one
   APFS volume (clones); a 78 GB workspace copied to another volume at about 400 MB/s.
 
-A Mac's production handed over (agedev_selfassembly p5): the predecessor was a hand-made installation with no
+A Mac's production handed over: the predecessor was a hand-made installation with no
 instance id (22 workspaces, 108 GB, 2.4 M files, 1411 attempts), on its own existing Gitea and (then) Zulip.
 
 - Downtime was 16 minutes: quiescence, `:8093` released, ports switched (`activate --no-start` after editing

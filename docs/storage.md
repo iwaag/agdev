@@ -1,4 +1,4 @@
-# Shared storage: one agshare for a parent and its children (improve_multinodes p6)
+# Shared storage: one agshare for a parent and its children
 
 `agshare` holds message files and published run outputs ([shares.md](../workflow_editor/docs/shares.md),
 [message-files.md](../workflow_editor/docs/message-files.md)). Installations that work together use the
