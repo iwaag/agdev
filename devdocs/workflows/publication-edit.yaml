@@ -1,0 +1,31 @@
+# Workflow definition (ag.workflow.v2). Edit here or in the workflow editor.
+schema: ag.workflow.v2
+id: publication-edit
+name: Publication change
+intent: |
+  Apply a change the publisher project requests to this project's external
+  publication contract, overlay or source, judged by this project's own
+  agent as the owner of that knowledge, so that it is integrated into the
+  project's main and can be published from there. Refuse or correct, with
+  reasons, what would misrepresent the project.
+documentation:
+  policy: manual
+execution:
+  agent: agdev-agent
+  profile: sonnet
+  guides: [publisher:agent/source-change.md]
+intake:
+  requests: true
+repositories:
+  project: {path: ., access: editable}
+nodes:
+  apply:
+    type: do
+    name: Apply and review
+    description: |
+      Check each repository against the stated base, apply the patches
+      (a submodule first), judge them as this project's owner, commit with
+      the publisher run named, and complete with the commits made and
+      anything changed or refused.
+    repositories: [project]
+edges: []

@@ -1,0 +1,1112 @@
+"""autolab as the executor of workflow runs (workflow_editor p4).
+
+A person requests a run through agdev (the workflow editor service);
+the request becomes a run record in the project's devdocs and a job in the
+execution host's queue. This loop is autolab's side of it: it launches one
+agent process per attempt the coordinator hands it, several at once since
+improve_wfrun p4.
+
+- It takes the next job (``wfe exec claim``), offering the execution
+  profiles it can launch and the hash of the common workflow contract. The
+  editor records the attempt's beginning in the run record with the settings
+  the run's workflow asks for (the agent identity, the profile, the
+  context bundle by snapshot id and hashes) and hands them back. The agent is launched in the
+  run's own working copy (``cwd`` of the claim; workflow_editor p9: each run
+  has its own copy of the project, on its own branches) in a process group of its own, with the workflow's
+  profile, ``WFE_ATTEMPT`` set so its ``wfe run`` reports carry the attempt
+  id, and a prompt composed of the request and delivery route, the common contract, the run's scoped context
+  (workflow_editor p13: the snapshot the claim prepared) and the run's brief
+  (workflow_editor p6). The executing agent is whoever the
+  workflow names; autolab is the host that launches and publishes it.
+- When the process ends it reports how (``wfe exec finished``); the run
+  record decides what that means (a talk question ends the process; an
+  exit with work left running is an interruption) and the checkpoint is
+  published.
+- A stop or cancellation requested by a person is carried out here: the
+  process group gets SIGTERM, then SIGKILL; the record calls it stopped only
+  after the process is gone.
+- On start, and every minute, ``wfe exec reconcile`` turns processes that
+  vanished into ``unknown`` and re-queues requests and answers whose queue
+  entry was lost. Nothing is rerun or completed by itself.
+
+Sessions (agent_session p1). A run's workflow chooses its session policy:
+``fresh`` (a new harness conversation every attempt) or ``run`` (later
+attempts resume the run's retained conversation). The editor decides at
+claim which session an attempt uses — new under an id it mints, or the
+run's current one by id — and records it in ``attempt.begin`` before
+anything is launched. This loop offers which profiles can keep such
+conversations (``agag.harness.SESSION_HARNESSES``), passes the id to the
+harness (``--session-id`` / ``--resume``), checks before a resume that the
+conversation is still in this host's store (a missing one is replaced
+through ``wfe exec session --missing`` before launch), gives a resumed
+session the editor's compact continuation instead of the whole bootstrap
+(the whole bootstrap again when the editor found it compacted, agent_session
+p1 ex2), and records
+the id the harness reports in its init event (``wfe exec session
+--attached``; a failed record is retried and carried by the end report). An
+id other than the intended one stops the attempt, which ends interrupted
+(``--interrupted "session mismatch: …"``); WFE then refuses to continue that
+conversation until it is retired (agent_session p1 ex1). A process still
+lives only as long as its attempt: a wait for a person ends it, and the
+conversation waits in the store.
+
+Launch ownership (agent_session p1 ex1). The agent is spawned behind a launch
+gate: a tiny wrapper that waits on a pipe this loop holds and execs the
+harness only when it reads ``go``, written after ``wfe exec started``
+registered its process. An executor that dies before that closes the pipe,
+and the wrapper exits without doing any agent work, so an unregistered
+process is never a writer. From the spawn on, the loop owns the process: a
+launch that fails after it (registration, the gate, the prompt) terminates
+and reaps the group before the attempt is finalized; if that cannot be
+confirmed, the loop keeps the process and the slot (``reconcile
+--holding``) and says so, rather than letting another writer start.
+
+Execution nodes (project_migration p7). This loop is one worker of the
+coordinator (``worker`` in the settings: its id in the coordinator's
+workers.json; empty: the coordinator's local worker). It claims only runs
+assigned to it, into its own slot, and names itself in every report. On a
+remote worker its ``wfe`` is the coordinator's client (WFE
+``cli/remote.ts``): the claim materializes the run's copy on this host, the
+end publishes it. The launch gate records how the agent's process ended in
+``<log>.exit``, and a restarted loop takes back a process it left running
+(``wfe exec adopt``) instead of waiting for it to be declared lost.
+
+Worker lanes (project_migration p8) and several attempts at once
+(improve_wfrun p4). A worker may declare extra lanes in the coordinator's
+workers.json (``"lanes": ["coordination"]``); ``lanes = ["coordination"]`` in
+the settings makes this process serve them: one ``Executor`` per lane, each
+with its own tick loop (the extra lanes' in threads), claiming with ``--lane
+<name>`` and carrying out its own attempts' stops and ends. Since p4 an
+executor holds as many attempts as the coordinator hands it: each tick tends
+every running attempt (stop, timeout, session, end) and then claims once
+more; what may start is the coordinator's rule (warden's coordination
+decisions, WFE ``docs/coordination.md``), never a count kept here. Heartbeat
+(with what this host measures of its load, ``--facts-json``), reconcile
+(``--holding`` with the attempts of every lane) stay
+with the default lane's executor, on a keeper thread of their own in
+``serve`` so a slow launch or publication never delays them, and ``adopt``
+hands each live attempt back to the executor of its lane. The end of an
+attempt (its report and checkpoint) runs where it is found; stopping or
+losing one attempt touches no other.
+
+Idle cost (lighter_services p3). A lane skips its claim while the local exec
+store (``local_exec_store``: only when this ``wfe`` certainly reads a store on
+this host) holds no queued job, read-only and fail-open, and still claims in
+full at least every ``FULL_CLAIM_SECONDS``; the heartbeat goes every
+``HEARTBEAT_SECONDS`` and at the next keeper pass after its detail changed.
+
+Every state rule lives in the workflow editor (``shared/run.ts``,
+``server/exec.ts``); this module only launches, watches and reports.
+
+Run: ``uv run python -m agautolab.wfexec [--once]``. Settings:
+``.local/wfexec.toml`` (``wfe`` = the launcher argv; optional
+``agent_command`` = an argv that replaces the harness, for trials;
+``worker`` = this executor's node id; ``lanes`` = the extra worker lanes
+it claims in). Coordination with people and other installations is WFE's
+(conversations, run views, direct delegation, HTTP peers): this process
+talks to WFE only (cluster_teamwork p5 removed its Zulip transports).
+"""
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import os
+import shutil
+import signal
+import subprocess
+import sys
+import time
+import threading
+import tomllib
+from dataclasses import dataclass, field
+from pathlib import Path
+
+from agag.agent import resolve_spec_role
+from agag.harness import SESSION_HARNESSES, Session, _agy_stdin, build_argv, session_stored, stream_session_id
+
+from agautolab.instance import AGAUTOLAB_ROOT, SPEC
+
+ROLE = "wfrun"
+# The short common contract follows the request; scoped context and the brief follow it.
+GUIDE = AGAUTOLAB_ROOT / "agent" / "guides" / "wfrun" / "guide.md"
+
+def execution_contract() -> str:
+    """Keep references readable from any run cwd and fingerprint their contents.
+
+    The manifest makes a reference edit invalidate an old session contract too.
+    Only paths and hashes, not the reference bodies, enter the initial prompt.
+    """
+    directory = GUIDE.parent.resolve()
+    notes = sorted((directory / "reference").glob("*.md"))
+    manifest = "\n".join(f"- {p.relative_to(directory)}: {hashlib.sha256(p.read_bytes()).hexdigest()}" for p in notes)
+    return GUIDE.read_text().rstrip() + f"\n\nGuide directory: {directory}\nRead relative guide links from this directory using the shell.\nReference revision hashes (for session identity):\n{manifest}\n"
+
+
+def request_intro(claim: dict) -> str:
+    """Read the fixed input from the claimed copy; never guess a room route."""
+    if not claim.get("cwd") or not claim.get("ref"):
+        return ""
+    ref = claim["ref"]
+    folder = Path(claim["cwd"]) / "devdocs" / "runs" / ref["workflow"] / ref["run"]
+    record = json.loads((folder / "run.json").read_text())
+    given = record["input"]
+    source = given.get("source") or {}
+    path = (folder / given["file"]).resolve()
+    if not path.is_relative_to(folder.resolve()):
+        raise ValueError("run input leaves its run folder")
+    text = path.read_text()
+    if given.get("kind") == "request":
+        destination = "The requesting agent receives your run's recorded outcome and artifacts and relays them to the person. The brief below identifies that requester."
+    elif source.get("kind") == "conversation":
+        destination = f"Conversation {source['conversation']}, message #{source['message']}. Read it with wfe conversation show; reply using wfe conversation reply --re {source['message']} (see reference/delivery.md)."
+    else:
+        destination = "The run view exposes outcomes and attached files; any request-topic coordination is delivered by WFE. Put the answer in the outcome or attach its body with --artifact when completing the node."
+    return f"# This request\n\n{text}\n\n# Delivery\n\n{destination}\nYour final session text is only an execution log, not the delivered answer.\n"
+
+
+CONTRACT_NAME = "wfrun/guide.md"
+SETTINGS = AGAUTOLAB_ROOT / ".local" / "wfexec.toml"
+TERM_GRACE_SECONDS = 20
+# How long a harness may stay alive after writing its session's final result
+# before the processes it left in the background are stopped
+# (project_migration p8 ex1: front converse/run-029 ended its turn with a
+# backgrounded `find /` still running, and the attempt held its slot).
+SESSION_END_GRACE_SECONDS = 30
+RECONCILE_SECONDS = 60
+CLAIM_PREPARE_SECONDS = 30 * 60
+POLL_SECONDS = 2.0
+# Idle cost (lighter_services p3). A lane whose local queue holds no queued job
+# skips its claim, which would only read; a full claim still runs at least this
+# often per lane, whatever the queue looks like.
+FULL_CLAIM_SECONDS = 60.0
+# The heartbeat is sent at most this long after the last successful one, and at
+# the next keeper pass when what it says (the lanes' detail) changed. The
+# coordinator calls a worker unavailable after 45 s of silence.
+HEARTBEAT_SECONDS = 15.0
+# The lane every worker has (project_migration p8): its one slot of before.
+DEFAULT_LANE = "default"
+# How long a failed launch waits for its process group after SIGTERM and
+# again after SIGKILL before it reports the group as not confirmed gone.
+ABANDON_WAIT_SECONDS = 5.0
+# The launch gate: argv[1] is the read end of the executor's pipe, argv[2]
+# the exit file. Anything but `go` (EOF: the executor is gone) exits before
+# the harness is started. After `go` the gate runs the harness as its child,
+# waits for it and writes how it ended (`exit <code>` / `signal <name>`) to
+# the exit file before ending the same way (project_migration p7): an
+# executor restarted meanwhile reads there how its attempt ended instead of
+# only finding the process gone. The gate ignores the group's SIGTERM so it
+# outlives the harness; SIGKILL ends both, and then there is no exit file.
+GATE = (
+    "import os,sys,signal\n"
+    "fd=int(sys.argv[1]);ex=sys.argv[2]\n"
+    "go=os.read(fd,2)\n"
+    "os.close(fd)\n"
+    "go==b'go' or sys.exit(75)\n"
+    "pid=os.fork()\n"
+    "pid or os.execvp(sys.argv[3],sys.argv[3:])\n"
+    "[signal.signal(s,signal.SIG_IGN) for s in (signal.SIGTERM,signal.SIGINT,signal.SIGHUP)]\n"
+    "st=os.waitpid(pid,0)[1]\n"
+    "w='signal %s'%signal.Signals(os.WTERMSIG(st)).name if os.WIFSIGNALED(st) else 'exit %d'%os.WEXITSTATUS(st)\n"
+    "open(ex+'.tmp','w').write(w+'\\n');os.replace(ex+'.tmp',ex)\n"
+    "os.WIFSIGNALED(st) and (signal.signal(os.WTERMSIG(st),signal.SIG_DFL),os.kill(os.getpid(),os.WTERMSIG(st)))\n"
+    "sys.exit(os.WEXITSTATUS(st))\n"
+)
+
+
+def _profile_names() -> list[str]:
+    from agag.agent import load_config
+    config, overlay = load_config(SPEC.agents_config, SPEC.agents_local_config)
+    names = set((config.get("profiles") or {}).keys()) | set(((overlay or {}).get("profiles") or {}).keys())
+    return sorted(names)
+
+
+@dataclass
+class Settings:
+    wfe: list[str]
+    # The execution node this executor is (project_migration p7): the id in
+    # the coordinator's workers.json. Empty: the coordinator's local worker.
+    worker: str = ""
+    # The extra worker lanes (project_migration p8) this process claims in,
+    # one executor each, beside the default lane. Empty: the default lane only.
+    lanes: list[str] = field(default_factory=list)
+    agent_command: list[str] | None = None
+    profile: str | None = None
+    timeout_seconds: float = 4 * 3600
+    env: dict[str, str] = field(default_factory=dict)
+    # Trials with `agent_command`: offer explicit sessions for every profile
+    # and hand the session to the command as WFE_SESSION_MODE / WFE_SESSION_ID;
+    # a conversation counts as stored when `<trial_session_store>/<id>` exists.
+    trial_sessions: bool = False
+    trial_session_store: Path | None = None
+    # While this file exists no new attempt starts here; running ones go on. The
+    # installation's lifecycle service holds it across an update (docs/install.md).
+    drain_file: Path | None = None
+
+    @staticmethod
+    def load(path: Path = SETTINGS) -> "Settings":
+        data = tomllib.loads(path.read_text()) if path.exists() else {}
+        wfe = data.get("wfe")
+        if not wfe:
+            raise SystemExit(f"{path} needs `wfe = [...]`: the argv of the wfe launcher for the agdev registry")
+        return Settings(
+            wfe=list(wfe) if isinstance(wfe, list) else [str(wfe)],
+            worker=str(data.get("worker") or ""),
+            lanes=[str(x) for x in (data.get("lanes") or []) if str(x) != DEFAULT_LANE],
+            agent_command=list(data["agent_command"]) if data.get("agent_command") else None,
+            profile=data.get("profile"),
+            timeout_seconds=float(data.get("timeout_seconds", 4 * 3600)),
+            env={str(k): str(v) for k, v in (data.get("env") or {}).items()},
+            trial_sessions=bool(data.get("trial_sessions", False)),
+            trial_session_store=Path(data["trial_session_store"]) if data.get("trial_session_store") else None,
+            drain_file=Path(data["drain_file"]) if data.get("drain_file") else None,
+        )
+
+
+_PLAIN_VALUE = r"""(?:"([^"$`\\]*)"|'([^']*)')(?=[\s;]|$)"""
+
+
+def local_exec_store(wfe: list[str], env: dict[str, str]) -> tuple[Path | None, str]:
+    """The exec store the claim of this ``wfe`` reads, when that is certainly a
+    file on this host (lighter_services p3), else None and why. Only a single
+    launcher file that pins a registry (an installed ``bin/wfe`` or a ``wfe
+    setup`` launcher) qualifies; a remote worker's client, an argv with
+    arguments or anything unreadable does not. The area is the CLI's: the
+    launcher's ``WFE_AREA``, else the environment's, else the registry's folder."""
+    import re
+    if len(wfe) != 1:
+        return None, "the wfe argv is not a single launcher"
+    try:
+        text = Path(wfe[0]).read_text(errors="replace")[:65536]
+    except OSError as error:
+        return None, f"the launcher cannot be read ({error})"
+    if "WFE_WORKER_AREA" in text:
+        return None, "the launcher is a remote worker's client"
+    reg = re.search(r"WFE_REGISTRY=" + _PLAIN_VALUE, text)
+    if not reg:
+        return None, "the launcher pins no plain registry path"
+    area_m = re.search(r"WFE_AREA=" + _PLAIN_VALUE, text)
+    if area_m:
+        area = Path(area_m.group(1) or area_m.group(2))
+    elif env.get("WFE_AREA"):
+        area = Path(env["WFE_AREA"])
+    else:
+        area = Path(reg.group(1) or reg.group(2)).parent
+    store = area / ".local" / "exec" / "exec.sqlite"
+    if not store.is_absolute() or not store.is_file():
+        return None, f"no exec store at {store}"
+    return store, f"local exec store {store}"
+
+
+def queued_job(store: Path) -> bool | None:
+    """Whether the store holds any queued job (of any lane or worker), read-only
+    and briefly; None when that cannot be told (missing file or table, a lock,
+    an error): the caller then claims as before. Never creates or writes."""
+    import sqlite3
+    try:
+        db = sqlite3.connect(f"{store.as_uri()}?mode=ro", uri=True, timeout=0.2)
+    except Exception:  # noqa: BLE001 - unknown: claim
+        return None
+    try:
+        return db.execute("SELECT 1 FROM jobs WHERE state = 'queued' LIMIT 1").fetchone() is not None
+    except Exception:  # noqa: BLE001 - unknown: claim
+        return None
+    finally:
+        db.close()
+
+
+def harness_input(argv: list[str], prompt: str) -> str:
+    """What the harness reads on stdin. agy takes one stream-json line per turn:
+    a plain prompt ended every attempt in seconds with `failed to decode stream
+    input` (forge provide/run-014, improve_workflow p3), the first time a
+    workflow run used the `agy` profile."""
+    streamed = "--input-format" in argv and argv[argv.index("--input-format") + 1:argv.index("--input-format") + 2] == ["stream-json"]
+    return _agy_stdin(prompt) if streamed else prompt
+
+
+@dataclass
+class Running:
+    attempt: str
+    proc: subprocess.Popen
+    started: float
+    term_sent: float | None = None
+    log: Path | None = None
+    # The run's lane as the coordinator recorded it (views; p4).
+    lane: str = DEFAULT_LANE
+    # The session this attempt was launched in (agent_session p1), until the
+    # harness's init event says which id it actually uses.
+    session_id: str | None = None
+    attached: bool = True
+    # The id the harness's init event reported, once read; recorded when
+    # `attached` turns True (a failed record is retried, and carried by the
+    # end report: agent_session p1 ex1).
+    reported: str | None = None
+    # Why the execution host ends this attempt itself although its process
+    # may exit 0: a launch that failed after the spawn, or a session
+    # mismatch (agent_session p1 ex1). Its end is recorded, as interrupted
+    # for this reason, only once the process group is confirmed gone.
+    abandon: str | None = None
+    # When the harness's final result event was first seen while its
+    # process lived on (monotonic), whether that result was an error, and
+    # whether leftovers were stopped because of it (p8 ex1).
+    session_ended: float | None = None
+    session_error: bool = False
+    leftover: bool = False
+
+
+def session_result(log: Path) -> dict | None:
+    """The harness's final `result` event of its stream log, if written
+    (claude_code stream-json): the session has ended."""
+    try:
+        with log.open("rb") as f:
+            f.seek(0, os.SEEK_END)
+            f.seek(max(0, f.tell() - 262144))
+            tail = f.read().decode("utf-8", "replace")
+    except OSError:
+        return None
+    for line in reversed(tail.splitlines()):
+        if '"type":"result"' not in line.replace(" ", ""):
+            continue
+        try:
+            event = json.loads(line)
+        except ValueError:
+            continue
+        if isinstance(event, dict) and event.get("type") == "result":
+            return event
+    return None
+
+
+class Adopted:
+    """A process this executor left running before a restart and takes back
+    (``wfe exec adopt``, project_migration p7). It is not this process's
+    child: ``poll`` looks at the pid and, once it is gone, at the exit file
+    the launch gate wrote. Gone without one, the end is not known (``lost``)."""
+
+    def __init__(self, pid: int, exit_file: Path):
+        self.pid = pid
+        self.exit_file = exit_file
+        self.returncode: int | None = None
+        self.lost = False
+        self.stdin = None
+
+    def poll(self) -> int | None:
+        if self.returncode is not None or self.lost:
+            return self.returncode
+        try:
+            os.kill(self.pid, 0)
+            return None
+        except ProcessLookupError:
+            pass
+        except PermissionError:
+            return None
+        ended = exit_of(self.exit_file)
+        if ended is None:
+            self.lost = True
+            return None
+        self.returncode = ended
+        return ended
+
+
+def exit_of(file: Path) -> int | None:
+    """The end the launch gate recorded: an exit code, or minus a signal number."""
+    try:
+        kind, value = file.read_text().split()
+    except (OSError, ValueError):
+        return None
+    if kind == "signal":
+        return -int(getattr(signal, value, signal.SIGKILL))
+    return int(value)
+
+
+class Executor:
+    def __init__(self, settings: Settings, *, name: str = "autolab", log=print, lane: str = DEFAULT_LANE,
+                 store: tuple[Path | None, str] | None = None):
+        self.s = settings
+        self.name = name
+        self.lane = lane
+        self.log = log
+        # Claim gating (lighter_services p3): the local store a claim reads, or
+        # None (no gating: every pass claims). When this lane last claimed in full.
+        self.store, self.store_note = store if store is not None else local_exec_store(settings.wfe, {**os.environ, **settings.env})
+        self.last_claim: float | None = None
+        # Heartbeat spacing (p3): when the last one succeeded and what it said.
+        self.last_beat: float | None = None
+        self.last_detail: str | None = None
+        # Every attempt this executor holds, by id, oldest first (p4).
+        self.running: dict[str, Running] = {}
+        self.guard = threading.RLock()
+        self.last_reconcile = 0.0
+        # In `serve`, the keeper thread reports and reconciles; a tick then
+        # does neither (tests and --once tick without a keeper).
+        self.keeper: threading.Thread | None = None
+        # While a claim is being prepared and launched its attempt is `launching`
+        # and not yet held; a remote worker's claim materializes a copy, which can
+        # outlast the two minutes after which a reconcile calls such a row lost.
+        self.claiming: float | None = None
+        self._gpu: tuple[float, list[dict]] = (0.0, [])
+        # The default lane's executor holds one executor per extra lane
+        # (project_migration p8); each owns its attempts, their stops and ends.
+        self.lanes: dict[str, Executor] = {}
+        if lane == DEFAULT_LANE:
+            for extra in dict.fromkeys(settings.lanes):
+                self.lanes[extra] = Executor(settings, name=name, lane=extra, log=lambda m, extra=extra: log(f"[{extra}] {m}"), store=(self.store, self.store_note))
+
+    @property
+    def current(self) -> Running | None:
+        """The oldest attempt this executor holds (what "the slot" held before p4), or None."""
+        with self.guard:
+            return next(iter(self.running.values()), None)
+
+    @current.setter
+    def current(self, r: Running | None) -> None:
+        with self.guard:
+            if r is None:
+                self.running.clear()
+            else:
+                self.running[r.attempt] = r
+
+    def hold(self, r: Running) -> None:
+        with self.guard:
+            self.running[r.attempt] = r
+
+    def release(self, r: Running) -> None:
+        with self.guard:
+            self.running.pop(r.attempt, None)
+
+    def held(self) -> list[Running]:
+        with self.guard:
+            return list(self.running.values())
+
+    def executors(self) -> list["Executor"]:
+        """Every lane's executor of this process, the default lane's first."""
+        return [self, *self.lanes.values()]
+
+    # ---- wfe ---------------------------------------------------------------
+
+    def wfe(self, *args: str, check: bool = True) -> dict | list:
+        # Every exec report names this executor's node (project_migration p7).
+        if args and args[0] == "exec" and self.s.worker:
+            args = (*args, "--worker", self.s.worker)
+        proc = subprocess.run([*self.s.wfe, *args, "--json"], capture_output=True, text=True, timeout=300, env={**os.environ, **self.s.env})
+        out = proc.stdout.strip()
+        if proc.returncode != 0 and check:
+            raise RuntimeError(f"wfe {' '.join(args)} failed ({proc.returncode}): {proc.stderr.strip() or out}")
+        try:
+            return json.loads(out) if out else {}
+        except json.JSONDecodeError:
+            raise RuntimeError(f"wfe {' '.join(args)} printed no JSON: {out[:300]} {proc.stderr[:300]}")
+
+    # ---- the agent -----------------------------------------------------------
+
+    def agent_argv(self, cwd: Path, profile: str | None = None, session: Session | None = None) -> tuple[list[str], str, dict[str, str]]:
+        """The argv, the backend it names (Agent ≠ Model), and its environment.
+        `profile` is the run's workflow's; without one, the host's default.
+        `session`: the conversation to create or resume (agent_session p1)."""
+        if self.s.agent_command:
+            env = {"WFE_SESSION_MODE": session.mode, "WFE_SESSION_ID": session.id} if session else {}
+            return list(self.s.agent_command), "trial command", env
+        agent = resolve_spec_role(SPEC, ROLE, profile_override=profile or self.s.profile)
+        argv = build_argv(
+            agent, allowed_tools=agent.allowed_tools, skip_permissions=agent.harness in ("claude_code", "agy"),
+            stream=True, cwd=cwd, timeout=self.s.timeout_seconds, session=session,
+        )
+        return argv, f"{agent.harness} / {agent.model}", dict(agent.environment)
+
+    def session_stored(self, profile: str | None, session_id: str) -> bool | None:
+        """Whether this host still holds the conversation to resume."""
+        if self.s.agent_command:
+            if self.s.trial_session_store is None:
+                return None
+            return (self.s.trial_session_store / session_id).exists()
+        agent = resolve_spec_role(SPEC, ROLE, profile_override=profile or self.s.profile, check_available=False)
+        return session_stored(agent, session_id)
+
+    def prompt(self, claim: dict, contract: str | None = None) -> str:
+        """A new session: the request, common contract, then the scoped context the
+        claim prepared (its snapshot's text), then the brief. A resumed session
+        already holds the contract and context (the editor resumes only under
+        the same configuration, context fingerprint included), so it gets the editor's compact continuation
+        instead (agent_session p1 ex2). A resumed session the editor could
+        not show to still hold them (compacted, or a compaction that cannot
+        be ruled out: ``session.reconstruct``) gets the whole bootstrap again,
+        in the same conversation, and is told why."""
+        session = (claim.get("execution") or {}).get("session") or {}
+        if session.get("mode") == "resume" and claim.get("continuation"):
+            return self.continuation(claim)
+        attempt = claim["attempt"]["id"]
+        parts: list[str] = []
+        if session.get("mode") == "resume":
+            parts += [
+                f"# Attempt {attempt}: the run's instructions again", "",
+                f"This is a new attempt of the same run, continuing your conversation, but {session.get('reconstruct') or 'it may no longer hold its beginning'}: "
+                "what it said earlier may be summarized or missing. So the run's instructions follow in full, as a new "
+                "session gets them. Where they or the record differ from what you remember, they decide. Every earlier "
+                "attempt id in this conversation is ended, and processes you started in earlier attempts are gone.", "",
+            ]
+        intro = request_intro(claim)
+        if intro:
+            parts += [intro, ""]
+        parts += [(contract if contract is not None else execution_contract()).rstrip()]
+        # The scoped context the editor resolved and saved for this attempt
+        # (workflow_editor p13): system, project and workflow defaults and
+        # overrides, as the exact text of its snapshot.
+        context = ((claim.get("execution") or {}).get("context") or {}).get("text")
+        if context:
+            parts += ["", str(context).rstrip()]
+        parts += [
+            "", "# This attempt", "",
+            f"Attempt: {attempt} (in your environment as WFE_ATTEMPT; every `wfe run` report carries it).",
+            claim["brief"], "",
+            "Begin by reading the run: `wfe run show <run> --history`.",
+        ]
+        return "\n".join(parts)
+
+    def continuation(self, claim: dict) -> str:
+        """What a resumed session is told at the start of a new attempt: the
+        new attempt identity, then the editor's continuation — why it runs,
+        what was recorded since its previous attempt began, the compact
+        state and the pending input in full (agent_session p1 ex2). The
+        contract, context and stable run facts are already in the
+        conversation, unchanged; nothing asks it to read the whole run."""
+        attempt = claim["attempt"]["id"]
+        return "\n".join([
+            f"# This attempt: {attempt}", "",
+            f"This is a new attempt of the same run, continuing your conversation. Your attempt is now {attempt} "
+            "(WFE_ATTEMPT in your environment); every earlier attempt id in this conversation is ended, and a "
+            "report carrying one is refused. Processes you started in earlier attempts are gone.",
+            "What you remember is context, not record: what was answered, accepted, held or completed is what "
+            "the run's record says now.", "",
+            claim["continuation"],
+        ])
+    def offer(self) -> tuple[dict[str, str], str, str, dict[str, str]]:
+        """The profiles this host can launch (name → backend label), the
+        common contract with its hash, and which profiles keep explicit
+        sessions ('' = the host's default profile), as offered at claim."""
+        contract = execution_contract()
+        digest = hashlib.sha256(contract.encode()).hexdigest()
+        if self.s.agent_command:
+            names = _profile_names()
+            sessions = {name: "explicit" for name in [*names, ""]} if self.s.trial_sessions else {}
+            return {name: "trial command" for name in names}, contract, digest, sessions
+        profiles: dict[str, str] = {}
+        sessions: dict[str, str] = {}
+        for name in _profile_names():
+            try:
+                agent = resolve_spec_role(SPEC, ROLE, profile_override=name, check_available=False)
+            except Exception:  # noqa: BLE001 - a profile that does not resolve is not offered
+                continue
+            profiles[name] = f"{agent.harness} / {agent.model}"
+            if agent.harness in SESSION_HARNESSES:
+                sessions[name] = SESSION_HARNESSES[agent.harness]
+        try:
+            default = resolve_spec_role(SPEC, ROLE, profile_override=self.s.profile, check_available=False)
+            if default.harness in SESSION_HARNESSES:
+                sessions[""] = SESSION_HARNESSES[default.harness]
+        except Exception:  # noqa: BLE001 - no default profile: none offered for ''
+            pass
+        return profiles, contract, digest, sessions
+
+    def launch(self, claim: dict, argv: list[str], extra_env: dict[str, str], contract: str | None = None) -> None:
+        """Spawns the agent behind the launch gate, takes ownership of it
+        (``self.current``) at once, registers it, opens the gate and sends
+        the prompt. Raises after the spawn only with ``self.current`` set:
+        the caller then stops what was spawned before ending the attempt."""
+        attempt = claim["attempt"]["id"]
+        cwd = Path(claim["cwd"])
+        log = Path(claim["attempt"]["log"])
+        log.parent.mkdir(parents=True, exist_ok=True)
+        env = {**os.environ, **extra_env, **self.s.env, "WFE_ATTEMPT": attempt, "PWD": str(cwd), "NO_COLOR": "1"}
+        # better_git_strategy p1: the folder around the checkout (the run envelope:
+        # declared run files, staged inputs, run-local outputs) and the project
+        # workspace it came from; a remote worker's claim names its own envelope.
+        envelope = claim.get("envelope") or (str(cwd.parent) if cwd.name == "source" else None)
+        if envelope:
+            env["AGDEV_WORKSPACE"] = envelope
+        if claim.get("projectWorkspace"):
+            env["AGDEV_PROJECT_WORKSPACE"] = claim["projectWorkspace"]
+        wfe_dir = str(Path(self.s.wfe[0]).parent) if "/" in self.s.wfe[0] else ""
+        if wfe_dir:
+            env["PATH"] = f"{wfe_dir}:{env.get('PATH', '')}"
+        prompt = harness_input(argv, self.prompt(claim, contract)).encode()
+        if shutil.which(argv[0], path=env.get("PATH")) is None:
+            raise FileNotFoundError(f"{argv[0]}: no such command")
+        gate_r, gate_w = os.pipe()
+        try:
+            with log.open("ab") as out:
+                proc = subprocess.Popen([sys.executable, "-I", "-c", GATE, str(gate_r), f"{log}.exit", *argv], cwd=cwd, env=env,
+                                        stdin=subprocess.PIPE, stdout=out, stderr=subprocess.STDOUT,
+                                        start_new_session=True, pass_fds=(gate_r,))
+        except BaseException:
+            os.close(gate_w)
+            raise
+        finally:
+            os.close(gate_r)
+        sid = ((claim.get("execution") or {}).get("session") or {}).get("id")
+        self.hold(Running(attempt, proc, time.monotonic(), log=log, session_id=sid, attached=not sid, lane=str(claim.get("lane") or self.lane)))
+        try:
+            self.wfe("exec", "started", attempt, "--pid", str(proc.pid))
+            self.open_gate(gate_w)
+        finally:
+            os.close(gate_w)  # before `go`: EOF, and the gate exits without starting the harness
+        assert proc.stdin is not None
+        delivered, why = True, ""
+        try:
+            proc.stdin.write(prompt)
+            proc.stdin.close()
+        except BrokenPipeError:
+            delivered, why = False, "the harness closed its input before the prompt was written"  # its end is recorded as it ended
+        self.report_context(claim, delivered, why)
+        self.log(f"attempt {attempt}: launched pid {proc.pid} for {claim['ref']['workflow']}/{claim['ref']['run']} in {claim['workspace']['id']}")
+
+    def report_context(self, claim: dict, delivered: bool, detail: str = "") -> None:
+        """Records whether the prompt carrying the prepared context reached
+        the launched process (workflow_editor p13). Delivery is not proof the
+        agent read it. A failed record is logged; the attempt goes on."""
+        if not ((claim.get("execution") or {}).get("context") or {}).get("snapshot"):
+            return
+        attempt = claim["attempt"]["id"]
+        try:
+            self.wfe("exec", "context", attempt, "--delivered" if delivered else "--undelivered", *(["--detail", detail] if detail else []))
+        except Exception as error:  # noqa: BLE001 - a bookkeeping record; the attempt itself is unaffected
+            self.log(f"attempt {attempt}: context delivery not recorded: {error}")
+
+    @staticmethod
+    def open_gate(fd: int) -> None:
+        os.write(fd, b"go")
+
+    @staticmethod
+    def group_gone(r: Running) -> bool:
+        """The attempt's process group has no member left (its leader reaped)."""
+        r.proc.poll()
+        try:
+            os.killpg(r.proc.pid, 0)
+        except ProcessLookupError:
+            return True
+        except PermissionError:
+            return False
+        return False
+
+    def terminate(self, r: Running) -> bool:
+        """SIGTERM, then SIGKILL, to the attempt's group, each followed by
+        a bounded wait; True once the group is confirmed gone."""
+        for sig in (signal.SIGTERM, signal.SIGKILL):
+            try:
+                os.killpg(r.proc.pid, sig)
+            except ProcessLookupError:
+                pass
+            except PermissionError as error:
+                self.log(f"attempt {r.attempt}: {sig.name} refused: {error}")
+            end = time.monotonic() + ABANDON_WAIT_SECONDS
+            while time.monotonic() < end:
+                if self.group_gone(r):
+                    return True
+                time.sleep(0.05)
+        return self.group_gone(r)
+
+    def abandon(self, r: Running, why: str) -> str:
+        """The execution host ends the attempt itself (a launch that failed
+        after the spawn, a session mismatch): stop the process group, and
+        end the attempt only once the group is confirmed gone. Otherwise the
+        loop keeps it (the slot stays held) and the next ticks go on."""
+        r.abandon = r.abandon or why
+        if r.term_sent is None:
+            r.term_sent = time.monotonic()
+        if not self.terminate(r):
+            self.log(f"attempt {r.attempt}: process group {r.proc.pid} is not confirmed gone ({r.abandon}); "
+                     "the executor keeps it and the slot until it is")
+            return "stop-unconfirmed"
+        return self.finish(r)
+
+    # ---- one tick ----------------------------------------------------------------
+
+    def stop_group(self, r: Running, why: str) -> None:
+        now = time.monotonic()
+        try:
+            if r.term_sent is None:
+                os.killpg(r.proc.pid, signal.SIGTERM)
+                r.term_sent = now
+                self.log(f"attempt {r.attempt}: SIGTERM ({why})")
+            elif now - r.term_sent > TERM_GRACE_SECONDS:
+                os.killpg(r.proc.pid, signal.SIGKILL)
+                self.log(f"attempt {r.attempt}: SIGKILL ({why}; still alive after {TERM_GRACE_SECONDS} s)")
+        except ProcessLookupError:
+            pass
+        except PermissionError as error:  # macOS: a group left with only an unreaped process
+            self.log(f"attempt {r.attempt}: signal refused ({error}); waiting for the process to be gone")
+
+    def attach(self, r: Running) -> None:
+        """Record the session id the harness announced in its init event
+        (agent_session p1). The intended id is already recorded; this
+        confirms it, or records that the harness used another — and then the
+        attempt is stopped: work does not go on in a conversation nobody
+        chose (p1 ex1). A failed record stays pending and is retried."""
+        if r.attached or r.log is None:
+            return
+        if r.reported is None:
+            try:
+                with r.log.open("r", errors="replace") as f:
+                    for _ in range(200):
+                        line = f.readline()
+                        if not line:
+                            return
+                        sid = stream_session_id(line)
+                        if sid:
+                            break
+                    else:
+                        return
+            except OSError:
+                return
+            r.reported = sid
+            if r.session_id and sid != r.session_id:
+                self.log(f"attempt {r.attempt}: the harness reports session {sid}, not the intended {r.session_id}; stopping the attempt")
+                r.abandon = r.abandon or f"session mismatch: launched in session {r.session_id}, the harness reported {sid}"
+        try:
+            self.wfe("exec", "session", r.attempt, "--attached", r.reported)
+            r.attached = True
+        except RuntimeError as error:
+            self.log(f"attempt {r.attempt}: session {r.reported} not recorded yet (retrying): {error}")
+
+    def keep(self) -> None:
+        """The worker's heartbeat (with its measured load) and, every minute,
+        the reconcile: the default lane's, speaking for every lane of this
+        process (project_migration p8); every lane's attempts are held, so
+        none is judged gone meanwhile."""
+        if self.lane != DEFAULT_LANE:
+            return
+        def doing(ex: Executor) -> str:
+            ids = [r.attempt for r in ex.held()]
+            return f"executing {', '.join(ids)}" if ids else "idle"
+        detail = "; ".join([doing(self), *(f"{lane}: {doing(ex)}" for lane, ex in self.lanes.items())])
+        # Every HEARTBEAT_SECONDS, or at once when the detail changed (p3); the load
+        # sample changes every time and is not a reason. A failed send stays due.
+        beat = time.monotonic()
+        if self.last_beat is None or beat - self.last_beat >= HEARTBEAT_SECONDS or detail != self.last_detail:
+            self.wfe("exec", "heartbeat", "--pid", str(os.getpid()), "--detail", detail, "--facts-json", json.dumps({"load": self.host_load()}))
+            self.last_beat, self.last_detail = beat, detail
+        # The keeper runs beside the ticks (p4): no reconcile judges a launch in
+        # progress. Bounded, so a stuck claim cannot stop reconciliation for good.
+        now = time.monotonic()
+        preparing = any(ex.claiming is not None and now - ex.claiming < CLAIM_PREPARE_SECONDS for ex in self.executors())
+        if not preparing and now - self.last_reconcile > RECONCILE_SECONDS:
+            holding = [arg for ex in self.executors() for held in ex.held() for arg in ("--holding", held.attempt)]
+            notes = self.wfe("exec", "reconcile", *holding).get("notes", [])
+            for n in notes:
+                self.log(f"reconcile: {n}")
+            self.last_reconcile = time.monotonic()
+
+    def host_load(self) -> dict:
+        """What this host measures of itself now (improve_wfrun p4): evidence
+        for warden's judgment, kept with the heartbeat. Best effort; a
+        measurement that fails is left out, never guessed."""
+        out: dict = {"at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())}
+        try:
+            out["cpus"] = os.cpu_count()
+            l1, l5, _ = os.getloadavg()
+            out["load1"], out["load5"] = round(l1, 2), round(l5, 2)
+        except (OSError, AttributeError):
+            pass
+        try:
+            if sys.platform == "darwin":
+                # launchd's PATH lacks /usr/sbin: name the tools by their place.
+                total = int(subprocess.run(["/usr/sbin/sysctl", "-n", "hw.memsize"], capture_output=True, text=True, timeout=2).stdout.strip() or 0)
+                vm = subprocess.run(["/usr/bin/vm_stat"], capture_output=True, text=True, timeout=2).stdout
+                page = int((vm.split("page size of")[1].split()[0]) if "page size of" in vm else 4096)
+                free = 0
+                for line in vm.splitlines():
+                    if line.startswith(("Pages free", "Pages inactive", "Pages speculative")):
+                        free += int(line.split(":")[1].strip().rstrip(".")) * page
+                out["memTotalMB"], out["memFreeMB"] = total // 1048576, free // 1048576
+            else:
+                info = {}
+                for line in Path("/proc/meminfo").read_text().splitlines():
+                    k, _, v = line.partition(":")
+                    info[k] = int(v.split()[0]) if v.strip() else 0
+                out["memTotalMB"], out["memFreeMB"] = info.get("MemTotal", 0) // 1024, info.get("MemAvailable", 0) // 1024
+        except (OSError, ValueError, IndexError, subprocess.SubprocessError):
+            pass
+        if shutil.which("nvidia-smi"):
+            at, gpus = self._gpu
+            if time.monotonic() - at > 30:
+                gpus = []
+                try:
+                    q = subprocess.run(["nvidia-smi", "--query-gpu=name,memory.used,memory.total,utilization.gpu", "--format=csv,noheader,nounits"], capture_output=True, text=True, timeout=3)
+                    for line in q.stdout.splitlines():
+                        name, used, total, util = [x.strip() for x in line.split(",")]
+                        gpus.append({"name": name, "memUsedMB": int(float(used)), "memTotalMB": int(float(total)), "utilPercent": int(float(util))})
+                except (OSError, ValueError, subprocess.SubprocessError):
+                    gpus = []
+                self._gpu = (time.monotonic(), gpus)
+            if gpus:
+                out["gpu"] = gpus
+        return out
+
+    def tend(self, r: Running, due: dict) -> str:
+        """One attempt's tick: stop or time out, read its session id, and end
+        it once its process is gone. Returns executing, finished or
+        stop-unconfirmed; a failure here is this attempt's alone."""
+        if r.abandon:
+            # A failed launch not yet confirmed stopped: keep stopping it.
+            return self.abandon(r, r.abandon)
+        if r.attempt in due:
+            self.stop_group(r, "stop or cancel requested")
+        elif time.monotonic() - r.started > self.s.timeout_seconds:
+            self.stop_group(r, "the attempt's time budget ran out")
+        self.attach(r)
+        if r.abandon:
+            return self.abandon(r, r.abandon)
+        # An adopted process gone without its exit file is lost (p4: seen on
+        # gpupc when the gate was killed): ended as such here, not held
+        # forever while the reconcile is told it is still owned.
+        if r.proc.poll() is None and not getattr(r.proc, "lost", False):
+            self.watch_session_end(r)
+            return "executing"
+        self.attach(r)
+        if r.abandon:
+            return self.abandon(r, r.abandon)
+        return self.finish(r)
+
+    def tick(self) -> str:
+        """Report (unless the keeper does), tend every attempt, then claim
+        once. Returns finished when an attempt ended this tick, launched when
+        one started, stop-unconfirmed, executing while attempts run, idle."""
+        if self.keeper is None:
+            self.keep()
+        held = self.held()
+        outcome = "idle"
+        if held:
+            due = {a["id"]: a for a in self.wfe("exec", "stops")}
+            for r in held:
+                try:
+                    state = self.tend(r, due)
+                except Exception as error:  # noqa: BLE001 - one attempt's failure; the others go on
+                    self.log(f"attempt {r.attempt}: tick failed: {error}")
+                    state = "executing"
+                if state in ("finished", "stop-unconfirmed"):
+                    return state
+            outcome = "executing"
+        if self.s.drain_file is not None and self.s.drain_file.exists():
+            return outcome
+        if not self.claim_due():
+            return outcome
+        claimed = self.claim_once()
+        return claimed if claimed != "idle" else outcome
+
+    def claim_due(self) -> bool:
+        """Whether this pass claims (lighter_services p3): always without a local
+        store, at the first pass, FULL_CLAIM_SECONDS after this lane's last claim,
+        and whenever the store holds a queued job or cannot tell. A claim of an
+        empty queue only reads, so skipping it changes nothing."""
+        if self.store is None or self.last_claim is None or time.monotonic() - self.last_claim >= FULL_CLAIM_SECONDS:
+            return True
+        return queued_job(self.store) is not False
+
+    def claim_once(self) -> str:
+        """Asks the coordinator for one more job of this lane and launches it.
+        What may start is the coordinator's rule (improve_wfrun p4); here an
+        idle answer is simply nothing to do now."""
+        self.claiming = time.monotonic()
+        self.last_claim = self.claiming
+        try:
+            return self._claim_once()
+        finally:
+            self.claiming = None
+
+    def _claim_once(self) -> str:
+        profiles, contract, digest, sessions = self.offer()
+        claim = self.wfe("exec", "claim", "--backend", self.backend_label(),
+                         "--profiles-json", json.dumps(profiles), "--contract", f"{CONTRACT_NAME}={digest}",
+                         "--sessions-json", json.dumps(sessions),
+                         *(("--lane", self.lane) if self.lane != DEFAULT_LANE else ()))
+        if "idle" in claim:
+            return "idle"
+        cwd = Path(claim["cwd"])
+        execution = claim.get("execution") or {}
+        attempt = claim["attempt"]["id"]
+        try:
+            session = self.session_of(claim)
+            argv, _, extra_env = self.agent_argv(cwd, execution.get("profile"), session)
+            self.launch(claim, argv, extra_env, contract)
+        except Exception as error:  # the launch failed: the attempt ends as interrupted
+            self.log(f"attempt {attempt}: launch failed: {error}")
+            self.report_context(claim, False, f"launch failed: {error}")
+            spawned = next((r for r in self.held() if r.attempt == attempt), None)
+            if spawned is not None:
+                return self.abandon(spawned, f"launch failed: {error}")  # something was spawned
+            self.wfe("exec", "finished", attempt, "--exit-code", "127")
+            return "launch-failed"
+        return "launched"
+
+    def watch_session_end(self, r: Running) -> None:
+        """A harness that wrote its session's final result but lives on is
+        kept alive by what it left in the background; nothing wakes an ended
+        session, so after a grace those processes are stopped and the
+        attempt ends as the session did (project_migration p8 ex1)."""
+        if r.log is None:
+            return
+        if r.session_ended is None:
+            result = session_result(r.log)
+            if result is None:
+                return
+            r.session_ended = time.monotonic()
+            r.session_error = bool(result.get("is_error"))
+            return
+        if time.monotonic() - r.session_ended > SESSION_END_GRACE_SECONDS:
+            r.leftover = True
+            self.stop_group(r, f"the session ended {SESSION_END_GRACE_SECONDS}+ s ago and only processes it left in the background keep it alive")
+
+    def finish(self, r: Running) -> str:
+        """The attempt's leader is gone: clear its group and record the end.
+        A failure to record keeps the attempt current; the next tick retries."""
+        code = r.proc.poll()
+        try:  # the leader is gone; the group may still hold children
+            os.killpg(r.proc.pid, signal.SIGKILL)
+        except (ProcessLookupError, PermissionError):
+            pass
+        args = ["exec", "finished", r.attempt]
+        if getattr(r.proc, "lost", False):
+            args += ["--lost"]  # an adopted process gone without an exit file
+        elif r.leftover:
+            # Stopped for leftovers after the session's own end: it ended as its result says.
+            args += ["--exit-code", "1" if r.session_error else "0"]
+        elif code is not None and code < 0:
+            args += ["--signal", signal.Signals(-code).name]
+        else:
+            args += ["--exit-code", str(code)]
+        if r.abandon:
+            args += ["--interrupted", r.abandon]
+        if r.reported and not r.attached:
+            args += ["--attached", r.reported]  # recorded with the end, or named in its detail
+        result = self.wfe(*args)
+        how = "lost" if getattr(r.proc, "lost", False) else f"signal {signal.Signals(-code).name}" if code is not None and code < 0 else f"exit {code}"
+        how = f"{r.abandon}; {how}" if r.abandon else how
+        how = f"session ended, leftover background processes stopped; {how}" if r.leftover else how
+        self.log(f"attempt {r.attempt}: ended ({how}) → {result.get('outcome')}; checkpoint {(result.get('checkpoint') or {}).get('state')}")
+        self.release(r)
+        return "finished"
+
+    def session_of(self, claim: dict) -> Session | None:
+        """The conversation this attempt is launched in. A resume first checks
+        that the conversation is still in this host's store: a missing one
+        is replaced before launch (nothing ran in it in this attempt), and
+        the claim is updated to the new session so the prompt is the whole
+        bootstrap."""
+        execution = claim.get("execution") or {}
+        ss = execution.get("session") or {}
+        if not ss.get("id"):
+            return None
+        if ss.get("mode") == "resume":
+            stored = self.session_stored(execution.get("profile"), ss["id"])
+            if stored is False:
+                attempt = claim["attempt"]["id"]
+                got = self.wfe("exec", "session", attempt, "--missing", "--detail", "no transcript in the harness store")
+                self.log(f"attempt {attempt}: session {ss['id']} is missing on this host; replaced by {got.get('id')}")
+                ss = {**ss, "mode": "new", "id": got.get("id"), "replaces": {"id": ss["id"], "reason": "missing on this host"}}
+                execution["session"] = ss
+                if not ss["id"]:
+                    return None
+        return Session(ss["mode"], ss["id"])
+
+    def backend_label(self) -> str:
+        if self.s.agent_command:
+            return "trial command"
+        try:
+            agent = resolve_spec_role(SPEC, ROLE, profile_override=self.s.profile, check_available=False)
+            return f"{agent.harness} / {agent.model}"
+        except Exception as error:  # noqa: BLE001 - recorded, not fatal
+            return f"unresolved ({error})"
+
+    def adopt(self) -> None:
+        """Takes back the attempts this executor's node left running before a
+        restart (project_migration p7), so their stops and ends are handled
+        here again: each by the executor of its lane (p8; an answer without a
+        lane is the default lane's). Not done: the next ticks' reconcile
+        judges the process."""
+        try:
+            live = self.wfe("exec", "adopt")
+        except Exception as error:  # noqa: BLE001 - the reconcile handles it later
+            self.log(f"adopt: not checked: {error}")
+            return
+        for a in live if isinstance(live, list) else []:
+            lane = a.get("lane") or DEFAULT_LANE
+            # An ordinary lane this process does not serve as a loop of its own
+            # is the default lane's (p4: every ordinary lane's work is one loop).
+            ex = self if lane == DEFAULT_LANE else self.lanes.get(lane, self if lane not in self.s.lanes else None)
+            if ex is None:
+                # Not served here any more: its process is judged by the
+                # coordinator's reconcile when it is gone.
+                self.log(f"attempt {a['id']}: left running in lane {lane}, which this executor does not serve; not adopted")
+                continue
+            if any(r.attempt == a["id"] for r in ex.held()):
+                continue
+            log = Path(a["log"]) if a.get("log") else None
+            ex.hold(Running(a["id"], Adopted(int(a["pid"]), Path(f"{log}.exit") if log else Path("/nonexistent")), time.monotonic(), log=log, lane=lane))  # type: ignore[arg-type]
+            ex.log(f"attempt {a['id']}: adopted pid {a['pid']} left running before the restart")
+
+    def loop(self, halt: threading.Event, once: bool = False) -> None:
+        """Ticks until halted (or, with ``once``, until nothing is left to do)."""
+        while not halt.is_set():
+            try:
+                state = self.tick()
+            except Exception as error:  # noqa: BLE001 - keep serving; the next tick retries
+                self.log(f"tick failed: {error}")
+                state = "error"
+            if once and state in ("idle", "error"):
+                break
+            halt.wait(POLL_SECONDS)
+        for r in self.held():
+            # The agent keeps running in its own session; a restarted executor
+            # finds it alive and adopts it (adopt, reconcile).
+            self.log(f"leaving attempt {r.attempt} (pid {r.proc.pid}) running")
+
+    def keep_forever(self, halt: threading.Event) -> None:
+        """The keeper (p4): heartbeat and reconcile on a thread of their own,
+        so a launch or a publication in a tick never delays them."""
+        while not halt.is_set():
+            try:
+                self.keep()
+            except Exception as error:  # noqa: BLE001 - said; the next beat retries
+                self.log(f"keeper: {error}")
+            halt.wait(POLL_SECONDS)
+
+    def serve(self, once: bool = False) -> None:
+        lanes = f"lanes {', '.join(self.lanes)} beside the default lane" if self.lanes else "the default lane"
+        self.log(f"{self.name} workflow-run executor{f' (worker {self.s.worker})' if self.s.worker else ''}: {lanes}, as many attempts as the coordinator admits, polling every {POLL_SECONDS} s")
+        gate = (f"claims skipped while {self.store_note} holds no queued job, a full claim per lane at least every {FULL_CLAIM_SECONDS:.0f} s"
+                if self.store is not None else f"every pass claims ({self.store_note})")
+        self.log(f"idle cost: {gate}; heartbeat every {HEARTBEAT_SECONDS:.0f} s and on a change of state")
+        self.adopt()
+        halt = threading.Event()
+        if not once:
+            self.keeper = threading.Thread(target=self.keep_forever, args=(halt,), daemon=True, name="wfexec-keeper")
+            self.keeper.start()
+
+        def leave(signum, frame):  # noqa: ARG001
+            halt.set()
+
+        signal.signal(signal.SIGTERM, leave)
+        signal.signal(signal.SIGINT, leave)
+        quiet = threading.Event()
+        # Each extra lane ticks in a thread of its own (p8), so a long launch
+        # or end in one lane never delays another; they end with this loop.
+        workers = [threading.Thread(target=ex.loop, args=(halt, once), name=f"wfexec-{lane}") for lane, ex in self.lanes.items()]
+        for t in workers:
+            t.start()
+        self.loop(halt, once)
+        if not once:
+            halt.set()
+        for t in workers:
+            t.join()
+        quiet.set()
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description=__doc__.split("\n")[0])
+    parser.add_argument("--once", action="store_true", help="return when nothing is left to do (trials)")
+    parser.add_argument("--settings", type=Path, default=SETTINGS)
+    args = parser.parse_args(argv)
+    Executor(Settings.load(args.settings), log=lambda m: print(f"{time.strftime('%Y-%m-%dT%H:%M:%S')} {m}", flush=True)).serve(once=args.once)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

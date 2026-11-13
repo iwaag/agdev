@@ -1,0 +1,476 @@
+// One registered workspace: Git inspection, project metadata, workflow
+// discovery, creation and saving. All paths are bounded to the workspace root.
+import { readdir, realpath, stat } from 'node:fs/promises'
+import { dirname, join } from 'node:path'
+import { approvalStates, type ApprovalState } from '../shared/canonical.ts'
+import {
+  acceptsRequests, DOC_POLICIES, docSteps, ID_PATTERN, normalizeRepoPath, PROJECT_SCHEMA, type Documentation,
+  type ApprovalKind, type Project, type Workflow,
+} from '../shared/model.ts'
+import { delegateTargets, hasErrors, validateProject, validateWorkflow, type ValidationContext, type WorkflowRef } from '../shared/validate.ts'
+import type {
+  AddSubmoduleResponse, Diagnostic, FileProblem, ProjectResponse, RepoCategory, RepositoryStatus,
+  PeerProject, WorkflowResponse, WorkflowSummary,
+} from '../shared/api.ts'
+import { atomicWrite, createExclusive, inside, readTextOrNull, textHash } from './files.ts'
+import { git, LOCAL_TRANSPORT } from './git.ts'
+import type { Registration } from './registry.ts'
+import { sourceRootOf, stateRootOf } from './layout.ts'
+import { devdocsInfo, type DevdocsInfo } from './devdocs.ts'
+import { templateIds, workflowFromTemplate } from './templates.ts'
+import { newProjectText, newWorkflowText, parseProject, parseWorkflow, renderProject, renderWorkflow } from './yamlDoc.ts'
+
+export const WORKFLOWS_DIR = 'devdocs/workflows'
+const readCache = new Map<string, { sig: string; text: string; workflow?: Workflow; problem?: FileProblem }>()
+export const WORKFLOW_FILE = /^[A-Za-z0-9][A-Za-z0-9._-]*\.ya?ml$/
+
+export class RequestError extends Error {
+  status: number
+  detail?: unknown
+  constructor(status: number, message: string, detail?: unknown) {
+    super(message); this.status = status; this.detail = detail
+  }
+}
+
+export function categoryOf(path: string): RepoCategory {
+  if (path === '.') return 'root'
+  if (path === 'devdocs') return 'devdocs'
+  if (path === 'study' || path.startsWith('study/')) return 'study'
+  if (path === 'wedo' || path.startsWith('wedo/')) return 'wedo'
+  return 'other'
+}
+
+// Local commits that no remote-tracking ref contains (as last fetched; no
+// network read), and the branch's upstream when it has one. A detached
+// submodule checkout is published when some remote branch contains it.
+async function publication(dir: string): Promise<RepositoryStatus['publication']> {
+  const up = await git(dir, ['rev-parse', '--abbrev-ref', '--symbolic-full-name', '@{upstream}'])
+  const ahead = await git(dir, ['rev-list', '--count', 'HEAD', '--not', '--remotes'])
+  const behind = up.code === 0 ? await git(dir, ['rev-list', '--count', 'HEAD..@{upstream}']) : null
+  return { upstream: up.code === 0 ? up.stdout.trim() : null, ahead: Number(ahead.stdout.trim()) || 0, behind: Number(behind?.stdout.trim()) || 0 }
+}
+
+async function isDir(p: string) { try { return (await stat(p)).isDirectory() } catch { return false } }
+
+// A save that names the revision it was made from is refused when the file
+// moved on since (code `definition-conflict`, detail: the current revision).
+function staleBase(file: string, base: string | null | undefined, current: string | null) {
+  if (base === undefined || base === null) return
+  const now = current === null ? null : textHash(current)
+  if (now !== base) throw new RequestError(409, `${file} changed since revision ${base} was read (now ${now ?? 'absent'}); read it again and reapply the change`, { code: 'definition-conflict', rev: now })
+}
+
+export class Workspace {
+  readonly reg: Registration
+  // Set by the service when the watcher vouches that Git state has not
+  // changed since these were inspected; repositories() then reuses them.
+  knownRepositories?: RepositoryStatus[]
+  // A run's own working copy (p9, server/runspace.ts): the same logical
+  // workspace (reg.id), rooted at the copy; `shared` is the project
+  // workspace it was made from.
+  // improve_wfrun p2: recordRoot, where the run's folder is durably kept (owner:
+  // the repository of the tree that snapshots it); treeless, this workspace is
+  // rooted at that record because the run has no usable tree.
+  // better_git_strategy p1: `dir`, the run envelope (<workspace>/.agdev/runs/<wf>/<run>).
+  readonly copyOf?: { shared: Workspace; ref: { workflow: string; run: string }; dir?: string; recordRoot?: string; owner?: string; treeless?: boolean }
+  constructor(reg: Registration, copyOf?: Workspace['copyOf']) { this.reg = reg; this.copyOf = copyOf }
+  // The other registered projects' workflows (p10: delegate targets), when
+  // the caller knows the registry (the service, the CLI).
+  peers?: () => Promise<PeerProject[]>
+  private async peerContext(): Promise<{ peers?: PeerProject[]; projects?: Record<string, WorkflowRef[]> }> {
+    if (!this.peers) return {}
+    const peers = await this.peers().catch(() => undefined)
+    return peers ? { peers, projects: Object.fromEntries(peers.map(p => [p.project, p.workflows.map(w => ({ id: w.id, file: w.file, delegates: w.delegates, intake: w.intake }))])) } : {}
+  }
+  // The Git checkout every repository operation uses (sourceRoot): a project
+  // workspace's <path>/source, a run's own checkout (its Registration path is
+  // the checkout, or the record root when it has none).
+  get root() { return this.copyOf ? this.reg.path : sourceRootOf(this.reg.path) }
+  // The unversioned folder around it: the project workspace, or the run envelope.
+  get envelope() { return this.copyOf ? (this.copyOf.dir ?? dirname(this.reg.path)) : this.reg.path }
+  // agdev's state of the project workspace (<workspace>/.agdev).
+  get stateRoot() { return stateRootOf(this.shared.reg.path) }
+  // The project workspace: itself, or the one a run copy was made from.
+  get shared(): Workspace { return this.copyOf?.shared ?? this }
+
+  // ---- Git inspection -------------------------------------------------
+
+  async submodulePaths(): Promise<{ name: string; path: string; url?: string }[]> {
+    const r = await git(this.root, ['config', '-f', '.gitmodules', '--get-regexp', '^submodule\\..*\\.(path|url)$'])
+    if (r.code !== 0) return [] // no .gitmodules, or no entries
+    const byName = new Map<string, { name: string; path?: string; url?: string }>()
+    for (const line of r.stdout.split('\n')) {
+      const m = /^submodule\.(.+)\.(path|url) (.*)$/.exec(line)
+      if (!m) continue
+      const entry = byName.get(m[1]) ?? { name: m[1] }
+      entry[m[2] as 'path' | 'url'] = m[3]
+      byName.set(m[1], entry)
+    }
+    return [...byName.values()].filter((e): e is { name: string; path: string; url?: string } => !!e.path)
+  }
+
+  async repositories(): Promise<RepositoryStatus[]> {
+    if (this.knownRepositories) return this.knownRepositories
+    const rootHead = await git(this.root, ['rev-parse', 'HEAD'])
+    const rootBranch = await git(this.root, ['symbolic-ref', '-q', '--short', 'HEAD'])
+    const rootDirty = await git(this.root, ['status', '--porcelain=v1', '--ignore-submodules=all'])
+    const rootUrl = await git(this.root, ['config', '--get', 'remote.origin.url'])
+    const out: RepositoryStatus[] = [{
+      path: '.', name: 'project root', kind: 'root', category: 'root', initialized: true,
+      url: rootUrl.code === 0 ? rootUrl.stdout.trim() : undefined,
+      head: rootHead.code === 0 ? rootHead.stdout.trim() : undefined,
+      branch: rootBranch.code === 0 ? rootBranch.stdout.trim() : null,
+      dirty: rootDirty.code === 0 ? rootDirty.stdout.split('\n').filter(Boolean).length : 0,
+      publication: await publication(this.root),
+    }]
+    const subs = await this.submodulePaths()
+    const inspected = await Promise.all(subs.map(sm => this.inspectSubmodule(sm)))
+    // Directory mode: devdocs is a resource of the project, kept in the root
+    // repository; it is not an independent repository.
+    if (!subs.some(sm => normalizeRepoPath(sm.path) === 'devdocs')) {
+      const dir = join(this.root, 'devdocs')
+      if (await isDir(dir)) {
+        const dirty = await git(this.root, ['status', '--porcelain=v1', '--', 'devdocs'])
+        out.push({ path: 'devdocs', name: 'devdocs', kind: 'directory', category: 'devdocs', initialized: true, dirty: dirty.code === 0 ? dirty.stdout.split('\n').filter(Boolean).length : 0 })
+      }
+    }
+    // Local areas (project_migration p1): folders of the root repository the
+    // project declares as its own knowledge areas. They are part of the root,
+    // published with it; `initialized` says whether the folder is here.
+    const read = await this.readProject().catch(() => ({ project: undefined }))
+    const subPaths = subs.map(sm => normalizeRepoPath(sm.path) ?? sm.path)
+    for (const a of read.project?.areas ?? []) {
+      const path = normalizeRepoPath(a.path)
+      if (!path || path === '.' || path === 'devdocs' || out.some(r => r.path === path)) continue
+      const status: RepositoryStatus = { path, name: path.split('/').pop() ?? path, kind: 'directory', category: categoryOf(path), initialized: false, dirty: 0, description: a.description || undefined }
+      const sub = subPaths.find(sp => sp === path || path.startsWith(`${sp}/`) || sp.startsWith(`${path}/`))
+      if (sub === path) { const m = inspected.find(r => r.path === sub); if (m) m.error = [m.error, `also declared as a local area in project.yaml; a submodule is not a local area`].filter(Boolean).join('; '); continue }
+      if (sub) { status.error = `declared as a local area, but it overlaps the submodule ${sub}`; out.push(status); continue }
+      const dir = await inside(this.root, path).catch(() => null)
+      if (dir && await isDir(dir)) {
+        status.initialized = true
+        const dirty = await git(this.root, ['status', '--porcelain=v1', '--', path])
+        status.dirty = dirty.code === 0 ? dirty.stdout.split('\n').filter(Boolean).length : 0
+      }
+      out.push(status)
+    }
+    return [...out, ...inspected]
+  }
+
+  // The devdocs storage mode as declared and as Git shows it, and the
+  // repository that owns devdocs (server/devdocs.ts).
+  async devdocs(): Promise<DevdocsInfo> {
+    const read = await this.readProject().catch(() => ({ project: undefined }))
+    return devdocsInfo(this.root, read.project?.devdocs, (await this.submodulePaths()).map(s => s.path))
+  }
+
+  private async inspectSubmodule(sm: { path: string; url?: string }): Promise<RepositoryStatus> {
+    const path = normalizeRepoPath(sm.path) ?? sm.path
+    const status: RepositoryStatus = {
+      path, name: path.split('/').pop() ?? path, kind: 'submodule', category: categoryOf(path),
+      url: sm.url, initialized: false, dirty: 0,
+    }
+    const tree = await git(this.root, ['ls-tree', 'HEAD', '--', path])
+    const treeMatch = /^160000 commit ([0-9a-f]+)\t/.exec(tree.stdout)
+    if (treeMatch) status.recorded = treeMatch[1]
+    const index = await git(this.root, ['ls-files', '--stage', '--', path])
+    const indexMatch = /^160000 ([0-9a-f]+) \d\t/.exec(index.stdout)
+    if (indexMatch && indexMatch[1] !== status.recorded) status.staged = indexMatch[1]
+    try {
+      const dir = await inside(this.root, path)
+      // Initialized = the path is its own Git work tree: it has a .git entry
+      // and Git reports it, not the project root, as the top level.
+      const top = await git(dir, ['rev-parse', '--show-toplevel'])
+      const hasGit = await stat(join(dir, '.git')).then(() => true, () => false)
+      if (hasGit && top.code === 0 && top.stdout.trim() === await realpath(dir)) {
+        status.initialized = true
+        const head = await git(dir, ['rev-parse', 'HEAD'])
+        if (head.code === 0) status.head = head.stdout.trim()
+        const branch = await git(dir, ['symbolic-ref', '-q', '--short', 'HEAD'])
+        status.branch = branch.code === 0 ? branch.stdout.trim() : null
+        const dirty = await git(dir, ['status', '--porcelain=v1'])
+        status.dirty = dirty.stdout.split('\n').filter(Boolean).length
+        status.publication = await publication(dir)
+        const expected = status.staged ?? status.recorded
+        if (status.head && expected) status.matchesRecorded = status.head === expected
+      }
+    } catch (e) {
+      status.error = (e as Error).message
+    }
+    return status
+  }
+
+  // What this project root lacks, each with the action that fixes it.
+  async structure(): Promise<{ projectId?: string; projectName?: string; diagnostics: Diagnostic[] }> {
+    const root = this.root
+    const out: Diagnostic[] = []
+    let projectId: string | undefined, projectName: string | undefined
+    const text = await readTextOrNull(join(root, 'project.yaml')).catch(() => null)
+    if (text === null) {
+      out.push({ severity: 'error', code: 'project-missing', message: 'project.yaml does not exist', fix: 'Write project.yaml (schema ag.project.v1, see docs/contract.md), or use "Create project.yaml" in the project view.' })
+    } else {
+      const parsed = parseProject(text)
+      if (!parsed.ok) {
+        out.push({ severity: 'error', code: 'project-unreadable', message: `project.yaml: ${parsed.problem.message}${'line' in parsed.problem && parsed.problem.line ? ` (line ${parsed.problem.line})` : ''}`, fix: 'Fix the YAML by hand.' })
+      } else {
+        projectId = parsed.model.id || undefined
+        projectName = parsed.model.name || undefined
+        // The storage mode is diagnosed below with what Git shows.
+        for (const i of validateProject(parsed.model).filter(i => i.code !== 'devdocs-mode')) out.push({ severity: 'warning', code: `project-${i.code}`, message: `project.yaml: ${i.message}`, fix: 'Edit project.yaml or the project view.' })
+      }
+    }
+    const info = await this.devdocs()
+    if (info.problem) out.push(info.problem)
+    if (info.observed === 'missing' && info.declared !== 'submodule') {
+      out.push({ severity: 'error', code: 'devdocs-missing', message: 'devdocs/ does not exist', fix: 'Create the directory devdocs/workflows/ in the project root.' })
+    } else {
+      const dir = await this.workflowsDir()
+      if (!dir.exists && dir.reason === 'devdocs submodule is not initialized') {
+        out.push({ severity: 'error', code: 'devdocs-uninitialized', message: 'devdocs is not checked out in this workspace', fix: 'git submodule update --init devdocs' })
+      } else if (!dir.exists && info.observed !== 'missing') {
+        out.push({ severity: 'warning', code: 'workflows-missing', message: 'devdocs/workflows/ does not exist yet', fix: 'Create the directory devdocs/workflows/.' })
+      }
+    }
+    // The p3 layout kept runs at devdocs/<workflow>/runs/. It is not read or
+    // converted; its presence is said, so runs do not seem to have vanished.
+    const devdocsDir = join(root, 'devdocs')
+    const old = (await readdir(devdocsDir, { withFileTypes: true }).catch(() => [])).filter(d => d.isDirectory() && d.name !== 'runs' && d.name !== 'workflows' && ID_PATTERN.test(d.name))
+    const legacy: string[] = []
+    for (const d of old) if (await isDir(join(devdocsDir, d.name, 'runs'))) legacy.push(`devdocs/${d.name}/runs/`)
+    if (legacy.length) out.push({ severity: 'warning', code: 'runs-old-layout', message: `${legacy.join(', ')} use${legacy.length === 1 ? 's' : ''} the old run layout, which is not supported; those runs are not listed`, fix: 'Runs live in devdocs/runs/<workflow>/<run>/. Old runs are not converted; keep them as history or remove them by hand.' })
+    return { projectId, projectName, diagnostics: out }
+  }
+
+  // ---- project.yaml ---------------------------------------------------
+
+  async readProject(): Promise<{ text: string | null; project?: Project; problem?: FileProblem }> {
+    if (this.copyOf?.treeless) return this.copyOf.shared.readProject()
+    const text = await readTextOrNull(await inside(this.root, 'project.yaml'))
+    if (text === null) return { text, problem: { kind: 'missing', message: 'project.yaml does not exist' } }
+    const parsed = parseProject(text)
+    if (!parsed.ok) return { text, problem: parsed.problem }
+    return { text, project: parsed.model }
+  }
+
+  async projectResponse(): Promise<ProjectResponse> {
+    const repositories = await this.repositories()
+    const [read, wf, structure] = await Promise.all([this.readProject(), this.workflowSummaries(repositories), this.structure()])
+    return {
+      workspace: this.reg.id,
+      rev: read.text === null ? null : textHash(read.text),
+      project: read.project, problem: read.problem,
+      issues: read.project ? validateProject(read.project) : [],
+      repositories, workflows: wf.list, workflowsDir: wf.dir, structure: structure.diagnostics,
+    }
+  }
+
+  // `base` (project_migration p8): the revision the writer read. A file that
+  // changed since is not overwritten: the refusal names the current revision,
+  // so the writer reads it again instead of replacing someone else's edit.
+  async saveProject(project: Project, base?: string | null): Promise<{ rev: string; text: string }> {
+    const path = await inside(this.root, 'project.yaml')
+    const current = await readTextOrNull(path)
+    staleBase('project.yaml', base, current)
+    let text: string
+    if (current === null) {
+      text = newProjectText({ ...project, schema: project.schema || PROJECT_SCHEMA })
+    } else {
+      const parsed = parseProject(current)
+      if (!parsed.ok) throw new RequestError(409, `project.yaml on disk cannot be read (${parsed.problem.message}); fix the file before saving from the editor`, parsed.problem)
+      text = renderProject(parsed.doc, project)
+      if (text === current) return { rev: textHash(text), text }
+    }
+    await atomicWrite(path, text)
+    return { rev: textHash(text), text }
+  }
+
+  // ---- workflows ------------------------------------------------------
+
+  async workflowsDir(): Promise<{ path: string; exists: boolean; reason?: string }> {
+    const path = await inside(this.root, WORKFLOWS_DIR)
+    if (await isDir(path)) return { path, exists: true }
+    const devdocs = await inside(this.root, 'devdocs')
+    const submodule = (await this.submodulePaths()).some(s => normalizeRepoPath(s.path) === 'devdocs')
+    const reason = !(await isDir(devdocs)) ? 'devdocs is missing'
+      : submodule && !(await stat(join(devdocs, '.git')).then(() => true, () => false)) ? 'devdocs submodule is not initialized'
+        : `${WORKFLOWS_DIR} does not exist yet`
+    return { path, exists: false, reason }
+  }
+
+  async workflowFiles(): Promise<string[]> {
+    const dir = await this.workflowsDir()
+    if (!dir.exists) return []
+    return (await readdir(dir.path)).filter(f => WORKFLOW_FILE.test(f)).sort()
+  }
+
+  async readWorkflowFile(file: string): Promise<{ text: string | null; workflow?: Workflow; problem?: FileProblem }> {
+    if (!WORKFLOW_FILE.test(file)) throw new RequestError(400, `invalid workflow file name "${file}"`)
+    const path = await inside(this.root, `${WORKFLOWS_DIR}/${file}`)
+    // Parsing every workflow on every refresh dominated large projects; an
+    // unchanged file (same size, mtime and inode) reuses its last reading.
+    const st = await stat(path).catch(() => null)
+    const sig = st ? `${st.size}:${st.mtimeMs}:${st.ino}` : null
+    const hit = sig ? readCache.get(path) : undefined
+    if (hit && hit.sig === sig) return { text: hit.text, problem: hit.problem, workflow: hit.workflow && structuredClone(hit.workflow) }
+    const text = await readTextOrNull(path)
+    if (text === null) { readCache.delete(path); return { text, problem: { kind: 'missing', message: `${file} does not exist` } } }
+    const parsed = parseWorkflow(text)
+    const reading = parsed.ok ? { text, workflow: parsed.model } : { text, problem: parsed.problem }
+    if (sig) {
+      if (readCache.size > 2000) readCache.clear()
+      readCache.set(path, { sig, ...reading, workflow: reading.workflow && structuredClone(reading.workflow) })
+    }
+    return reading
+  }
+
+  async workflowSummaries(repos?: RepositoryStatus[]): Promise<{ list: WorkflowSummary[]; dir: { exists: boolean; reason?: string } }> {
+    const dir = await this.workflowsDir()
+    const files = await this.workflowFiles()
+    const reads = await Promise.all(files.map(async f => ({ file: f, ...(await this.readWorkflowFile(f)) })))
+    const refs = reads.filter(r => r.workflow).map(r => ({ id: r.workflow!.id, file: r.file, delegates: delegateTargets(r.workflow!, this.reg.project), intake: acceptsRequests(r.workflow!) }))
+    const repositories = repos ?? await this.repositories()
+    const { projects } = await this.peerContext()
+    const list: WorkflowSummary[] = []
+    for (const r of reads) {
+      if (!r.workflow) { list.push({ file: r.file, problem: r.problem, errors: 1, warnings: 0, delegates: [] }); continue }
+      const issues = validateWorkflow(r.workflow, { repositories, workflows: refs, file: r.file, project: this.reg.project, ...(projects ? { projects } : {}) })
+      const states = await approvalStates(r.workflow)
+      list.push({
+        file: r.file, id: r.workflow.id, name: r.workflow.name,
+        errors: issues.filter(i => i.severity === 'error').length,
+        warnings: issues.filter(i => i.severity === 'warning').length,
+        approvals: { intent: states.intent.status, definition: states.definition.status },
+        delegates: delegateTargets(r.workflow, this.reg.project),
+        intake: acceptsRequests(r.workflow),
+      })
+    }
+    return { list, dir: { exists: dir.exists, reason: dir.reason } }
+  }
+
+  async validationContext(file: string, repositories: RepositoryStatus[]): Promise<ValidationContext> {
+    const { list } = await this.workflowSummaries(repositories)
+    return {
+      repositories,
+      workflows: list.filter(s => s.id).map(s => ({ id: s.id!, file: s.file, delegates: s.delegates, intake: s.intake })),
+      file, project: this.reg.project, ...((await this.peerContext()).projects ? { projects: (await this.peerContext()).projects } : {}),
+    }
+  }
+
+  async workflowResponse(file: string): Promise<WorkflowResponse> {
+    const repositories = await this.repositories()
+    const [read, summaries, peerCtx] = await Promise.all([this.readWorkflowFile(file), this.workflowSummaries(repositories), this.peerContext()])
+    const ctx: ValidationContext = {
+      repositories,
+      workflows: summaries.list.filter(s => s.id).map(s => ({ id: s.id!, file: s.file, delegates: s.delegates, intake: s.intake })),
+      file, project: this.reg.project, ...(peerCtx.projects ? { projects: peerCtx.projects } : {}),
+    }
+    return {
+      workspace: this.reg.id, file, ...(this.reg.project ? { project: this.reg.project } : {}), ...(peerCtx.peers ? { peers: peerCtx.peers } : {}),
+      rev: read.text === null ? null : textHash(read.text), text: read.text,
+      workflow: read.workflow, problem: read.problem,
+      issues: read.workflow ? validateWorkflow(read.workflow, ctx) : [],
+      approvals: read.workflow ? await approvalStates(read.workflow) : undefined,
+      repositories, workflows: summaries.list,
+    }
+  }
+
+  // Creates a workflow file from a template (server/templates.ts). The
+  // documentation setting is a policy name or a whole declaration (p8/ex2:
+  // custom with its three steps); without one, the template's applies.
+  // Refusals name the field they are about (detail.field), so a form can
+  // show them beside the input.
+  async createWorkflow(id: string, name: string, documentation?: string | Documentation, template = 'empty'): Promise<{ file: string }> {
+    const dir = await this.workflowsDir()
+    const made = await this.newWorkflow(id, name, documentation, template)
+    if (!dir.exists) throw new RequestError(409, `cannot create a workflow: ${dir.reason}`)
+    const target = await inside(this.root, `${WORKFLOWS_DIR}/${made.file}`)
+    try {
+      await createExclusive(target, made.text)
+    } catch (e) {
+      if ((e as NodeJS.ErrnoException).code === 'EEXIST') throw new RequestError(409, `${made.file} already exists`, { field: 'id' })
+      throw e
+    }
+    return { file: made.file }
+  }
+
+  // A new definition's file name and bytes, refused as a creation would be;
+  // writes nothing (a draft keeps them in its own storage, p20).
+  async newWorkflow(id: string, name: string, documentation?: string | Documentation, template = 'empty'): Promise<{ file: string; text: string }> {
+    if (!ID_PATTERN.test(id)) throw new RequestError(400, `workflow id must match ${ID_PATTERN.source} (lowercase letters, digits, - _ .)`, { field: 'id' })
+    const doc: Documentation | undefined = typeof documentation === 'string' ? { policy: documentation } : documentation
+    if (doc && !docSteps(doc)) throw new RequestError(400, (DOC_POLICIES as readonly string[]).includes(doc.policy) ? `documentation policy ${doc.policy} ${doc.policy === 'custom' ? 'declares each of plan, reports and final (true or false)' : 'declares none of plan, reports and final'}` : `documentation policy must be ${DOC_POLICIES.join(', ')}`, { field: 'policy' })
+    if (!templateIds().includes(template)) throw new RequestError(400, `workflow template must be ${templateIds().join(' or ')}`, { field: 'template' })
+    const { list } = await this.workflowSummaries()
+    const clash = list.find(s => s.id === id)
+    if (clash) throw new RequestError(409, `workflow id "${id}" is already used by ${clash.file}`, { field: 'id' })
+    const w = await workflowFromTemplate(template, id, name, this)
+    if (doc) w.documentation = { ...doc }
+    return { file: `${id}.yaml`, text: newWorkflowText(w) }
+  }
+
+  // Saves a draft. Refuses to write over a file that is currently malformed or
+  // unsupported: the stale rendering in the UI must not replace it.
+  async saveWorkflow(file: string, workflow: Workflow, base?: string | null): Promise<{ rev: string; text: string }> {
+    const read = await this.readWorkflowFile(file)
+    if (read.text === null) throw new RequestError(409, `${file} no longer exists; create it again or restore it`)
+    staleBase(file, base, read.text)
+    const parsed = parseWorkflow(read.text)
+    if (!parsed.ok) throw new RequestError(409, `${file} on disk cannot be read (${parsed.problem.message}); fix the file before saving from the editor`, parsed.problem)
+    const text = renderWorkflow(parsed.doc, workflow)
+    if (text === read.text) return { rev: textHash(text), text }
+    await atomicWrite(await inside(this.root, `${WORKFLOWS_DIR}/${file}`), text)
+    return { rev: textHash(text), text }
+  }
+
+  // Records an approval of the saved content. Definition approval requires
+  // content without validation errors; intent approval requires an intent.
+  async approve(file: string, kind: ApprovalKind, approver: string, now = new Date()): Promise<{ rev: string; text: string; state: ApprovalState }> {
+    if (!approver.trim()) throw new RequestError(400, 'an approver name is required')
+    const read = await this.readWorkflowFile(file)
+    if (!read.workflow || read.text === null) throw new RequestError(409, `${file} cannot be approved: ${read.problem?.message ?? 'unreadable'}`)
+    const repositories = await this.repositories()
+    const issues = validateWorkflow(read.workflow, await this.validationContext(file, repositories))
+    if (kind === 'intent' && issues.some(i => i.code === 'intent-missing')) throw new RequestError(409, 'the intent is empty')
+    if (kind === 'definition' && hasErrors(issues)) {
+      throw new RequestError(409, 'the saved definition has validation errors', issues.filter(i => i.severity === 'error'))
+    }
+    const states = await approvalStates(read.workflow)
+    const next = structuredClone(read.workflow)
+    next.approvals[kind] = { digest: states[kind].digest, approver: approver.trim(), at: now.toISOString() }
+    const saved = await this.saveWorkflow(file, next)
+    return { ...saved, state: (await approvalStates(next))[kind] }
+  }
+
+  // ---- submodules -----------------------------------------------------
+
+  async addSubmodule(rawPath: string, url: string, env: Record<string, string> = {}): Promise<AddSubmoduleResponse> {
+    const path = normalizeRepoPath(rawPath)
+    if (!path || path === '.') throw new RequestError(400, `"${rawPath}" is not a project-relative path`)
+    if (!url.trim()) throw new RequestError(400, 'a repository location is required')
+    if (/^-/.test(url) || /^-/.test(path)) throw new RequestError(400, 'locations and paths may not start with "-"')
+    const existing = await this.submodulePaths()
+    if (existing.some(s => normalizeRepoPath(s.path) === path)) throw new RequestError(409, `${path} is already a submodule`)
+    const target = await inside(this.root, path) // bounds check before Git touches anything
+    if (await stat(target).then(() => true, () => false)) throw new RequestError(409, `${path} already exists in the workspace; choose another path (nothing was changed)`)
+    // Local sources need file transport, which Git disables for submodules by
+    // default. Enable it for this one command when the source is local.
+    const local = (!/^[a-z][a-z0-9+.-]*:\/\//i.test(url) && !env.GIT_CONFIG_COUNT) || url.startsWith('file://')
+    const r = await git(this.root, ['submodule', 'add', '--', url.trim(), path], { config: local ? LOCAL_TRANSPORT : {}, env, timeoutMs: 120_000 })
+    if (r.code === 0) return { ok: true, message: `Added ${path}. The change is staged in the project root; commit it when ready.`, stderr: r.stderr.trim() || undefined }
+    const after = await this.submodulePaths()
+    const staged = await git(this.root, ['ls-files', '--stage', '--', path])
+    const pathAbs = await inside(this.root, path)
+    const gitDir = await git(this.root, ['rev-parse', '--git-path', `modules/${path}`])
+    return {
+      ok: false,
+      message: `git submodule add failed (exit ${r.code}). Nothing was reset; the state below is what Git left.`,
+      stderr: r.stderr.trim(),
+      partial: {
+        gitmodulesEntry: after.some(s => normalizeRepoPath(s.path) === path),
+        pathExists: await stat(pathAbs).then(() => true, () => false),
+        staged: staged.stdout.trim() !== '',
+        gitDirExists: gitDir.code === 0 && await isDir(join(this.root, gitDir.stdout.trim())),
+      },
+    }
+  }
+}

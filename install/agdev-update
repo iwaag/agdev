@@ -1,0 +1,75 @@
+#!/usr/bin/env python3
+"""Adopt a verified core revision on this installation, through its lifecycle service.
+
+  agdev-update request <commit> --reason TEXT   persist the request and print its id; then finish your run
+  agdev-update status [<id>]                    what happened to it (or to the newest one)
+
+<commit> is resolved here, in your working copy, to the full hash (a full hash is taken as given); the service activates exactly that
+commit, never a later state of a branch, and only once it is on `main` of the source (integrated work).
+Made from an attempt, the request waits (state awaiting-requester) until that attempt has ended and its
+run has no other open attempt; the wait is bounded, and a requester that never ends makes it fail.
+
+This changes the installation you are running on. Try a change on a candidate installation first
+(`agdev-remote`), and adopt the commit you verified there, or one with the same runtime code
+(`agdev-remote same-runtime`). The service builds the release, waits for open attempts, switches WFE,
+its CLI, the executor and Observer together, checks them and records the outcome. A request for
+another installation is refused by the service. docs/install.md.
+"""
+import argparse
+import datetime as dt
+import json
+import os
+import secrets
+import subprocess
+import sys
+from pathlib import Path
+
+if "AGDEV_LIFECYCLE" not in os.environ:
+    sys.exit("agdev-update: AGDEV_LIFECYCLE is not set; this tool is for a run of an installation's executor")
+ROOT = Path(os.environ["AGDEV_LIFECYCLE"])
+
+
+def exact_commit(revision: str) -> str:
+    # A full hash is exact already: the lifecycle resolves it in its own source (improve_multinodes p3), so no
+    # working copy holding it is needed here.
+    if len(revision) == 40 and all(c in "0123456789abcdef" for c in revision):
+        return revision
+    done = subprocess.run(["git", "rev-parse", "--verify", f"{revision}^{{commit}}"], text=True, capture_output=True, check=False)
+    if done.returncode != 0:
+        sys.exit(f"agdev-update: {revision!r} is not a commit in this working copy; fetch it first ({done.stderr.strip()[-200:]})")
+    return done.stdout.strip()
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    commands = parser.add_subparsers(dest="command", required=True)
+    request = commands.add_parser("request")
+    request.add_argument("commit")
+    request.add_argument("--reason", required=True)
+    status = commands.add_parser("status")
+    status.add_argument("id", nargs="?")
+    args = parser.parse_args()
+    if args.command == "request":
+        identity = dt.datetime.now(dt.timezone.utc).strftime("%Y%m%dT%H%M%SZ-") + secrets.token_hex(3)
+        record = {"id": identity, "instance": os.environ.get("AGDEV_INSTANCE_ID", ""), "commit": exact_commit(args.commit), "asked": args.commit,
+                  "onBranch": "main", "reason": args.reason, "requestedAt": dt.datetime.now(dt.timezone.utc).isoformat(),
+                  "run": os.environ.get("WFE_RUN", ""), "attempt": os.environ.get("WFE_ATTEMPT", "")}
+        if not record["attempt"]:
+            print("agdev-update: not made from an attempt; the service will not wait for any run before building", file=sys.stderr)
+        path = ROOT / "requests" / f"{identity}.json"
+        path.with_suffix(".tmp").write_text(json.dumps(record, indent=1) + "\n")
+        os.replace(path.with_suffix(".tmp"), path)
+        print(identity)
+        return 0
+    updates = sorted((ROOT / "updates").glob("*.json"), key=lambda p: p.name)
+    pending = sorted((ROOT / "requests").glob("*.json"), key=lambda p: p.name)
+    chosen = [p for p in updates + pending if not args.id or p.stem == args.id]
+    if not chosen:
+        print("no such update", file=sys.stderr)
+        return 1
+    print(chosen[-1].read_text(), end="")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

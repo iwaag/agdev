@@ -1,0 +1,39 @@
+#!/usr/bin/env python3
+"""Make the transfer bundle of a new installation's core, on any machine holding the core repository.
+
+  make-bundles --core <core repo> [--core-ref <rev>] --out <folder>
+
+Writes <out>/agdev.bundle and <out>/manifest.json. Projects are not bundled: an installation
+summons them from a summonplan (`agdevctl bootstrap-projects --plan <file>`,
+workflow_editor/docs/summon.md).
+"""
+import argparse
+import json
+import subprocess
+import tempfile
+from pathlib import Path
+
+
+def git(*args: str, cwd=None) -> str:
+    return subprocess.run(["git", *args], cwd=cwd, check=True, text=True, stdout=subprocess.PIPE).stdout.strip()
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("--core", required=True, type=Path)
+    parser.add_argument("--core-ref", default="main", help="the core revision that becomes the installation's main")
+    parser.add_argument("--out", required=True, type=Path)
+    args = parser.parse_args()
+    args.out.mkdir(parents=True, exist_ok=True)
+    core = git("rev-parse", args.core_ref, cwd=args.core)
+    with tempfile.TemporaryDirectory() as tmp:
+        git("init", "-q", "--bare", tmp, cwd=args.core)
+        git("push", "-q", tmp, f"{core}:refs/heads/main", cwd=args.core)
+        git("bundle", "create", "-q", str(args.out / "agdev.bundle"), "refs/heads/main", cwd=tmp)
+    sources = [{"repository": "agdev", "project": "agdev", "bundle": "agdev.bundle", "commit": core, "description": "agdev"}]
+    (args.out / "manifest.json").write_text(json.dumps({"sources": sources}, indent=1) + "\n")
+    print(json.dumps(sources, indent=1))
+
+
+if __name__ == "__main__":
+    main()

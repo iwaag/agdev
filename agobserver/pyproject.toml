@@ -1,0 +1,19 @@
+[project]
+name = "agobserver"
+version = "0.1.0"
+description = "agobserver: an agag agent"
+requires-python = ">=3.11"
+dependencies = ["pyagag"]
+
+[project.scripts]
+agobserver-workflow = "agobserver.wfmonitor:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/agobserver"]
+
+[tool.uv.sources]
+pyagag = { git = "https://github.com/iwaag/pyagag.git", rev = "03a2a325e8f0a9392f69275b1253d95ab67a360d" }

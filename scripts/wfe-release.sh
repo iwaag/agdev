@@ -1,0 +1,190 @@
+#!/bin/sh
+# Builds and installs the workflow editor service and its `wfe`
+# launcher from agdev's own source (workflow_editor/, p4/ex1). The editor
+# is a system component of agdev: a release is built from one agdev
+# commit and nothing is fetched from any managed project.
+#
+#   scripts/wfe-release.sh build    <area> [<commit>]  build a release (default HEAD)
+#   scripts/wfe-release.sh activate <area> <commit>    make a built release current
+#   scripts/wfe-release.sh switch   <area> <commit>    select it and write the launcher; for a lifecycle
+#                                                      service that restarts the services itself (install/agdevctl)
+#   scripts/wfe-release.sh deploy   <area> [<commit>]  build, then activate
+#   scripts/wfe-release.sh status   <area>             current release, service and launcher
+#
+# <area> is the operating area (pj-agdev/.local/agdev): its registry.json is the
+# catalog, and it holds the installed system code beside the workspaces:
+#
+#   <area>/service/releases/<core commit>/   workflow_editor/ at that commit, built, RELEASE.json;
+#                                            system/ with the executor, Observer and install resources of the same commit
+#   <area>/service/current -> releases/<commit>    what the service (launchd) and the launcher run
+#   <area>/bin/wfe                                 the launcher (autolab's executor and its agents use it)
+#   <area>/authoring/AGENTS.md, CLAUDE.md          the authoring entry for an IDE agent (p13), refreshed on activation
+#
+# The service and the launcher both run service/current, so one symlink switch
+# moves them together. Activation
+# refuses while an execution attempt is open (the CLI is not replaced under a
+# live attempt), restarts com.agdev.wfe-service, and then requires both the
+# service (GET api/version) and the launcher (wfe version) to report the new
+# commit. If either does not within the timeout, activation fails and reports
+# the selected release for inspection; it never restores an older release.
+#
+# Environment: WFE_RELEASE_REPO (the Git repository, default the one holding this
+# script), WFE_RELEASE_STATE (where system/*/.local of a release point, default none),
+# AGDEV_RUNTIME (the tool versions) and AGDEV_SOURCE (the repository URL the commit comes from, for Home's
+# commit link), both recorded in RELEASE.json. Tests: WFE_SERVICE_LABEL (default
+# com.agdev.wfe-service), WFE_SERVICE_URL (default http://127.0.0.1:8098),
+# WFE_HEALTH_SECONDS (30).
+set -eu
+
+usage() { sed -n '7,12p' "$0" | sed 's/^# //' >&2; exit 2; }
+[ $# -ge 2 ] || usage
+CMD=$1
+AREA=$(cd "$2" && pwd)
+REPO=${WFE_RELEASE_REPO:-$(cd "$(dirname "$0")/.." && pwd)}
+LABEL=${WFE_SERVICE_LABEL:-com.agdev.wfe-service}
+URL=${WFE_SERVICE_URL:-http://127.0.0.1:8098}
+HEALTH=${WFE_HEALTH_SECONDS:-30}
+SERVICE="$AREA/service"
+[ -f "$AREA/registry.json" ] || { echo "$AREA has no registry.json: not an operating area" >&2; exit 2; }
+
+resolve_commit() { git -C "$REPO" rev-parse --verify "${1:-HEAD}^{commit}"; }
+
+build() {
+  SHA=$(resolve_commit "${1:-HEAD}")
+  REL="$SERVICE/releases/$SHA"
+  if [ "$(git -C "$REPO" rev-parse --is-bare-repository)" = "false" ] && [ -n "$(git -C "$REPO" status --porcelain -- workflow_editor)" ]; then
+    echo "note: workflow_editor/ has uncommitted changes; the release is built from commit $SHA, not the working tree"
+  fi
+  git -C "$REPO" cat-file -e "$SHA:workflow_editor/package.json" 2>/dev/null || { echo "commit $SHA has no workflow_editor/" >&2; exit 1; }
+  if [ -f "$REL/RELEASE.json" ]; then echo "release $SHA exists (built before)"; return 0; fi
+  rm -rf "$REL.tmp" && mkdir -p "$REL.tmp"
+  git -C "$REPO" archive "$SHA" workflow_editor | tar -x -C "$REL.tmp" --strip-components 1
+  ( cd "$REL.tmp" && npm ci --no-audit --no-fund && npm run build ) || { echo "build failed; nothing in use changed ($REL.tmp kept for inspection)" >&2; exit 1; }
+  build_system "$SHA" || { echo "system build failed; nothing in use changed ($REL.tmp kept for inspection)" >&2; exit 1; }
+  mv "$REL.tmp" "$REL"
+  finish_system "$REL" || { echo "installing the release's environments failed" >&2; mv "$REL" "$REL.tmp"; exit 1; }
+  pyagag=$(sed -n 's/^source = { git = "[^"]*pyagag[^#]*#\([0-9a-f]*\)".*/\1/p' "$REL/system/agautolab/uv.lock" | head -1)
+  # The source: what the caller named, else where the mirror was cloned from (an older agdevctl names none);
+  # only an http(s) URL without credentials is recorded.
+  src=${AGDEV_SOURCE:-$(git -C "$REPO" config --get remote.origin.url 2>/dev/null || true)}
+  case "$src" in http://*@*|https://*@*) src= ;; http://*|https://*) ;; *) src= ;; esac
+  # RELEASE.json last: its presence is what makes this a built release.
+  printf '{"agdevworld": "%s", "tree": "%s", "built": "%s", "pyagag": "%s", "runtime": "%s", "source": "%s", "tests": "none"}\n' "$SHA" "$(git -C "$REPO" rev-parse "$SHA:workflow_editor")" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$pyagag" "${AGDEV_RUNTIME:-}" "$src" > "$REL/RELEASE.json.new"
+  mv "$REL/RELEASE.json.new" "$REL/RELEASE.json"
+  echo "built: releases/$SHA"
+}
+
+# The executor and Observer of the same commit, each in its own locked environment,
+# resolved in the temporary place (a lock that no longer resolves fails the build) and
+# made again at the final path because a virtual environment records where it is.
+build_system() {
+  mkdir -p "$REL.tmp/system"
+  git -C "$REPO" archive "$1" agautolab agobserver install scripts | tar -x -C "$REL.tmp/system"
+  for part in agobserver agautolab; do
+    ( cd "$REL.tmp/system/$part" && uv sync --frozen -q --no-dev ) || return 1
+    rm -rf "$REL.tmp/system/$part/.venv"
+  done
+}
+
+finish_system() {
+  for part in agobserver agautolab; do
+    ( cd "$1/system/$part" && uv sync --frozen -q --no-dev ) || return 1
+    if [ -n "${WFE_RELEASE_STATE:-}" ]; then ln -sfn "$WFE_RELEASE_STATE/$part" "$1/system/$part/.local"; fi
+  done
+  if [ -n "${WFE_RELEASE_STATE:-}" ]; then ln -sfn "$WFE_RELEASE_STATE/system" "$1/system/.local"; fi
+}
+
+open_attempts() {
+  DB="$AREA/.local/exec/exec.sqlite"
+  [ -f "$DB" ] || return 0
+  sqlite3 -readonly "$DB" "SELECT id || ' (' || workspace || ' ' || workflow || '/' || run || ')' FROM attempts WHERE state != 'ended'" 2>/dev/null || true
+}
+
+write_launcher() {
+  mkdir -p "$AREA/bin"
+  NODE=$(command -v node)
+  cat > "$AREA/bin/wfe.new" <<SH
+#!/bin/sh
+# wfe of the installed release (service/current), pinned to this area's registry
+# and to the port its service listens on (so wfe status finds it).
+# Written by agdev scripts/wfe-release.sh; the service runs the same release.
+# Compiled code is reused across calls (Node's compile cache, per uid and file content);
+# an unusable directory only means normal compilation.
+NODE_COMPILE_CACHE="\${NODE_COMPILE_CACHE:-$AREA/.local/node-compile-cache}"; export NODE_COMPILE_CACHE
+WFE_REGISTRY="$AREA/registry.json" WFE_PORT="${URL##*:}" exec "$NODE" "$SERVICE/current/cli/wfe.ts" "\$@"
+SH
+  chmod +x "$AREA/bin/wfe.new" && mv -f "$AREA/bin/wfe.new" "$AREA/bin/wfe"
+  for tool in agdev-update agdev-remote agdev-cred; do
+    if [ -f "$SERVICE/current/system/install/$tool" ]; then ln -sfn "$SERVICE/current/system/install/$tool" "$AREA/bin/$tool"; fi
+  done
+}
+
+# The area's authoring entry (workflow_editor p13): <area>/authoring/AGENTS.md
+# and CLAUDE.md from the release's template, with the published editor URL
+# (present.json answerBase, else the service URL). Never above the workspaces.
+write_authoring() {
+  pub=$(node -e 'try{const c=JSON.parse(require("fs").readFileSync(process.argv[1],"utf8"));console.log(c.answerBase||"")}catch{console.log("")}' "$AREA/present.json")
+  WFE_REGISTRY="$AREA/registry.json" node "$SERVICE/current/cli/wfe.ts" setup "$AREA" --installed-url "${pub:-$URL/}" || echo "note: the authoring entry was not refreshed" >&2
+}
+
+# An atomic replacement of the link: GNU mv -T, BSD mv -h.
+switch_to() { ln -sfn "releases/$1" "$SERVICE/current.new" && { mv -fT "$SERVICE/current.new" "$SERVICE/current" 2>/dev/null || mv -fh "$SERVICE/current.new" "$SERVICE/current"; }; }
+
+restart() {
+  if command -v launchctl >/dev/null 2>&1 && launchctl print "gui/$(id -u)/$LABEL" >/dev/null 2>&1; then
+    launchctl kickstart -k "gui/$(id -u)/$LABEL" && echo "restarted $LABEL"
+  else
+    echo "$LABEL is not loaded; nothing restarted"
+  fi
+}
+
+# healthy <sha>: the service and launcher both report the selected release.
+healthy() {
+  i=0
+  while [ "$i" -lt "$HEALTH" ]; do
+    svc=$(curl -sf "$URL/api/version" 2>/dev/null | node -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>{try{console.log(JSON.parse(s).release?.agdevworld??"")}catch{console.log("")}})' || true)
+    cli=$("$AREA/bin/wfe" version --json 2>/dev/null | node -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>{try{console.log(JSON.parse(s).release?.agdevworld??"")}catch{console.log("")}})' || true)
+    [ "$svc" = "$1" ] && [ "$cli" = "$1" ] && return 0
+    i=$((i + 1)); sleep 1
+  done
+  return 1
+}
+
+activate() {
+  SHA=$(resolve_commit "$1")
+  [ -f "$SERVICE/releases/$SHA/RELEASE.json" ] || { echo "releases/$SHA is not built (scripts/wfe-release.sh build)" >&2; exit 1; }
+  busy=$(open_attempts)
+  if [ -n "$busy" ]; then echo "refused: an execution attempt is open: $busy. Let it end (or stop it) before replacing the CLI." >&2; exit 1; fi
+  CURRENT=$(readlink "$SERVICE/current" 2>/dev/null | sed 's#^releases/##' || true)
+  if [ "$CURRENT" = "$SHA" ]; then echo "releases/$SHA is already current"; write_launcher; restart; healthy "$SHA" && echo "healthy" && return 0; echo "not healthy" >&2; exit 1; fi
+  switch_to "$SHA"
+  write_launcher
+  echo "current: releases/$SHA (was: ${CURRENT:-none})"
+  restart
+  if healthy "$SHA"; then
+    echo "healthy: the service and bin/wfe run agdev $SHA"
+    write_authoring
+    return 0
+  fi
+  echo "health check failed for $SHA within ${HEALTH}s" >&2
+  echo "selected release remains $SHA; inspect $AREA/service.log" >&2
+  exit 1
+}
+
+case "$CMD" in
+  build) build "${3:-HEAD}" ;;
+  activate) [ $# -ge 3 ] || usage; activate "$3" ;;
+  switch) [ $# -ge 3 ] || usage
+    SHA=$(resolve_commit "$3")
+    [ -f "$SERVICE/releases/$SHA/RELEASE.json" ] || { echo "releases/$SHA is not built" >&2; exit 1; }
+    switch_to "$SHA"; write_launcher; echo "current: releases/$SHA" ;;
+  authoring) write_authoring ;;
+  deploy) build "${3:-HEAD}"; activate "$(resolve_commit "${3:-HEAD}")" ;;
+  status)
+    echo "current:  $(readlink "$SERVICE/current" 2>/dev/null || echo none)"
+    echo "releases: $(ls "$SERVICE/releases" 2>/dev/null | tr '\n' ' ')"
+    echo "service:  $(curl -sf "$URL/api/version" 2>/dev/null || echo "no answer at $URL/api/version")"
+    echo "launcher: $("$AREA/bin/wfe" version --json 2>/dev/null | tr -d '\n' || echo "no launcher")"
+    a=$(open_attempts); echo "open attempts: ${a:-none}" ;;
+  *) usage ;;
+esac

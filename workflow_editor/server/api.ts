@@ -1,0 +1,1322 @@
+// HTTP routes of the local service. JSON in, JSON out; the UI is one client.
+import { spawn } from 'node:child_process'
+import type { IncomingMessage, ServerResponse } from 'node:http'
+import { readFile, stat } from 'node:fs/promises'
+import { basename, dirname, extname, isAbsolute, join, normalize, sep } from 'node:path'
+import { fileURLToPath } from 'node:url'
+import type { RepositoryStatus, WorkspaceSummary, WorkspacesResponse } from '../shared/api.ts'
+import { APPROVAL_KINDS, type ApprovalKind, type Documentation, type Project, type Workflow } from '../shared/model.ts'
+import { addNewRepository, createProject } from './create.ts'
+import { workspaceDir } from './placement.ts'
+import { addSharedRepository, createSharedRepository, dashboard, obtainWorkspace, registerGiteaProject, registerSharedRepository, type AgdevContext } from './agdev.ts'
+import type { Gitea } from './gitea.ts'
+import type { ExecStore } from './exec.ts'
+import { REPO_CATEGORIES, type RepoCategory } from './registry.ts'
+import { BoundaryError } from './files.ts'
+import { loadRegistry, observe, registerWorkspace, RegistryError, type Registration, type Registry } from './registry.ts'
+import { listRuns, readRunFile, runOp, runResponse, resolveRef } from './runs.ts'
+import { OPS, hostOf, runKey, type OpInput, type RunRef } from '../shared/run.ts'
+import type { Watcher } from './watch.ts'
+import { areaInstance, codeVersion } from './version.ts'
+import { loadPresentConfig } from './present.ts'
+import { assertNotRetired, assertWorkspaceAllowed, loadBoundary, retiredByUrl } from './boundary.ts'
+import { RequestError, Workspace } from './workspace.ts'
+
+export interface ServiceConfig {
+  registryFile: string
+  // The authoring area: browser-created projects go beneath it and new
+  // devdocs sources into its sources/. Defaults to the registry's directory.
+  area?: string
+  // Browser writes are accepted from these origins and from the origin the
+  // request itself names (same origin, under whatever LAN name it was opened).
+  allowedOrigins: string[]
+  // Host names the service answers to; absent: any (the service is meant to
+  // be reached from the LAN under any of the host's names).
+  allowedHosts?: string[]
+  distDir?: string // serve the built UI from the same origin
+  watcher?: Watcher
+  gitea?: Gitea
+  giteaProblem?: string
+  exec?: ExecStore // this host's execution management (queue, attempts, publication)
+  conversations?: import('./conversations.ts').ConversationStore // conversations with project agents (p8, p15)
+  usage?: import('./usage.ts').UsageReader // what executions used (retire_old_ui p1)
+  dialogue?: import('./dialogue.ts').DialogueStore // character dialogue, the service's own store and worker (argue p5)
+  challenges?: import('./challenges.ts').ChallengeStore // challenges (challenge p1)
+  peerLoop?: import('./peerhttp.ts').PeerHttpLoop // HTTP delivery between installations (cluster_teamwork p2)
+}
+
+
+// Requests forwarded by agdev's same-origin route carry this header
+// (set by its nginx). Through that route the service offers the agdev and
+// editor operations, but no operation that takes an arbitrary host path or
+// repository location: those stay with local processes (the CLI).
+export const ROUTE_HEADER = 'x-wfe-route'
+
+const MAX_BODY = 2 * 1024 * 1024
+
+function send(res: ServerResponse, status: number, body: unknown) {
+  const text = JSON.stringify(body)
+  res.writeHead(status, { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store' })
+  res.end(text)
+}
+
+// `max`: a route that carries files (p19: a person's message) reads more.
+async function body(req: IncomingMessage, max = MAX_BODY): Promise<unknown> {
+  const type = req.headers['content-type'] ?? ''
+  if (!type.startsWith('application/json')) throw new RequestError(415, 'writes require content-type: application/json')
+  const tooLarge = (n: number) => new RequestError(413, `request body too large (${n} bytes; at most ${max})`, max > MAX_BODY ? { code: 'attachment-limit', limit: 'requestBytes', actual: n } : undefined)
+  const declared = Number(req.headers['content-length'] ?? 0)
+  if (declared > max) throw tooLarge(declared)
+  const chunks: Buffer[] = []
+  let size = 0
+  for await (const chunk of req) {
+    size += (chunk as Buffer).length
+    if (size > max) throw tooLarge(size)
+    chunks.push(chunk as Buffer)
+  }
+  try { return JSON.parse(Buffer.concat(chunks).toString('utf8')) } catch { throw new RequestError(400, 'invalid JSON body') }
+}
+
+const isObj = (v: unknown): v is Record<string, unknown> => typeof v === 'object' && v !== null && !Array.isArray(v)
+
+// Minimal structural check of a model sent by a client. Validation of content
+// happens in shared/validate.ts; this only keeps wrong types out of the YAML.
+function asWorkflow(v: unknown): Workflow {
+  if (!isObj(v) || !isObj(v.repositories) || !isObj(v.nodes) || !Array.isArray(v.edges) || !isObj(v.approvals) || !isObj(v.layout) || !isObj((v.layout as Record<string, unknown>).nodes)) {
+    throw new RequestError(400, 'body.workflow is not a workflow model')
+  }
+  for (const k of ['schema', 'id', 'name', 'intent']) if (typeof v[k] !== 'string') throw new RequestError(400, `workflow.${k} must be text`)
+  for (const [id, n] of Object.entries(v.nodes)) {
+    if (!isObj(n) || typeof n.type !== 'string' || typeof n.description !== 'string' || typeof n.name !== 'string' ||
+      !Array.isArray(n.repositories) || !n.repositories.every(r => typeof r === 'string') ||
+      (n.workflow !== undefined && typeof n.workflow !== 'string')) throw new RequestError(400, `workflow.nodes.${id} is malformed`)
+  }
+  for (const [k, b] of Object.entries(v.repositories)) {
+    if (!isObj(b) || typeof b.path !== 'string' || typeof b.access !== 'string') throw new RequestError(400, `workflow.repositories.${k} is malformed`)
+  }
+  for (const e of v.edges) if (!isObj(e) || typeof e.from !== 'string' || typeof e.to !== 'string') throw new RequestError(400, 'workflow.edges is malformed')
+  // A model without intake would remove the file's declaration, turning an
+  // opt-out into the default (fix2).
+  if (!isObj(v.intake) || typeof v.intake.zulip !== 'string' || (v.intake.requests !== undefined && typeof v.intake.requests !== 'boolean')) throw new RequestError(400, 'workflow.intake must be {zulip: text, requests?: boolean} (zulip "" or requests false: no requests)')
+  for (const [k, p] of Object.entries((v.layout as Record<string, Record<string, unknown>>).nodes)) {
+    if (!isObj(p) || typeof p.x !== 'number' || typeof p.y !== 'number' || !Number.isFinite(p.x) || !Number.isFinite(p.y)) throw new RequestError(400, `workflow.layout.nodes.${k} is malformed`)
+  }
+  return v as unknown as Workflow
+}
+
+function asProject(v: unknown): Project {
+  if (!isObj(v)) throw new RequestError(400, 'body.project is not a project model')
+  for (const k of ['schema', 'id', 'name', 'intent']) if (typeof v[k] !== 'string') throw new RequestError(400, `project.${k} must be text`)
+  if (!Array.isArray(v.goals) || !v.goals.every(g => typeof g === 'string')) throw new RequestError(400, 'project.goals must be a list of text')
+  return v as unknown as Project
+}
+
+const MIME: Record<string, string> = {
+  '.html': 'text/html; charset=utf-8', '.js': 'text/javascript; charset=utf-8', '.css': 'text/css; charset=utf-8',
+  '.svg': 'image/svg+xml', '.json': 'application/json', '.ico': 'image/x-icon', '.png': 'image/png', '.mjs': 'text/javascript; charset=utf-8', '.map': 'application/json',
+}
+// What a project's or run's file is served as for a reader's browser (p8):
+// media plays and text shows; anything else downloads.
+const RAW_MIME: Record<string, string> = {
+  ...MIME, '.jpg': 'image/jpeg', '.jpeg': 'image/jpeg', '.gif': 'image/gif', '.webp': 'image/webp',
+  '.wav': 'audio/wav', '.mp3': 'audio/mpeg', '.ogg': 'audio/ogg', '.flac': 'audio/flac', '.mp4': 'video/mp4', '.webm': 'video/webm',
+  '.md': 'text/plain; charset=utf-8', '.txt': 'text/plain; charset=utf-8', '.yaml': 'text/plain; charset=utf-8', '.pdf': 'application/pdf',
+}
+function sendRaw(res: ServerResponse, path: string, bytes: Buffer) {
+  res.writeHead(200, { 'content-type': RAW_MIME[extname(path).toLowerCase()] ?? 'application/octet-stream', 'content-length': bytes.length, 'content-disposition': `inline; filename="${basename(path).replace(/"/g, '')}"` })
+  res.end(bytes)
+}
+
+// This installation's web origin as present.json publishes it (the origin of answerBase, without its /wfe/ path); null when unset or unreadable.
+const webOriginOf = (area: string): string | null => { try { const b = loadPresentConfig(area).answerBase; return b ? new URL(b).origin : null } catch { return null } }
+
+export function createHandler(config: ServiceConfig) {
+  let challenges = config.challenges
+  async function challengeStore() {
+    if (!challenges) {
+      const { ChallengeStore } = await import('./challenges.ts')
+      challenges = new ChallengeStore({ area: config.area ?? dirname(config.registryFile), env: async () => config.gitea ? config.gitea.gitEnv() : {} })
+    }
+    return challenges
+  }
+  async function registry(): Promise<Registry> { return loadRegistry(config.registryFile) }
+  const area = config.area ?? dirname(config.registryFile)
+  // Shared areas resolve against this area's shares.json (project_migration p6).
+  void import('./shares.ts').then(m => m.setShareArea(area))
+  const texts = (v: unknown) => Array.isArray(v) && v.every(x => typeof x === 'string')
+
+  const agdev: AgdevContext = { registryFile: config.registryFile, area, gitea: config.gitea, giteaProblem: config.giteaProblem, executor: config.exec ? async () => config.exec!.executorState() : undefined, workers: config.exec ? async () => config.exec!.workersState().map(w => ({ id: w.id, label: w.label, local: w.local, state: w.state, at: w.at, detail: w.detail })) : undefined }
+  const needExec = () => { if (!config.exec) throw new RequestError(503, 'execution is not configured on this service'); return config.exec }
+  // fix6: the delegated results a run reports are assessed with its completion (reads children through this host's delegation store).
+  const assessAdvice = () => config.exec ? { assess: async (rec: import('../shared/run.ts').RunRecord) => (await import('./delegate.ts')).delegatedReminders(config.exec!.delegate, rec) } : {}
+  // tidy p2: what a conductor's last completion leaves unsaid in its
+  // discussion, as the CLI adds it (server/restChecks.ts).
+  async function restAdvice(ws: Workspace, ref: RunRef, node: string): Promise<import('../shared/reminders.ts').Reminder[]> {
+    const cs = config.conversations
+    if (!cs) return []
+    const { ConversationService } = await import('./conversationService.ts')
+    const ds = new ConversationService(cs)
+    if ('disabled' in ds.config()) return []
+    const { readRun } = await import('./runs.ts')
+    const record = (await readRun(ws, ref)).record
+    if (!record) return []
+    return (await import('./restChecks.ts')).restReminders(ds, record, `${ws.reg.id}/${ref.workflow}/${ref.run}`, node)
+  }
+  const str = (v: unknown, what: string) => { if (typeof v !== 'string' || !v.trim()) throw new RequestError(400, `${what} is required`); return v.trim() }
+  const category = (v: unknown): RepoCategory => { if (!REPO_CATEGORIES.includes(v as RepoCategory)) throw new RequestError(400, `category must be one of ${REPO_CATEGORIES.join(', ')}`); return v as RepoCategory }
+
+  async function workspace(id: string): Promise<Workspace> {
+    const reg = (await registry()).workspaces.find(w => w.id === id)
+    if (!reg) throw new RequestError(404, `workspace "${id}" is not registered`)
+    await assertWorkspaceAllowed(await loadBoundary(config.registryFile, area), reg, 'Opening')
+    const obs = await observe(reg)
+    if (!obs.available) throw new RequestError(409, `workspace "${id}" is registered but not available: ${obs.reason}`)
+    const ws = new Workspace(reg)
+    // Delegate targets in the other registered projects (p10).
+    ws.peers = async () => (await import('./peers.ts')).registryPeers(config.registryFile, area, reg.project, { registryFile: config.registryFile, area, gitea: config.gitea, giteaProblem: config.giteaProblem })
+    return ws
+  }
+
+  // Repository inspection costs several Git commands per submodule. While a
+  // watcher observes a workspace, its result is reused until the Git
+  // fingerprint or .gitmodules changes; `?refresh=1` always inspects anew.
+  const repoCache = new Map<string, { key: string; repos: RepositoryStatus[] }>()
+  async function withRepositories(ws: Workspace, refresh: boolean) {
+    const gitKey = config.watcher?.gitKey(ws.reg.id)
+    if (!gitKey) return
+    const modules = await readFile(join(ws.root, '.gitmodules'), 'utf8').catch(() => '')
+    const key = `${gitKey}\0${modules}`
+    const hit = repoCache.get(ws.reg.id)
+    if (hit && hit.key === key && !refresh) { ws.knownRepositories = hit.repos; return }
+    const repos = await ws.repositories()
+    repoCache.set(ws.reg.id, { key, repos })
+    ws.knownRepositories = repos
+  }
+
+  const accessOf = (url: URL): import('./access.ts').AccessContext => ({ registryFile: config.registryFile, area, gitea: config.gitea, giteaProblem: config.giteaProblem, refresh: url.searchParams.get('refresh') === '1' })
+  async function registered(id: string): Promise<Registration> {
+    const reg = (await registry()).workspaces.find(w => w.id === id)
+    if (!reg) throw new RequestError(404, `workspace "${id}" is not registered`)
+    await assertWorkspaceAllowed(await loadBoundary(config.registryFile, area), reg, 'Opening')
+    return reg
+  }
+
+  // Definitions by source (p20, docs/drafts.md): GET published-head, the check an
+  // open view polls; GET published[/<file>], what ordinary execution runs, with the
+  // checkout's relation beside the list when there is a checkout.
+  async function handleDefinitions(req: IncomingMessage, res: ServerResponse, url: URL, method: string, wsId: string, b: string, file: string | undefined, action: string | undefined): Promise<boolean> {
+    const reg = await registered(wsId)
+    const ctx = accessOf(url)
+    const pubs = await import('./published.ts')
+    if (b === 'published-head' && method === 'GET') {
+      if (!reg.project) throw new RequestError(409, `workspace ${reg.id} names no registered project`)
+      send(res, 200, { source: await pubs.publishedHead(ctx, reg.project, { refresh: ctx.refresh }) })
+      return true
+    }
+    if (b === 'published' && method === 'GET') {
+      const pub = await pubs.publishedWorkspace(ctx, reg, { ttlMs: pubs.OPEN_VIEW_TTL_MS })
+      if (file) {
+        const r = await pub.workflowResponse(file)
+        send(res, 200, { ...r, source: pub.source, descriptor: pubs.publishedDescriptor(pub.source, file, r.workflow?.id ?? null, r.text) })
+        return true
+      }
+      const { list, dir } = await pub.workflowSummaries()
+      const relation = await (async () => {
+        if (!(await observe(reg)).available) return { problem: 'this project has no checkout available on this host' }
+        return (await import('./workspaceSync.ts')).workspaceRelation(ctx, new Workspace(reg))
+      })().catch(e => ({ problem: (e as Error).message }))
+      send(res, 200, { source: pub.source, workflows: list, ...(dir.exists ? {} : { problem: dir.reason }), relation })
+      return true
+    }
+    if (b !== 'drafts') return false
+    if (!reg.project) throw new RequestError(409, `workspace ${reg.id} names no registered project, so it has no drafts`)
+    const d = await import('./drafts.ts')
+    const store = new d.DraftStore(area)
+    const input = method === 'GET' ? {} : await body(req) as Record<string, unknown>
+    const by = typeof input.by === 'string' ? input.by : ''
+    const rev = () => { if (typeof input.revision !== 'number') throw new RequestError(400, 'revision is required: the draft revision you read'); return input.revision }
+    if (!file && method === 'GET') { send(res, 200, { drafts: (await store.list({ project: reg.project, file: url.searchParams.get('file') || undefined })).map(d.draftMeta) }); return true }
+    if (file === 'local-edits' && method === 'GET') {
+      const { localEdits } = await import('./localEdits.ts')
+      send(res, 200, await localEdits(ctx, store, reg))
+      return true
+    }
+    if (!file && method === 'POST') {
+      let created
+      if (input.new && typeof input.new === 'object') {
+        const n = input.new as Record<string, unknown>
+        created = await d.newWorkflowDraft(ctx, store, reg, { id: str(n.id, 'id'), name: typeof n.name === 'string' ? n.name : '', documentation: n.documentation && typeof n.documentation === 'object' ? n.documentation as Documentation : typeof n.policy === 'string' ? n.policy : undefined, template: typeof n.template === 'string' ? n.template : 'empty', by })
+      } else if (input.import && typeof input.import === 'object') {
+        const i = input.import as Record<string, unknown>
+        const { importEdit } = await import('./localEdits.ts')
+        created = await importEdit(ctx, store, reg, { file: str(i.file, 'file'), sha256: str(i.sha256, 'sha256'), by })
+      } else created = await d.startDraft(ctx, store, reg, { file: str(input.file, 'file'), by, another: input.another === true })
+      send(res, 201, { draft: d.draftMeta(created) })
+      return true
+    }
+    if (!file) return false
+    if (!action && method === 'GET') { send(res, 200, await d.readDraft(ctx, store, reg, file)); return true }
+    if (!action && method === 'PUT') {
+      const saved = await d.saveDraft(store, file, { revision: rev(), by, ...(input.workflow ? { workflow: asWorkflow(input.workflow) } : {}), ...(typeof input.text === 'string' ? { text: input.text } : {}) })
+      send(res, 200, await d.readDraft(ctx, store, reg, saved.id))
+      return true
+    }
+    if (!action && method === 'DELETE') { send(res, 200, { draft: d.draftMeta(await d.discardDraft(store, file, { revision: rev(), by })) }); return true }
+    if (action === 'compare' && method === 'POST') { send(res, 200, await d.compareDraft(ctx, store, reg, file)); return true }
+    if (action === 'approve' && method === 'POST') {
+      if (!(APPROVAL_KINDS as readonly string[]).includes(input.kind as string)) throw new RequestError(400, 'kind must be intent or definition')
+      const saved = await d.approveDraft(ctx, store, reg, file, { revision: rev(), kind: input.kind as ApprovalKind, approver: typeof input.approver === 'string' ? input.approver : '' })
+      send(res, 200, await d.readDraft(ctx, store, reg, saved.id))
+      return true
+    }
+    if (action === 'resolve' && method === 'POST') {
+      const saved = await d.resolveDraft(ctx, store, reg, file, { revision: rev(), by, latest: typeof input.latest === 'string' ? input.latest : null, ...(typeof input.text === 'string' ? { text: input.text } : {}), ...(input.recreate === true ? { recreate: true } : {}), ...(typeof input.retarget === 'string' ? { retarget: input.retarget } : {}) })
+      send(res, 200, await d.readDraft(ctx, store, reg, saved.id))
+      return true
+    }
+    if (action === 'apply' && method === 'POST') {
+      const r = await d.applyDraft(ctx, store, reg, file, { revision: rev(), by, ...(typeof input.key === 'string' ? { key: input.key } : {}) })
+      send(res, r.ok ? 200 : r.apply.outcome === 'conflict' ? 409 : r.apply.outcome === 'invalid' ? 422 : 502, r)
+      return true
+    }
+    // A trial runs the exact saved revision, on the published code.
+    if (action === 'try' && method === 'POST') {
+      const draft = await store.read(file)
+      if (draft.project !== reg.project) throw new RequestError(404, `draft ${file} is of project ${draft.project}`)
+      if (draft.revision !== rev()) throw new RequestError(409, `draft ${file} is at revision ${draft.revision}, not ${String(input.revision)}: a trial runs a saved revision you have seen`, { code: 'draft-revision-conflict', revision: draft.revision })
+      const r = await needExec().request({ workspace: reg.id, workflow: draft.file, text: str(input.text, 'the request text'), author: str(input.author, 'author'), receipt: str(input.receipt, 'receipt'), by: typeof input.by === 'string' ? input.by : undefined, via: 'browser', ...(typeof input.node === 'string' && input.node ? { node: input.node } : {}), trial: { file: draft.file, sha256: draft.sha256, draft: { id: draft.id, revision: draft.revision, author: draft.author, text: draft.text } } })
+      send(res, 200, { ok: true, ref: r.ref, job: r.job, duplicate: r.duplicate })
+      return true
+    }
+    return false
+  }
+
+  async function serveStatic(res: ServerResponse, url: URL): Promise<boolean> {
+    if (!config.distDir) return false
+    const rel = normalize(decodeURIComponent(url.pathname)).replace(/^([/\\])+/, '')
+    let file = join(config.distDir, rel)
+    if (!file.startsWith(config.distDir + sep) && file !== config.distDir) return false
+    const st = await stat(file).catch(() => null)
+    // The embeddable graph (argue p4 ex3, src/embed/): its fixed names are
+    // never answered with the editor's page, and never cached stale.
+    const embed = rel.startsWith(`embed${sep}`) || rel.startsWith('embed/')
+    if (embed && (!st || st.isDirectory())) return false
+    if (!st || st.isDirectory()) file = join(config.distDir, 'index.html')
+    const data = await readFile(file).catch(() => null)
+    if (!data) return false
+    res.writeHead(200, { 'content-type': MIME[extname(file)] ?? 'application/octet-stream', ...(embed ? { 'cache-control': 'no-cache' } : {}) })
+    res.end(data)
+    return true
+  }
+
+  return async function handle(req: IncomingMessage, res: ServerResponse) {
+    try {
+      // Only answer to the listed host names, when a list is given.
+      const host = (req.headers.host ?? '').replace(/:\d+$/, '')
+      if (config.allowedHosts && !config.allowedHosts.includes(host)) throw new RequestError(403, `host "${host}" is not allowed`)
+      const url = new URL(req.url ?? '/', 'http://local')
+      const method = req.method ?? 'GET'
+      // Browser writes only from the page's own origin or a configured one
+      // (a page of another site cannot write). Clients that send no Origin
+      // (curl, tests) are allowed.
+      if (method !== 'GET' && method !== 'HEAD') {
+        const origin = req.headers.origin
+        const sameOrigin = origin !== undefined && req.headers.host !== undefined && origin.replace(/^https?:\/\//, '') === req.headers.host
+        if (origin !== undefined && !sameOrigin && !config.allowedOrigins.includes(origin)) throw new RequestError(403, `origin "${origin}" may not write`)
+      }
+      const parts = url.pathname.split('/').filter(Boolean).map(decodeURIComponent)
+      if (parts[0] !== 'api') {
+        if (method === 'GET' && await serveStatic(res, url)) return
+        if (method === 'GET' && !config.distDir && url.pathname === '/') {
+          res.writeHead(200, { 'content-type': 'text/plain; charset=utf-8' })
+          res.end('This is the workflow editor API only.\nOpen the UI through the Vite dev server (npm run dev → http://127.0.0.1:5175),\nor run `npm start` to serve the built UI here.\n')
+          return
+        }
+        throw new RequestError(404, 'not found')
+      }
+      const [, a, wsId, b, file, action] = parts
+
+      // A shared area's file or folder listing (project_migration p6,
+      // docs/shares.md): read-only, streamed with byte ranges.
+      if (a === 'shares' && wsId && (method === 'GET' || method === 'HEAD')) {
+        const { serveShare, setShareArea } = await import('./shares.ts')
+        setShareArea(area)
+        return await serveShare(req, res, wsId, parts.slice(3).join('/'), url.pathname.endsWith('/') || parts.length === 3, url.searchParams.get('inline') === '1')
+      }
+      // What a shared:// reference is on this host (p12, for Boast pages' helpers).
+      if (a === 'share-ref' && !wsId && method === 'GET') {
+        const { resolveShared } = await import('./boast.ts')
+        const { setShareArea } = await import('./shares.ts')
+        setShareArea(area)
+        return send(res, 200, await resolveShared(str(url.searchParams.get('ref'), 'ref')))
+      }
+
+      // ---- Boast (p12, docs/boast.md): a project's showcase, read-only ----
+      if (a === 'boast' && wsId && (method === 'GET' || method === 'HEAD')) {
+        const x = await import('./boast.ts')
+        const ctx: import('./access.ts').AccessContext = { registryFile: config.registryFile, area, gitea: config.gitea, giteaProblem: config.giteaProblem, refresh: url.searchParams.get('refresh') === '1' }
+        const slash = url.pathname.endsWith('/')
+        if (!b) {
+          const source = url.searchParams.get('source') ?? 'committed'
+          if (source !== 'committed' && source !== 'worktree') throw new RequestError(400, 'source is committed or worktree')
+          return send(res, 200, await x.boastState(ctx, wsId, { source, workspace: url.searchParams.get('workspace') || undefined }))
+        }
+        // A deployment-specific destination for a page (docs/boast.md): relative from the page, `../../link/<key>`.
+        if (b === 'link' && file && !action) {
+          const link = (await import('./site.ts')).boastLink(area, wsId, file)
+          if ('problem' in link) throw new RequestError(404, link.problem)
+          res.writeHead(302, { location: link.url, 'cache-control': 'no-store' })
+          res.end()
+          return
+        }
+        if (b === 'c' && file) return await x.serveCommitted(req, res, ctx, wsId, file, parts.slice(5).join('/'), slash)
+        if (b === 'w' && file) return await x.serveWorktree(req, res, ctx, wsId, file, parts.slice(5).join('/'), slash)
+        throw new RequestError(404, 'not found')
+      }
+
+      // Conversations (project_migration p8 … challenge p2,
+      // docs/conversations.md): one tree for every conversation — a person
+      // with one project, several, or a room a conductor leads. The person's
+      // words are the page's (the configured person) unless a client names an
+      // automated trial author; agents speak through their runs with the CLI.
+      // Writes start runs only through response requests.
+      if (a === 'conversations') {
+        const cs = config.conversations
+        if (!cs) throw new RequestError(503, 'conversations are not configured on this service')
+        const { ConversationService } = await import('./conversationService.ts')
+        const { ConversationArchive } = await import('./conversationArchive.ts')
+        const { viewBaseOf, attachRequests } = await import('./conversations.ts')
+        const mf = await import('./messageFiles.ts')
+        const ds = new ConversationService(cs)
+        const cfg = ds.config()
+        const person = 'disabled' in cfg ? null : cfg.person
+        const need = () => { if ('disabled' in cfg) throw new RequestError(503, cfg.disabled); return cfg }
+        // A person's message may carry files (p19): its routes read more.
+        const carries = method === 'POST' && ((!wsId) || (b === 'messages' && !file))
+        const input = method === 'POST' ? await body(req, carries ? mf.REQUEST_BYTES : MAX_BODY) as Record<string, unknown> : {}
+        const files = () => mf.decodeFiles(input.files)
+        // The words: required, unless files come with them.
+        const said = (fs: unknown[]) => { const v = input.text ?? ''; if (typeof v !== 'string') throw new RequestError(400, 'text is a string'); if (!v.trim() && !fs.length) throw new RequestError(400, 'text is required'); return v }
+        const opt = (k: string) => input[k] === undefined ? undefined : str(input[k], k)
+        const words = (k: string) => { const v = input[k]; if (typeof v !== 'string' || !v.trim()) throw new RequestError(400, `${k} is required`); return v }
+        const list = (k: string): string[] => { const v = input[k] ?? []; if (!Array.isArray(v) || !v.every(x => typeof x === 'string')) throw new RequestError(400, `${k} is a list of names`); return v as string[] }
+        const nums = (k: string): number[] => { const v = input[k] ?? []; if (!Array.isArray(v) || !v.every(n => Number.isInteger(n))) throw new RequestError(400, `${k} is a list of message ids`); return v as number[] }
+        const archive = new ConversationArchive(ds)
+        const view = async (id: string, since = 0) => ({ person, ...await ds.view(id, { viewBase: viewBaseOf(area), since }), archive: await archive.status(id), attachmentFiles: await mf.filesAvailability(area) })
+        const exists = (id: string) => ds.conversation(id) ?? (() => { throw new RequestError(404, `no conversation ${id}`) })()
+        // The list as readers use it: ?category=conversation|check
+        // &state=open|closed|all&with=<participant>&mode=direct|group|facilitated
+        // &limit=&offset=, with every view's counts; overview, brief and status
+        // for the page's rows only.
+        if (!wsId && method === 'GET') {
+          const q = (k: string) => url.searchParams.get(k) ?? undefined
+          const n = (k: string) => { const v = q(k); if (v === undefined) return undefined; const x = Number(v); if (!Number.isInteger(x) || x < 0) throw new RequestError(400, `${k} is a whole number`); return x }
+          const l = 'disabled' in cfg ? null : await ds.listing({ category: q('category'), state: q('state'), with: q('with'), mode: q('mode'), limit: n('limit'), offset: n('offset') })
+          return send(res, 200, { person, disabled: 'disabled' in cfg ? cfg.disabled : null, participants: await ds.participants(), attachmentFiles: await mf.filesAvailability(area), counts: l?.counts ?? null, total: l?.total ?? 0, offset: l?.offset ?? 0, conversations: await Promise.all((l?.conversations ?? []).map(async d => {
+            const st = await archive.status(d.id)
+            return {
+              id: d.id, title: d.title, displayTitle: d.displayTitle, category: d.category, created: d.created, updated: d.updated, state: d.state, count: d.count, newest: d.last?.id ?? 0, members: d.members, participants: d.participants, open: d.open,
+              mode: d.mode, defaultTo: d.defaultTo, facilitation: d.facilitation, conductor: d.conductor ?? null, activity: d.activity, overview: d.overview, brief: d.brief, status: d.status,
+              last: d.last ? { id: d.last.id, at: d.last.at, role: d.last.role, author: d.last.author, participant: d.last.participant, kind: d.last.kind, text: d.last.text.slice(0, 300) } : null,
+              archive: { state: st.state, commit: st.published?.commit ?? null, through: st.published?.horizon.message ?? null, url: st.published?.url ?? null, path: st.path },
+            }
+          })) })
+        }
+        if (!wsId && method === 'POST') {
+          const c = need()
+          const id = str(input.id, 'id')
+          const author = opt('author') ?? c.person
+          const dt = input.defaultTo
+          if (dt !== undefined && dt !== null && typeof dt !== 'string') throw new RequestError(400, 'defaultTo is a participant, or null')
+          const r = ds.create(id, { title: str(input.title, 'title'), by: author, members: list('members'), category: opt('category'), facilitate: input.facilitate === true, ...(dt !== undefined ? { defaultTo: dt as string | null } : {}) })
+          let posted = null
+          const fs = files()
+          if (input.text !== undefined || fs.length) posted = await ds.post(id, { text: said(fs), author, token: str(input.token, 'token'), to: list('to'), re: nums('re'), via: opt('via'), challenges: attachRequests(input.challenges), files: fs })
+          return send(res, r.duplicate ? 200 : 201, { created: !r.duplicate, posted: posted && { message: posted.message.id, duplicate: posted.duplicate, requests: posted.invitations.map(i => ds.invitationView(i)) }, ...await view(id) })
+        }
+        if (wsId && !b && method === 'GET') {
+          const since = Number(url.searchParams.get('since') ?? 0)
+          return send(res, 200, await view(wsId, Number.isInteger(since) ? since : 0))
+        }
+        // The person's words. A new id is created by its first message, with
+        // the project `with` names (a one-to-one room). A client other than
+        // the page (Slack) says how the words came (`via`) and, for an
+        // automated trial actor, who wrote them (`author`).
+        if (wsId && b === 'messages' && !file && method === 'POST') {
+          const c = need()
+          const fs = files()
+          const r = await ds.post(wsId, { text: said(fs), author: opt('author') ?? c.person, token: str(input.token, 'token'), to: list('to'), runs: list('runs'), re: nums('re'), via: opt('via'), with: opt('with'), title: opt('title'), challenges: attachRequests(input.challenges), files: fs })
+          const attached = (await cs.attachmentViews(wsId, viewBaseOf(area))).get(r.message.id) ?? []
+          return send(res, 200, { sent: true, duplicate: r.duplicate, reopened: r.reopened, created: r.created, message: { ...ds.message(r.message, viewBaseOf(area)), attachments: attached }, requests: r.invitations.map(i => ds.invitationView(i, viewBaseOf(area))) })
+        }
+        // A message's files (p19, docs/message-files.md): their records, and
+        // the original bytes by the whole identity. Reading starts nothing.
+        if (wsId && b === 'messages' && file && action === 'attachments' && (method === 'GET' || method === 'HEAD')) {
+          exists(wsId)
+          const n = Number(file)
+          if (!Number.isInteger(n) || n <= 0) throw new RequestError(404, 'not found')
+          const m = cs.message(n)
+          if (!m || m.conv !== wsId) throw new RequestError(404, `conversation ${wsId} has no message #${n}`, { code: 'attachment-not-found' })
+          const att = parts[6]
+          if (!att) return send(res, 200, { conversation: wsId, message: n, attachments: (await cs.attachmentViews(wsId, viewBaseOf(area))).get(n) ?? [] })
+          const row = cs.fileRow(wsId, n, att)
+          if (!row || parts.length > 7) throw new RequestError(404, `message #${n} of ${wsId} has no attachment ${att}`, { code: 'attachment-not-found' })
+          return await mf.serveFile(req, res, row, url.searchParams.get('download') === '1')
+        }
+        if (wsId && b === 'attachments' && file === 'verify' && method === 'GET') {
+          exists(wsId)
+          const only = url.searchParams.get('message')
+          const rows = cs.fileRows({ conv: wsId }).filter(r => !only || r.message === Number(only))
+          const out = []
+          for (const r of rows) { const v = await mf.checkFile(mf.refOf(r)); out.push({ message: r.message, ordinal: r.ordinal, attachment: r.attachment, name: r.name, bytes: r.bytes, sha256: r.sha256, state: v.state, detail: v.detail }) }
+          return send(res, 200, { conversation: wsId, verified: out.filter(x => x.state === 'verified').length, files: out })
+        }
+        // Facilitation: start (with a brief: the person's words to the
+        // conductor) or end. Joining a member or changing presentation never
+        // starts it.
+        if (wsId && b === 'facilitation' && method === 'POST') {
+          const c = need()
+          const action = str(input.action, 'action')
+          const by = opt('author') ?? c.person
+          if (action === 'start') {
+            const r = await ds.startFacilitation(wsId, { text: words('text'), author: by, token: str(input.token, 'token'), re: nums('re'), via: opt('via'), challenges: attachRequests(input.challenges) })
+            return send(res, 200, { duplicate: r.duplicate, facilitation: r.facilitation, message: ds.message(r.posted.message, viewBaseOf(area)), requests: r.posted.invitations.map(i => ds.invitationView(i, viewBaseOf(area))) })
+          }
+          if (action === 'end') return send(res, 200, await ds.endFacilitation(wsId, { by, note: opt('note') }))
+          throw new RequestError(400, 'action is start or end')
+        }
+        if (wsId && b === 'default' && method === 'POST') {
+          const c = need()
+          const p = input.participant
+          if (p !== null && typeof p !== 'string') throw new RequestError(400, 'participant is a member, or null')
+          const r = ds.setDefault(wsId, p as string | null, { by: opt('author') ?? c.person, note: opt('note') })
+          return send(res, 200, { ok: true, defaultTo: r.default_to ?? null })
+        }
+        // Workflows in the conversation (argue p4 ex3, *Workflows in a
+        // conversation*): reads only — no model, no run, no write.
+        if (wsId && b === 'workflows' && method === 'GET') {
+          const { ConversationWorkflows } = await import('./conversationWorkflows.ts')
+          const wfs = new ConversationWorkflows(ds)
+          exists(wsId)
+          if (!file) return send(res, 200, { workflows: await wfs.list(wsId, viewBaseOf(area)), horizon: wfs.horizon(wsId) })
+          const n = Number(file)
+          if (!Number.isInteger(n)) throw new RequestError(404, 'not found')
+          if (!action) return send(res, 200, await wfs.graph(wsId, n, viewBaseOf(area)))
+          if (action === 'current') return send(res, 200, await wfs.current(wsId, n, viewBaseOf(area)))
+          throw new RequestError(404, 'not found')
+        }
+        if (wsId && b === 'requests' && !file && method === 'POST') {
+          const c = need()
+          const r = await ds.invite(wsId, { participant: str(input.participant, 'participant'), question: words('question'), re: nums('re'), by: opt('author') ?? c.person, token: opt('token') })
+          return send(res, 200, { duplicate: r.duplicate, request: ds.invitationView(r.invitation, viewBaseOf(area)) })
+        }
+        if (wsId && b === 'requests' && file && action === 'withdraw' && method === 'POST') {
+          const c = need()
+          return send(res, 200, { request: ds.invitationView(ds.withdrawInvitation(wsId, Number(file), { by: opt('author') ?? c.person, reason: str(input.reason, 'reason') })) })
+        }
+        if (wsId && b === 'requests' && file && action === 'retry' && method === 'POST') { need(); return send(res, 200, { request: ds.invitationView(await ds.retry(wsId, Number(file)), viewBaseOf(area)) }) }
+        if (wsId && b === 'resume' && method === 'POST') {
+          const c = need()
+          const n = input.request === undefined ? undefined : Number(input.request)
+          if (n !== undefined && !Number.isInteger(n)) throw new RequestError(400, 'request is a request id')
+          return send(res, 200, { ok: true, ...await ds.resume(wsId, { by: opt('author') ?? c.person, request: n }) })
+        }
+        if (wsId && b === 'members' && method === 'POST') {
+          const c = need()
+          const act = str(input.action, 'action')
+          const participant = str(input.participant, 'participant')
+          const by = opt('author') ?? c.person
+          if (act === 'join') return send(res, 200, ds.join(wsId, participant, { by, note: opt('note') }))
+          if (act === 'leave') return send(res, 200, ds.leave(wsId, participant, { by, note: opt('note') }))
+          throw new RequestError(400, 'action is join or leave')
+        }
+        // Metadata and the overview (argue p4 ex2): records about the
+        // conversation; they send nothing, ask nobody and reopen nothing.
+        if (wsId && b === 'meta' && method === 'POST') {
+          const c = need()
+          const t = input.displayTitle
+          if (t !== undefined && t !== null && typeof t !== 'string') throw new RequestError(400, 'displayTitle is a string, or null to remove it')
+          if (input.ifUntitled !== undefined && typeof input.ifUntitled !== 'boolean') throw new RequestError(400, 'ifUntitled is true or false')
+          const r = ds.setMeta(wsId, { category: opt('category'), displayTitle: t as string | null | undefined, ifUntitled: input.ifUntitled === true, by: opt('author') ?? c.person, note: opt('note') })
+          return send(res, 200, { ok: true, changed: r.changed, skipped: r.skipped, conversation: { id: wsId, category: r.conversation.category === 'check' ? 'check' : 'conversation', displayTitle: r.conversation.display_title ?? null } })
+        }
+        if (wsId && b === 'overview' && method === 'GET') { exists(wsId); return send(res, 200, { overview: ds.overview(wsId), revisions: ds.overviewRows(wsId).map(r => ds.overviewView(r)), brief: ds.brief(wsId) }) }
+        if (wsId && b === 'overview' && method === 'POST') {
+          const c = need()
+          const u = input.unresolved ?? []
+          if (!Array.isArray(u) || !u.every(x => typeof x === 'string')) throw new RequestError(400, 'unresolved is a list of texts')
+          const through = input.through === undefined ? undefined : Number(input.through)
+          if (through !== undefined && !Number.isInteger(through)) throw new RequestError(400, 'through is a message id')
+          if (input.ifUntitled !== undefined && typeof input.ifUntitled !== 'boolean') throw new RequestError(400, 'ifUntitled is true or false')
+          const r = ds.publishOverview(wsId, { purpose: words('purpose'), outcome: opt('outcome') ?? null, unresolved: u as string[], through, title: opt('displayTitle'), ifUntitled: input.ifUntitled === true, note: opt('note'), author: opt('author') ?? c.person, token: opt('token') })
+          return send(res, 200, { ok: true, ...r })
+        }
+        // p18: the conductor — its run, standing and status; an explicit
+        // replacement of a cancelled one (never done by itself).
+        if (wsId && b === 'conductor' && method === 'GET') {
+          exists(wsId)
+          const cur = await ds.conductorRecord(wsId)
+          const { runStatus } = await import('../shared/status.ts')
+          return send(res, 200, { conductor: cur?.run ?? null, standing: cur?.record?.standing ?? null, status: cur?.record ? runStatus(cur.record) : null })
+        }
+        if (wsId && b === 'conductor' && method === 'POST') {
+          const c = need()
+          if (opt('action') !== 'replace') throw new RequestError(400, 'action is replace (a new conductor for a cancelled one)')
+          return send(res, 200, { ok: true, ...await ds.replaceConductor(wsId, { by: opt('author') ?? c.person, reason: words('reason'), token: opt('token') }) })
+        }
+        // fix p2: the page's act is the configured person's (or a named trial
+        // author's), with an optional reason; the answer carries the room's
+        // state and status so a client shows success only from the record.
+        if (wsId && b === 'close' && method === 'POST') { const c = need(); return send(res, 200, { ok: true, ...await ds.close(wsId, { by: opt('author') ?? c.person, reason: opt('reason') ?? null }) }) }
+        if (wsId && b === 'reopen' && method === 'POST') { const c = need(); const was = ds.conversation(wsId)?.state; return send(res, 200, { ok: true, already: was === 'open', conversation: await ds.reopen(wsId, { by: opt('author') ?? c.person, reason: opt('reason') ?? null }), status: await ds.status(wsId) }) }
+        // Character dialogue (argue p5, docs/dialogue.md): the presentation
+        // path, apart from every read above. A read may queue lines for the
+        // dialogue worker; it never calls a model and changes nothing else.
+        if (wsId && b === 'dialogue') {
+          const { DialogueStore } = await import('./dialogue.ts')
+          const dl = config.dialogue ?? new DialogueStore(ds)
+          const language = (method === 'POST' ? opt('language') : url.searchParams.get('lang') ?? undefined) ?? 'ja'
+          if (!file && method === 'GET') {
+            const since = Number(url.searchParams.get('since') ?? 0)
+            return send(res, 200, await dl.read(wsId, language, { queue: url.searchParams.get('queue') !== '0', since: Number.isInteger(since) ? since : 0 }))
+          }
+          if (file === 'retry' && method === 'POST') {
+            const c = need()
+            const message = Number(input.message)
+            if (!Number.isInteger(message)) throw new RequestError(400, 'message is a message id')
+            return send(res, 200, { ok: true, ...await dl.retry(wsId, message, language, opt('author') ?? c.person) })
+          }
+          throw new RequestError(404, 'not found')
+        }
+        if (wsId && b === 'archive' && method === 'GET') return send(res, 200, await archive.status(wsId))
+        if (wsId && b === 'archive' && method === 'POST') { exists(wsId); const r = await archive.publish([wsId]); return send(res, r.failed.length ? 502 : 200, { ...r, status: await archive.status(wsId) }) }
+        throw new RequestError(404, 'not found')
+      }
+
+      // Challenges (challenge p1, docs/challenges.md): durable shared records
+      // of problems, in one Git repository; writes go through the journal.
+      if (a === 'challenges') {
+        const { challengeRoute } = await import('./challengeApi.ts')
+        return await challengeRoute(await challengeStore(), area, req, res, parts, url)
+      }
+
+      // Character dialogue's state (argue p5, docs/dialogue.md): read-only.
+      if (a === 'dialogue' && !wsId && method === 'GET') {
+        if (!config.conversations) throw new RequestError(503, 'conversations are not configured on this service')
+        const { DialogueStore } = await import('./dialogue.ts')
+        const { ConversationService } = await import('./conversationService.ts')
+        return send(res, 200, await (config.dialogue ?? new DialogueStore(new ConversationService(config.conversations))).status())
+      }
+
+      // Execution nodes (project_migration p7, docs/workers.md): every worker's
+      // state, and the remote workers' protocol.
+      if (a === 'workers') {
+        const { workerRoute } = await import('./workerApi.ts')
+        return await workerRoute({ exec: needExec(), registryFile: config.registryFile, area }, req, res, parts.slice(2), url)
+      }
+
+      // Backup of retired runs (improve_wfrun p3, docs/storage.md): read-only here.
+      if (a === 'backup' && method === 'GET') return send(res, 200, await (await import('./runBackup.ts')).backupOverview(needExec()))
+
+      // Usage (retire_old_ui p1, docs/usage.md): read-only.
+      if (a === 'usage' && method === 'GET') {
+        if (!config.usage) throw new RequestError(503, 'usage is not configured on this service')
+        if (wsId === 'budget' && !b) return send(res, 200, await config.usage.budget())
+        if (wsId) throw new RequestError(404, 'not found')
+        const { PERIODS } = await import('./usage.ts')
+        const period = url.searchParams.get('period') ?? '7d'
+        if (!(PERIODS as readonly string[]).includes(period)) throw new RequestError(400, `period is one of ${PERIODS.join(', ')}`)
+        return send(res, 200, await config.usage.usage(period as import('./usage.ts').Period))
+      }
+
+      // The code this service runs (an installed release names its agdev commit).
+      if (a === 'version' && !wsId && method === 'GET') return send(res, 200, { ...codeVersion(), instance: areaInstance(dirname(config.registryFile)), registry: config.registryFile, webOrigin: webOriginOf(area) })
+
+      // Machine submissions on this installation (cluster_teamwork p4,
+      // server/submissions.ts): Observer's recovery requests, by receipt.
+      if (a === 'submissions' && !b) {
+        const sub = await import('./submissions.ts')
+        if (!wsId && method === 'POST') {
+          const input = await body(req, 256 * 1024) as Record<string, unknown>
+          const s = (k: string) => typeof input[k] === 'string' ? input[k] as string : ''
+          const r = await sub.submit(needExec(), { requester: s('requester'), workflow: s('workflow'), key: s('key'), text: s('text'), ...(s('about') ? { about: s('about') } : {}), ...(s('workspace') ? { workspace: s('workspace') } : {}) })
+          return send(res, r.duplicate ? 200 : 201, { submission: r })
+        }
+        if (wsId && method === 'GET') return send(res, 200, { submission: await sub.viewOf(needExec(), decodeURIComponent(wsId)) })
+        throw new RequestError(405, 'submissions: POST {requester, workflow, key, text, about?, workspace?}, or GET submissions/<receipt>')
+      }
+
+      // HTTP delivery from other installations (cluster_teamwork p2,
+      // docs/peers.md "HTTP delivery"): one envelope per POST, authenticated by
+      // the bearer credential this installation issued, stored durably (202)
+      // and applied by the settle pass — never a CLI, never another store.
+      if (a === 'peers' && (wsId === 'messages' || wsId === 'self') && !file) {
+        const { PeerStore, HTTP_BODY_MAX, loadPeerConfig } = await import('./peerlink.ts')
+        const s = new PeerStore({ area, registryFile: config.registryFile, exec: needExec() })
+        try {
+          const who = s.verifyBearer(req.headers.authorization)
+          if (wsId === 'messages' && !b && method === 'POST') {
+            const raw = await body(req, HTTP_BODY_MAX)
+            const r = s.receiveHttp(who.peer, raw, req.socket.remoteAddress ?? null, { credential: who.credential, scope: who.scope })
+            config.peerLoop?.kick()
+            return send(res, r.status, { receipt: r.receipt, duplicate: r.duplicate })
+          }
+          if (wsId === 'messages' && b && method === 'GET') {
+            const r = s.receiptFor(who.peer, b)
+            if (!r) throw new RequestError(404, `no delivery ${b} from ${who.peer} was received here`, { code: 'peer-unknown' })
+            return send(res, 200, { receipt: r })
+          }
+          if (wsId === 'self' && !b && method === 'GET') {
+            const c = loadPeerConfig(area)
+            if (!('config' in c)) throw new RequestError(503, 'disabled' in c ? c.disabled : c.problems.join('; '), { code: 'peer-config' })
+            const p = c.config.peers.find(x => x.instance === who.peer)
+            if (!p) throw new RequestError(403, `${who.peer} holds a credential of this installation but is not a configured peer`, { code: 'peer-identity' })
+            return send(res, 200, { instance: c.config.self, you: p.instance, label: p.label, credential: who.credential, scope: who.scope, accept: who.scope === 'work' ? p.accept : [], ...(who.scope === 'manage' ? { grants: p.grant, manages: p.manage, parentage: p.parentage } : {}), at: new Date().toISOString() })
+          }
+          throw new RequestError(405, 'peers/messages: POST an envelope, or GET peers/messages/<id>; peers/self: GET')
+        } finally { s.close() }
+      }
+
+      // The cluster directory (cluster_teamwork p2, docs/cluster.md): read-only,
+      // unauthenticated, from caches (no repository is fetched per read).
+      if (a === 'cluster' && (wsId === 'advertisement' || wsId === 'directory') && !b && method === 'GET') {
+        const { Cluster } = await import('./cluster.ts')
+        const cl = new Cluster({ area, registryFile: config.registryFile, exec: needExec() })
+        if (wsId === 'advertisement') {
+          const ad = cl.cachedAdvertisement() ?? await cl.advertisement()
+          const etag = `"${ad.revision}"`
+          if (req.headers['if-none-match'] === etag) { res.writeHead(304, { etag, 'cache-control': 'no-store' }); res.end(); return }
+          res.writeHead(200, { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store', etag })
+          res.end(JSON.stringify(ad))
+          return
+        }
+        return send(res, 200, await cl.directory())
+      }
+
+      // Managed installations over the agdev link (improve_multinodes p3, docs/management.md): read-only.
+      if (a === 'manage' && method === 'GET') {
+        // p4 (the Cluster view): also this installation's own identity and
+        // lifecycle status, with or without a link. Nothing here asks a peer.
+        const { PeerStore, loadPeerConfig } = await import('./peerlink.ts')
+        const { lifecycleSample, localIdentity } = await import('./peermanage.ts')
+        const c = loadPeerConfig(area)
+        const local = () => ({
+          instance: areaInstance(dirname(config.registryFile)), ...localIdentity(area, 'config' in c ? c.config : null),
+          release: (() => { const r = codeVersion().release; return r?.agdevworld ? { commit: r.agdevworld, built: r.built ?? null } : null })(),
+          lifecycle: lifecycleSample(process.env.AGDEV_LIFECYCLE || null, Date.now()),
+        })
+        const at = new Date().toISOString()
+        if (!('config' in c)) {
+          if (wsId) throw new RequestError(409, 'disabled' in c ? c.disabled : c.problems.join('; '), { code: 'peer-config' })
+          return send(res, 200, { configured: false, config: 'disabled' in c ? 'disabled' : 'invalid', reason: 'disabled' in c ? c.disabled : c.problems.join('; '), at, local: local(), self: null, ancestry: [], peers: [] })
+        }
+        const s = new PeerStore({ area, registryFile: config.registryFile, exec: needExec() })
+        try {
+          if (wsId) return send(res, 200, { configured: true, operations: s.manage.show(decodeURIComponent(wsId)) })
+          return send(res, 200, { configured: true, config: 'ok', reason: null, at, local: local(), ...s.manage.status(c.config) })
+        } finally { s.close() }
+      }
+
+      // What tells this installation from another (docs/site.md): display facts only.
+      if (a === 'site' && !wsId && method === 'GET') return send(res, 200, (await import('./site.ts')).siteView(area))
+
+      // The workflow observation (observer p3, docs/observation.md): read-only.
+      if (a === 'observe' && !wsId && method === 'GET') {
+        const { Observer } = await import('./observe.ts')
+        return send(res, 200, await new Observer(config.exec ?? null, config.registryFile).observe({
+          workspace: url.searchParams.get('workspace') || undefined, runs: url.searchParams.getAll('run'), terminal: url.searchParams.get('terminal') === '1',
+        }))
+      }
+
+      // ---- project access (project_migration p4, docs/access.md): read-only ----
+      if (a === 'projects' && method === 'GET') {
+        const x = await import('./access.ts')
+        const ctx: import('./access.ts').AccessContext = { registryFile: config.registryFile, area, gitea: config.gitea, giteaProblem: config.giteaProblem, refresh: url.searchParams.get('refresh') === '1' }
+        const q = (k: string) => url.searchParams.get(k) || undefined
+        const num = (k: string) => { const v = q(k); if (v === undefined) return undefined; const n = Number(v); if (!Number.isInteger(n) || n < 1) throw new RequestError(400, `${k} must be a positive integer`); return n }
+        const source = q('source')
+        if (source !== undefined && source !== 'committed' && source !== 'worktree') throw new RequestError(400, 'source is committed or worktree')
+        const ro = { rev: q('rev'), upstream: q('upstream') === '1', require: q('require'), source: source as 'committed' | 'worktree' | undefined, workspace: q('workspace') }
+        if (!wsId) return send(res, 200, await x.list(ctx))
+        if (!b) return send(res, 200, await x.show(ctx, wsId, ro))
+        if (b === 'tree' && !file) return send(res, 200, await x.tree(ctx, wsId, q('path') ?? '.', { ...ro, depth: num('depth'), max: num('max') }))
+        if (b === 'file' && !file) return send(res, 200, x.serializable(await x.read(ctx, wsId, str(q('path'), 'path'), { ...ro, maxBytes: num('maxBytes') })))
+        // The file's bytes as the browser shows them (p8): a link a reader opens.
+        if (b === 'raw' && !file) { const r = await x.read(ctx, wsId, str(q('path'), 'path'), ro); return sendRaw(res, q('path')!, r.bytes!) }
+        if (b === 'search' && !file) return send(res, 200, await x.search(ctx, wsId, str(q('q'), 'q'), q('path') ?? '.', { ...ro, max: num('max'), regex: q('regex') === '1', ignoreCase: q('i') === '1' }))
+        if (b === 'runs') {
+          const published = q('published') === '1'
+          if (!file) return send(res, 200, await x.runs(ctx, wsId, { ...ro, workflow: q('workflow'), published }))
+          const [, , , , wf, run, sub] = parts
+          if (!run) throw new RequestError(404, 'not found')
+          if (!sub) return send(res, 200, await x.run(ctx, wsId, `${wf}/${run}`, { ...ro, published }))
+          if (sub === 'file') return send(res, 200, x.serializable(await x.runFile(ctx, wsId, `${wf}/${run}`, str(q('path'), 'path'), { ...ro, published, maxBytes: num('maxBytes') })))
+          if (sub === 'raw') { const r = await x.runFile(ctx, wsId, `${wf}/${run}`, str(q('path'), 'path'), { ...ro, published }); return sendRaw(res, q('path')!, r.bytes!) }
+        }
+        throw new RequestError(404, 'not found')
+      }
+
+      // ---- the mind repository (summoner p1, docs/mind.md): braindumps as grounds ----
+      if (a === 'mind') {
+        const m = await import('./mind.ts')
+        const ctx = { registryFile: config.registryFile, area, gitea: config.gitea, giteaProblem: config.giteaProblem }
+        const fresh = url.searchParams.get('refresh') === '1' ? 0 : undefined
+        if (!wsId && method === 'GET') return send(res, 200, await m.mindView(ctx, { maxAgeMs: fresh }))
+        if (wsId === 'braindumps') {
+          if (!b && method === 'POST') {
+            const input = await body(req) as Record<string, unknown>
+            return send(res, 200, await m.changeBraindump(ctx, { op: 'add', slug: str(input.slug, 'slug'), text: str(input.text, 'text'), author: str(input.author, 'author'), message: typeof input.message === 'string' ? input.message : undefined }))
+          }
+          if (b && !file && method === 'GET') return send(res, 200, await m.braindump(ctx, b))
+          if (b && !file && method === 'PUT') {
+            const input = await body(req) as Record<string, unknown>
+            return send(res, 200, await m.changeBraindump(ctx, { op: 'edit', slug: b, text: str(input.text, 'text'), author: str(input.author, 'author'), base: typeof input.base === 'string' ? input.base : undefined, message: typeof input.message === 'string' ? input.message : undefined }))
+          }
+          if (b && !file && method === 'DELETE') {
+            const input = await body(req) as Record<string, unknown>
+            return send(res, 200, await m.changeBraindump(ctx, { op: 'remove', slug: b, author: str(input.author, 'author'), force: input.force === true }))
+          }
+        }
+        if (wsId === 'why' && b && !file && method === 'GET') return send(res, 200, await m.why(ctx, b))
+        if (wsId === 'plans' && b && !file && method === 'GET') return send(res, 200, await m.plan(ctx, b))
+        if (wsId === 'plans' && !b && method === 'PUT') {
+          const input = await body(req) as Record<string, unknown>
+          return send(res, 200, await m.putPlan(ctx, { text: str(input.text, 'text'), author: str(input.author, 'author'), message: typeof input.message === 'string' ? input.message : undefined }))
+        }
+        throw new RequestError(404, `no route for ${method} ${url.pathname}`)
+      }
+
+      // ---- summoning (summoner p2, docs/summon.md): a plan's projects arrive here ----
+      if (a === 'summon') {
+        const s = await import('./summon.ts')
+        const ctx = { registryFile: config.registryFile, area, gitea: config.gitea, giteaProblem: config.giteaProblem }
+        if (!wsId && method === 'GET') return send(res, 200, await s.status(ctx, { plan: url.searchParams.get('plan') || undefined }))
+        if (wsId === 'apply' && !b && method === 'POST') {
+          const input = await body(req) as Record<string, unknown>
+          return send(res, 200, await s.apply(ctx, { plan: typeof input.plan === 'string' ? input.plan : undefined, dryRun: input.dryRun === true }))
+        }
+        throw new RequestError(404, `no route for ${method} ${url.pathname}`)
+      }
+
+      // ---- reusable findings (improve_workflow p2, docs/knowledge.md): read-only ----
+      if (a === 'knowledge' && method === 'GET') {
+        const k = await import('./knowledge.ts')
+        const ctx: import('./access.ts').AccessContext = { registryFile: config.registryFile, area, gitea: config.gitea, giteaProblem: config.giteaProblem, refresh: url.searchParams.get('refresh') === '1' }
+        const q = (n: string) => url.searchParams.get(n) || undefined
+        const o = { rev: q('rev'), as: q('as'), upstream: q('upstream') === '1', current: q('current') }
+        if (!wsId) return send(res, 200, await k.listFindings(ctx, { ...o, withBody: q('body') === '1', collection: q('collection'), project: q('project'), category: url.searchParams.getAll('category'), tag: url.searchParams.getAll('tag'), text: q('text') }))
+        if (wsId === 'collections' && !b) return send(res, 200, await k.listFindings(ctx, { ...o, project: q('project') }))
+        if (wsId === 'finding' && !b) return send(res, 200, await k.showFinding(ctx, str(q('id'), 'id'), o))
+        if (wsId === 'check' && !b) return send(res, 200, await k.checkCollection(ctx, str(q('collection'), 'collection'), o))
+        if (wsId === 'decisions' && !b) return send(res, 200, await k.runDecisions(ctx, str(q('project'), 'project'), str(q('run'), 'run')))
+        throw new RequestError(404, 'not found')
+      }
+
+      // ---- scoped context (p13, p14; docs/context.md): the matrix, blocks, details ----
+      if (a === 'context') {
+        const { ContextStore, applyBlockOp, scopeTarget } = await import('./contextStore.ts')
+        const store = new ContextStore(area)
+        const q = (k: string) => url.searchParams.get(k) || undefined
+        if (!wsId && method === 'GET') {
+          const { contextMatrix } = await import('./contextView.ts')
+          const access = { registryFile: config.registryFile, area, gitea: config.gitea, giteaProblem: config.giteaProblem }
+          // What a run would be given reads the published source (p20), not a checkout.
+          const reg = await registered(str(q('workspace'), 'workspace'))
+          const ws = config.gitea && reg.project ? await (await import('./published.ts')).publishedWorkspace(access, reg, { discovery: true }) : await workspace(reg.id)
+          return send(res, 200, await contextMatrix(access, ws, q('workflow') ?? null))
+        }
+        // Blocks of one scope, or of every scope (?all=1).
+        if (wsId === 'blocks' && !b && method === 'GET') {
+          if (q('all')) return send(res, 200, { blocks: await store.all() })
+          return send(res, 200, { blocks: await store.blocks(scopeTarget(str(q('scope'), 'scope'), q('project'), q('workflow'))) })
+        }
+        if (wsId === 'block' && !b) {
+          if (method === 'GET') {
+            const t = scopeTarget(str(q('scope'), 'scope'), q('project'), q('workflow'))
+            const id = str(q('block'), 'block')
+            return send(res, 200, { state: await store.read(t, id), revisions: await store.history(t, id) })
+          }
+          if (method === 'PUT') {
+            const input = await body(req) as Record<string, unknown>
+            if (typeof input.op !== 'string' || typeof input.scope !== 'string' || typeof input.block !== 'string') throw new RequestError(400, '{op, scope, project?, workflow?, block, base, by, …} (docs/context.md)')
+            const r = await applyBlockOp(store, { ...(input as unknown as import('./contextStore.ts').BlockOpInput), via: typeof input.via === 'string' ? input.via : 'http' }, config.exec ? id => config.exec!.attemptRun(id) : undefined)
+            return send(res, 200, { ok: true, ...r, revisions: await store.history(r.state.target, r.state.id) })
+          }
+        }
+        // A block's detail by its logical reference; ?raw=1 as text.
+        if (wsId === 'detail' && !b && method === 'GET') {
+          const d = await store.detail(str(q('ref'), 'ref'))
+          if (q('raw')) { res.writeHead(200, { 'content-type': `${d.name.endsWith('.json') ? 'application/json' : 'text/plain'}; charset=utf-8`, 'cache-control': 'no-store' }); res.end(d.text); return }
+          return send(res, 200, d)
+        }
+        throw new RequestError(404, `no route for ${method} ${url.pathname}`)
+      }
+
+      // ---- the agdev dashboard and resources (p4) ----
+      if (a === 'agdev') {
+        if (!wsId && method === 'GET') return send(res, 200, await dashboard(agdev))
+        if (wsId === 'projects' && !b && method === 'POST') {
+          const input = await body(req) as Record<string, unknown>
+          const id = str(input.id, 'id')
+          if (input.goals !== undefined && !texts(input.goals)) throw new RequestError(400, 'goals must be a list of text')
+          if (input.devdocs !== undefined && input.devdocs !== 'directory' && input.devdocs !== 'submodule') throw new RequestError(400, 'devdocs is directory or submodule')
+          if (!config.gitea) throw new RequestError(503, `Gitea is not available: ${config.giteaProblem ?? 'no Gitea setting'}`)
+          const result = await createProject({
+            dir: await workspaceDir(area, `pj-${id}`, `Creating project "${id}"`), id, name: str(input.name, 'name'), intent: typeof input.intent === 'string' ? input.intent : '',
+            goals: (input.goals as string[] | undefined) ?? [], devdocs: (input.devdocs as 'directory' | 'submodule' | undefined) ?? 'directory',
+            registryFile: config.registryFile, gitea: config.gitea, resume: input.resume === true, reuse: input.reuse === true,
+          })
+          return send(res, result.ok ? 201 : 422, result)
+        }
+        if (wsId === 'projects' && b === 'register' && method === 'POST') {
+          const input = await body(req) as Record<string, unknown>
+          return send(res, 200, await registerGiteaProject(agdev, str(input.owner, 'owner'), str(input.name, 'name')))
+        }
+        if (wsId === 'projects' && b && file === 'workspaces' && method === 'POST') return send(res, 201, await obtainWorkspace(agdev, b))
+        if (wsId === 'repositories' && !b && method === 'POST') {
+          const input = await body(req) as Record<string, unknown>
+          if (input.create === true) return send(res, 201, await createSharedRepository(agdev, str(input.name, 'name'), category(input.category), typeof input.description === 'string' ? input.description : ''))
+          return send(res, 200, await registerSharedRepository(agdev, str(input.owner, 'owner'), str(input.name, 'name'), category(input.category)))
+        }
+        throw new RequestError(404, `no route for ${method} ${url.pathname}`)
+      }
+
+      // ---- the person's node catalog (p7/ex1, docs/catalog.md) ----
+      if (a === 'nodes') {
+        const { addExample, createTemplate, deleteTemplate, readCatalog, updateTemplate } = await import('./catalog.ts')
+        const { EXAMPLES } = await import('../shared/catalog.ts')
+        const content = (input: Record<string, unknown>) => ({
+          name: typeof input.name === 'string' ? input.name : '', type: typeof input.type === 'string' ? input.type : '',
+          description: typeof input.description === 'string' ? input.description : '', expectation: typeof input.expectation === 'string' ? input.expectation : '',
+          ...(isObj(input.appearance) ? { appearance: { icon: String(input.appearance.icon ?? ''), color: String(input.appearance.color ?? '') } } : {}),
+          ...(input.expectations !== undefined ? { expectations: input.expectations as never } : {}),
+          ...(input.example === true ? { example: true } : {}),
+          ...(input.knowledge !== undefined ? { knowledge: input.knowledge as never } : {}),
+        })
+        if (!wsId && method === 'GET') {
+          const r = await readCatalog(area)
+          return send(res, 200, { ...r, examples: Object.entries(EXAMPLES).map(([id, c]) => ({ id, ...c })) })
+        }
+        if (!wsId && method === 'POST') {
+          const input = await body(req) as Record<string, unknown>
+          return send(res, 201, { ok: true, ...(await createTemplate(area, str(input.id, 'id'), content(input), typeof input.by === 'string' ? input.by : '')) })
+        }
+        if (wsId === 'examples' && b && method === 'POST') {
+          const input = await body(req) as Record<string, unknown>
+          return send(res, 201, { ok: true, ...(await addExample(area, b, typeof input.by === 'string' ? input.by : '', typeof input.id === 'string' && input.id.trim() ? input.id.trim() : undefined)) })
+        }
+        if (wsId && !b && method === 'PUT') {
+          const input = await body(req) as Record<string, unknown>
+          if (typeof input.expectRevision !== 'number') throw new RequestError(400, 'expectRevision is required: the revision the edit was based on')
+          return send(res, 200, { ok: true, ...(await updateTemplate(area, wsId, content(input), input.expectRevision, typeof input.by === 'string' ? input.by : '')) })
+        }
+        if (wsId && !b && method === 'DELETE') {
+          const rev = Number(url.searchParams.get('revision'))
+          if (!Number.isInteger(rev) || rev < 1) throw new RequestError(400, 'revision is required: the revision being deleted')
+          return send(res, 200, { ok: true, ...(await deleteTemplate(area, wsId, rev, url.searchParams.get('by') ?? '')) })
+        }
+        throw new RequestError(404, `no route for ${method} ${url.pathname}`)
+      }
+
+      // The home page's stream: registry changes only.
+      if (a === 'events' && method === 'GET') {
+        if (!config.watcher) throw new RequestError(404, 'watching is disabled')
+        return await config.watcher.stream(undefined, req, res)
+      }
+
+      if (a === 'workspaces' && !wsId && method === 'GET') {
+        const reg = await registry()
+        const list: WorkspaceSummary[] = await Promise.all(reg.workspaces.map(async w => {
+          const o = await observe(w)
+          return { id: w.id, label: w.label, host: w.host, observed: { available: o.available, reason: o.reason, projectId: o.projectId, projectName: o.projectName, branch: o.branch, head: o.head } }
+        }))
+        const out: WorkspacesResponse = { approver: reg.approver, workspaces: list, registry: { path: config.registryFile, exists: reg.exists }, area: { path: area, sources: join(area, 'sources') } }
+        return send(res, 200, out)
+      }
+      // Registration writes only the registry. A relative path is taken from the authoring area.
+      if (a === 'workspaces' && !wsId && method === 'POST') {
+        const input = await body(req) as Record<string, unknown>
+        if (typeof input.path !== 'string' || !input.path.trim()) throw new RequestError(400, 'path is required')
+        const id = typeof input.id === 'string' && input.id.trim() ? input.id.trim() : undefined
+        const path = input.path.trim()
+        const result = await registerWorkspace(config.registryFile, isAbsolute(path) ? path : join(area, path), { id, area })
+        return send(res, result.ok ? 200 : 422, result)
+      }
+      // Creation writes only beneath the project root (server/placement.ts; the CLI takes any destination).
+      if (a === 'projects' && !wsId && method === 'POST') {
+        const input = await body(req) as Record<string, unknown>
+        for (const k of ['id', 'name']) if (typeof input[k] !== 'string') throw new RequestError(400, `${k} is required`)
+        if (input.goals !== undefined && !texts(input.goals)) throw new RequestError(400, 'goals must be a list of text')
+        const rel = typeof input.dir === 'string' && input.dir.trim() ? input.dir.trim() : `pj-${input.id}`
+        const dir = await workspaceDir(area, rel, `Creating project "${String(input.id)}"`)
+        const result = await createProject({
+          dir, id: String(input.id).trim(), name: String(input.name), intent: typeof input.intent === 'string' ? input.intent : '',
+          goals: (input.goals as string[] | undefined) ?? [], sourcesDir: join(area, 'sources'),
+          devdocsSource: typeof input.devdocsSource === 'string' && input.devdocsSource.trim() ? input.devdocsSource.trim() : undefined,
+          registryFile: config.registryFile, resume: input.resume === true,
+        })
+        return send(res, result.ok ? 201 : 422, result)
+      }
+      if (a !== 'workspaces' || !wsId) throw new RequestError(404, 'not found')
+
+      if (b === 'events' && method === 'GET') {
+        if (!config.watcher) throw new RequestError(404, 'watching is disabled')
+        const ws = await workspace(wsId)
+        return await config.watcher.stream(ws, req, res)
+      }
+
+      // Published reads and drafts (p20) need the registration, not its checkout:
+      // they are answered whatever the checkout's state, or without one.
+      if (b === 'published-head' || b === 'published' || b === 'drafts') {
+        const definitions = await handleDefinitions(req, res, url, method, wsId, b, file, action)
+        if (definitions) return
+      }
+
+      const ws = await workspace(wsId)
+      if (method === 'GET') await withRepositories(ws, url.searchParams.get('refresh') === '1')
+      if (b === 'project' && !file) {
+        if (method === 'GET') return send(res, 200, await ws.projectResponse())
+        if (method === 'PUT') {
+          const input = await body(req) as Record<string, unknown>
+          const saved = await ws.saveProject(asProject(input.project), typeof input.base === 'string' ? input.base : undefined)
+          config.watcher?.noteOwnWrite(ws, 'project.yaml', saved.rev)
+          return send(res, 200, { ok: true, ...saved })
+        }
+      }
+      // Runs (docs/runs.md): GET runs, GET runs/<wf>/<run>[?rev=], GET runs/<wf>/<run>/file?path=,
+      // POST runs/<wf>/<run>/ops {op, …, by, expectSeq}.
+      if (b === 'runs') {
+        if (!file && method === 'GET') return send(res, 200, await listRuns(ws, undefined, config.exec ? ref => config.exec!.runRows(ws.reg.id, ref).jobs : undefined))
+        // A person's request: the run with their words, queued for the executor.
+        if (!file && method === 'POST') {
+          const input = await body(req) as Record<string, unknown>
+          const predecessor = typeof input.predecessor === 'string' && input.predecessor ? await resolveRef(ws, input.predecessor) : undefined
+          // Challenges named with the request (challenge p1), pinned now.
+          const { attachRequests, ConversationStore } = await import('./conversations.ts')
+          const wanted = attachRequests(input.challenges)
+          const attachments = wanted.length ? await (async () => { const cs = config.conversations ?? new ConversationStore({ area, exec: needExec() }); return cs.pinnedTexts(await cs.pinAll(wanted)) })() : []
+          const r = await needExec().request({ workspace: ws.reg.id, workflow: str(input.workflow, 'workflow'), text: str(input.text, 'the request text'), author: str(input.author, 'author'), receipt: str(input.receipt, 'receipt'), by: typeof input.by === 'string' ? input.by : undefined, via: 'browser', predecessor, ...(typeof input.node === 'string' && input.node ? { node: input.node } : {}), ...(attachments.length ? { attachments } : {}) })
+          return send(res, r.duplicate ? 200 : 201, { ok: true, ...r })
+        }
+        const ref: RunRef = { workflow: parts[4] ?? '', run: parts[5] ?? '' }
+        const sub = parts[6]
+        if (!ref.workflow || !ref.run || (parts.length > 7 && sub !== 'checkpoints' && sub !== 'presentations' && sub !== 'delegations' && sub !== 'reviews' && sub !== 'storage' && sub !== 'branches')) throw new RequestError(404, 'not found')
+        if (!sub && method === 'GET') return send(res, 200, await runResponse(ws, ref, { rev: url.searchParams.get('rev') || undefined }))
+        if (sub === 'exec' && method === 'GET') return send(res, 200, await needExec().runView(ws.reg.id, ref))
+        // The working copy's lifecycle (improve_wfrun p2, docs/storage.md): the
+        // view; a dry run answers here; the operation itself can take minutes,
+        // so it is started apart and the view follows it.
+        if (sub === 'storage' && !parts[7] && method === 'GET') return send(res, 200, await (await import('./retention.ts')).storageView(needExec(), ws, ref))
+        if (sub === 'storage' && (parts[7] === 'retire' || parts[7] === 'restore') && method === 'POST') {
+          const input = await body(req) as Record<string, unknown>
+          const by = typeof input.by === 'string' ? input.by.trim() : ''
+          if (!by) throw new RequestError(400, 'by is required: the name of who asks')
+          const m = await import('./retention.ts')
+          if (input.dryRun === true) return send(res, 200, parts[7] === 'retire' ? await m.retireRun(needExec(), ws, ref, { by, dryRun: true }) : await m.restoreRun(needExec(), ws, ref, { by, dryRun: true }))
+          const cli = fileURLToPath(new URL('../cli/wfe.ts', import.meta.url))
+          const p = spawn(process.execPath, [cli, 'run', parts[7], runKey(ref), '--by', by, '--workspace', ws.reg.id], { detached: true, stdio: 'ignore', env: { ...process.env, WFE_REGISTRY: config.registryFile, WFE_AREA: area } })
+          p.on('error', () => null)
+          p.unref()
+          return send(res, 202, { ok: true, started: parts[7] })
+        }
+        // Run branch cleanup (improve_wfrun p3, docs/storage.md): the same answer as wfe branches.
+        if (sub === 'branches') {
+          const m = await import('./branchCleanup.ts')
+          const c = await m.cleanupContext(needExec())
+          if (!parts[7] && method === 'GET') return send(res, 200, { ...await m.assess(c, ws, ref), limits: m.STORAGE_LIMITS, record: await m.readCleanupRecord(ws, ref) })
+          if ((parts[7] === 'delete' || parts[7] === 'recreate') && method === 'POST') {
+            const input = await body(req) as Record<string, unknown>
+            const by = typeof input.by === 'string' ? input.by.trim() : ''
+            if (!by) throw new RequestError(400, 'by is required: the name of who asks')
+            if (parts[7] === 'recreate') return send(res, 200, await m.recreateBranches(c, ws, ref, { by, dryRun: input.dryRun === true }))
+            if (!Array.isArray(input.refs)) throw new RequestError(400, 'refs is required: the exact repository, ref and oid the preview showed')
+            return send(res, 200, (await m.deleteSelection(c, async () => ws, [{ workspace: ws.reg.id, ref: runKey(ref), refs: input.refs as never }], { by, dryRun: input.dryRun === true }))[0])
+          }
+        }
+        // What each attempt was prepared with and the next attempt now (p13, docs/context.md).
+        if (sub === 'context' && method === 'GET') return send(res, 200, await (await import('./contextView.ts')).runContextView(needExec(), ws, ref))
+        // A full check of an input set's or output's bytes, on a person's
+        // request (project_migration p6): the result is recorded as a host fact.
+        if (sub === 'verify' && method === 'POST') {
+          const input = await body(req) as Record<string, unknown>
+          const by = typeof input.by === 'string' ? input.by.trim() : ''
+          if (!by) throw new RequestError(400, 'by is required: the name of who checks')
+          const m = await import('./shares.ts')
+          m.setShareArea(area)
+          const id = str(input.id, 'the input set or output id')
+          const r = /^i[0-9]+$/.test(id) ? await m.verifyInput(ws, ref, id, { by, via: 'browser' }) : await m.verifyOutput(ws, ref, id, { by, via: 'browser' })
+          return send(res, 200, { ok: true, status: r.status, detail: r.detail, seq: r.record.seq })
+        }
+        // Delegations (p10, docs/delegation.md): the parent's, with each child's
+        // current situation; and, for a child, who delegated it. Reads only.
+        if (sub === 'delegations' && !parts[7] && method === 'GET') {
+          const { delegationsView } = await import('./delegate.ts')
+          return send(res, 200, await delegationsView(needExec().delegate, ws, ref))
+        }
+        // fix6: judging a delegated result and returning it for correction,
+        // the same operations as wfe delegate dispose|revise. `yes` continues
+        // past the assessment's reminders for this one request; a client shows
+        // the reminders and asks before sending it, never sets it by itself.
+        if (sub === 'delegations' && parts[7] && (parts[8] === 'dispose' || parts[8] === 'revise') && method === 'POST') {
+          const input = await body(req) as Record<string, unknown>
+          const by = typeof input.by === 'string' ? input.by.trim() : ''
+          if (!by) throw new RequestError(400, 'by is required: the name of who records this')
+          const store = needExec().delegate
+          const meta = { ...(typeof input.receipt === 'string' ? { receipt: input.receipt } : {}), ...(typeof input.attempt === 'string' ? { attempt: input.attempt } : {}) }
+          const event = typeof input.event === 'number' ? input.event : undefined
+          const manifest = typeof input.manifest === 'string' ? input.manifest : undefined
+          const because = input.because && typeof input.because === 'object' ? input.because as never : undefined
+          const r = parts[8] === 'dispose'
+            ? await store.dispose(ws, ref, parts[7], { disposition: str(input.disposition, 'disposition'), note: str(input.note, 'note'), event, manifest, yes: input.yes === true }, { by, via: 'browser', ...meta })
+            : await store.revise(ws, ref, parts[7], { instruction: str(input.instruction, 'instruction'), reason: str(input.reason, 'reason'), event, manifest, because, ...(typeof input.followUp === 'string' ? { followUp: input.followUp } : {}), ...(input.reopen === true ? { reopen: true } : {}), ...(typeof input.evidence === 'string' ? { evidence: input.evidence } : {}) }, { by, via: 'browser', ...meta })
+          return send(res, 200, { ok: true, duplicate: r.duplicate ?? false, seq: r.record.seq, delegation: r.record.delegations?.[parts[7]] })
+        }
+        // tidy p3: this run's latest result as its requester receives it
+        // (wfe run result); `requester` names the reading run. And its
+        // return by that requester (wfe run return).
+        if (sub === 'result' && method === 'GET') {
+          const { assessRequested } = await import('./requestedResult.ts')
+          const q = new URL(req.url ?? '', 'http://x').searchParams.get('requester')
+          return send(res, 200, { result: await assessRequested(needExec().delegate, { workspace: ws.reg.id, ref }, q) })
+        }
+        if (sub === 'return' && method === 'POST') {
+          const input = await body(req) as Record<string, unknown>
+          const { returnRequested } = await import('./requestedResult.ts')
+          const r = await returnRequested(needExec().delegate, { workspace: ws.reg.id, ref }, { requester: str(input.requester, 'requester'), instruction: str(input.instruction, 'instruction'), reason: str(input.reason, 'reason'), ...(typeof input.evidence === 'string' ? { evidence: input.evidence } : {}), ...(typeof input.resultSeq === 'number' ? { resultSeq: input.resultSeq } : {}), ...(typeof input.attempt === 'string' ? { attempt: input.attempt } : {}), ...(typeof input.by === 'string' ? { by: input.by } : {}), ...(typeof input.receipt === 'string' ? { receipt: input.receipt } : {}), via: 'browser' })
+          return send(res, 200, { ok: true, correction: r.correction, duplicate: r.duplicate, job: r.job })
+        }
+        // fix6: one delegation's result assessment (reads only).
+        if (sub === 'delegations' && parts[7] && parts[8] === 'assessment' && method === 'GET') {
+          const store = needExec().delegate
+          const { record, d } = await store.parentDelegation(ws, ref, parts[7])
+          const { assessDelegation } = await import('./delegate.ts')
+          return send(res, 200, { assessment: await assessDelegation(store, record, d) })
+        }
+        // Detailed IO (p10): one entry of an attempt's log in full, redacted
+        // (?attempt=&line=).
+        if (sub === 'io' && method === 'GET') {
+          const { ioEntries } = await import('./ioview.ts')
+          return send(res, 200, await ioEntries(needExec(), ws, ref, url.searchParams.get('attempt') ?? undefined, url.searchParams.get('line') ? Number(url.searchParams.get('line')) : undefined))
+        }
+        if (sub === 'checkpoints' && parts[7] && parts[8] === 'publish' && method === 'POST') return send(res, 200, await needExec().publishCheckpoint(Number(parts[7])))
+        // What undoing the run involves (p9): facts, never an operation.
+        if (sub === 'reversal' && method === 'GET') {
+          const { reversalFacts } = await import('./reversal.ts')
+          return send(res, 200, await reversalFacts(ws, ref))
+        }
+        // Integration of the accepted result (p9): its journal, a dry run, or now.
+        if (sub === 'integration') {
+          const x = needExec()
+          if (method === 'GET') return send(res, 200, { integrations: x.integrations(ws.reg.id, ref).map(i => ({ ...i, steps: JSON.parse(i.steps) })) })
+          if (method === 'POST') {
+            const input = await body(req) as Record<string, unknown>
+            const by = typeof input.by === 'string' ? input.by.trim() : ''
+            if (!by) throw new RequestError(400, 'by is required: the name of who integrates the result')
+            return send(res, 200, { ok: true, ...(await x.integrateRun(ws, ref, { by, via: 'browser', dryRun: input.dryRun === true })) })
+          }
+        }
+        // Human review rounds (p17, docs/reviews.md): each with its subjects
+        // as served now; the person's Start review, decision and cleanup.
+        // A start or an approval answers once the request is recorded; the
+        // host work goes on and the page follows the round's state.
+        if (sub === 'reviews') {
+          const host = needExec().reviews
+          if (!parts[7] && method === 'GET') {
+            const rec = (await runResponse(ws, ref)).record
+            return send(res, 200, { reviews: rec ? await host.view(ws, rec) : [] })
+          }
+          if (parts[7] && !parts[8] && method === 'GET') {
+            const rec = (await runResponse(ws, ref)).record
+            const v = rec ? (await host.view(ws, rec)).find(x => x.id === parts[7]) : undefined
+            if (!v) throw new RequestError(404, `run ${ref.workflow}/${ref.run} has no review round ${parts[7]}`, { code: 'review-unknown' })
+            return send(res, 200, { review: v, run: { project: rec!.project, workflow: rec!.workflow, run: rec!.run, seq: rec!.seq, title: rec!.input.file } })
+          }
+          if (parts[7] && ['start', 'decide', 'cleanup'].includes(parts[8] ?? '') && method === 'POST') {
+            const input = await body(req) as Record<string, unknown>
+            const by = typeof input.by === 'string' ? input.by.trim() : ''
+            if (!by) throw new RequestError(400, 'by is required: the name of who acts')
+            const receipt = typeof input.receipt === 'string' ? { receipt: input.receipt } : {}
+            const id = parts[7]
+            if (parts[8] === 'start') {
+              const r = await host.start(ws, ref, id, { by, via: 'browser', ...receipt }, { wait: input.wait === true })
+              return send(res, 200, { ok: true, review: r.round })
+            }
+            if (parts[8] === 'decide') {
+              const outcome = input.outcome === 'approved' || input.outcome === 'changes' ? input.outcome : (() => { throw new RequestError(400, 'outcome is approved or changes') })()
+              const r = await host.decide(ws, ref, id, { outcome, ...(typeof input.feedback === 'string' && input.feedback.trim() ? { feedback: input.feedback } : {}), ...(Array.isArray(input.revisions) ? { revisions: input.revisions.map(String) } : {}), ...(input.synthetic === true ? { synthetic: true } : {}) }, { by, via: 'browser', ...receipt }, { wait: input.wait === true })
+              return send(res, 200, { ok: true, review: r.round })
+            }
+            const after = await host.cleanup(ws, ref, id, { by, via: 'browser' })
+            return send(res, 200, { ok: true, review: after })
+          }
+          throw new RequestError(404, `no route for ${method} ${url.pathname}`)
+        }
+        // Presentations (p7): what each record says and what this host
+        // observes now; the person's start (recovery) and stop.
+        if (sub === 'presentations') {
+          const { Presenter } = await import('./present.ts')
+          if (!parts[7] && method === 'GET') {
+            const rec = (await runResponse(ws, ref)).record
+            if (!rec?.presentations) return send(res, 200, { presentations: [] })
+            const pr = new Presenter({ registryFile: config.registryFile, area })
+            try { return send(res, 200, { presentations: await pr.view(ws, rec) }) } finally { pr.close() }
+          }
+          if (parts[7] && (parts[8] === 'start' || parts[8] === 'stop') && method === 'POST') {
+            const input = await body(req) as Record<string, unknown>
+            const by = typeof input.by === 'string' && input.by.trim() ? input.by.trim() : ''
+            if (!by) throw new RequestError(400, 'by is required: the name of who asks for it')
+            const pr = new Presenter({ registryFile: config.registryFile, area, by })
+            try {
+              if (parts[8] === 'start') return send(res, 200, { ok: true, ...(await pr.start(ws, ref, parts[7], { by })) })
+              const results = await pr.stop(ws, ref, parts[7] === 'all' ? 'all' : parts[7], { by })
+              return send(res, results.every(x => x.ok) ? 200 : 409, { ok: results.every(x => x.ok), results })
+            } finally { pr.close() }
+          }
+          throw new RequestError(404, `no route for ${method} ${url.pathname}`)
+        }
+        if (sub === 'file' && method === 'GET') return send(res, 200, await readRunFile(ws, ref, url.searchParams.get('path') ?? '', { rev: url.searchParams.get('rev') ?? undefined }))
+        // An adjustment of the run's future work (p7): inspect (dryRun) or apply.
+        if (sub === 'adjust' && method === 'POST') {
+          const input = await body(req) as Record<string, unknown>
+          const by = typeof input.by === 'string' ? input.by.trim() : ''
+          if (!by) throw new RequestError(400, 'by is required: the name of who adjusts the run')
+          const { adjustRun } = await import('./runs.ts')
+          const source = (input.source && typeof input.source === 'object' ? input.source : { kind: 'person', by }) as never
+          // completing (p8/ex2) and yes (fix5): the same combined operation
+          // and the same reminders as wfe run adjust --completing [--yes].
+          const c = input.completing as Record<string, unknown> | undefined
+          const completing = c && typeof c === 'object' ? { node: str(c.node, 'completing.node'), outcome: str(c.outcome, 'completing.outcome'), artifacts: Array.isArray(c.artifacts) ? c.artifacts.map(String) : [] } : undefined
+          const r = await adjustRun(ws, ref, { text: str(input.text, 'the adjusted definition'), reason: str(input.reason, 'the reason'), source, dryRun: input.dryRun === true, expectRevision: typeof input.expectRevision === 'string' ? input.expectRevision : undefined, completing }, { by, via: 'browser', expectSeq: typeof input.expectSeq === 'number' ? input.expectSeq : undefined, advice: { yes: input.yes === true, ...assessAdvice() }, ...(typeof input.receipt === 'string' ? { receipt: input.receipt } : {}), ...(typeof input.attempt === 'string' ? { attempt: input.attempt } : {}) })
+          return send(res, r.ok ? 200 : 422, r)
+        }
+        // Work already done, recorded as a completed node (fix5): wfe run record-done.
+        if (sub === 'record-done' && method === 'POST') {
+          const input = await body(req) as Record<string, unknown>
+          const by = typeof input.by === 'string' ? input.by.trim() : ''
+          if (!by) throw new RequestError(400, 'by is required: the name of who records it')
+          const { recordDone } = await import('./runs.ts')
+          const list = (k: string) => (Array.isArray(input[k]) ? (input[k] as unknown[]).map(String) : [])
+          const opt = (k: string) => (typeof input[k] === 'string' ? input[k] as string : undefined)
+          const r = await recordDone(ws, ref, {
+            node: opt('node'), template: opt('template'), type: opt('type'), name: opt('name'), description: opt('description'), after: list('after'), before: list('before'),
+            outcome: str(input.outcome, 'the outcome'), reason: str(input.reason, 'why it is recorded afterwards'), artifacts: list('artifacts'),
+            commits: Array.isArray(input.commits) ? (input.commits as { commit: string; repository?: string }[]) : [], entries: Array.isArray(input.entries) ? (input.entries as number[]) : [],
+            questions: list('questions'), outputs: list('outputs'), presentation: opt('presentation'),
+            reported: input.reported && typeof input.reported === 'object' ? input.reported as { started?: string; ended?: string } : undefined, expectRevision: opt('expectRevision'),
+          }, { by, via: 'browser', expectSeq: typeof input.expectSeq === 'number' ? input.expectSeq : undefined, ...(opt('receipt') ? { receipt: opt('receipt') } : {}) })
+          return send(res, 200, { ok: true, ...r })
+        }
+        if (sub === 'ops' && method === 'POST') {
+          const input = await body(req) as Record<string, unknown>
+          // Attempts and presentation facts are the execution host's; adjustments have their own route.
+          // Delegations, assignment and session retirement are made by their
+          // domain operations (target resolution, worker and process checks:
+          // wfe delegate, wfe run assign|session), never as a bare record
+          // (project_migration p8).
+          const offered = OPS.filter(o => o !== 'run.create' && !o.startsWith('attempt.') && !o.startsWith('presentation.') && !o.startsWith('input.') && !o.startsWith('output.') && !o.startsWith('delegation.') && !o.startsWith('review.') && !(['run.adjust', 'run.integrate', 'run.relocate', 'run.recover', 'run.assign', 'session.retire'] as string[]).includes(o))
+          if (!(offered as readonly string[]).includes(input.op as string)) throw new RequestError(400, `op must be one of ${offered.join(', ')} (attempts and presentation facts are the execution host's)`)
+          const by = typeof input.by === 'string' ? input.by : ''
+          if (!by.trim()) throw new RequestError(400, 'by is required: the name of who records this')
+          const expectSeq = typeof input.expectSeq === 'number' ? input.expectSeq : undefined
+          // yes (fix5): continue past this operation's reminders, as --yes does.
+          const { by: _b, expectSeq: _e, yes, ...op } = input
+          const advice = { yes: yes === true, ...assessAdvice(), ...(yes !== true && op.op === 'node.complete' && typeof op.node === 'string' ? { extra: await restAdvice(ws, ref, op.node) } : {}) }
+          const x = config.exec
+          const reason = typeof op.reason === 'string' ? op.reason : ''
+          // The person's control operations go through execution management,
+          // which also terminates, queues or publishes as they require.
+          if (x && op.op === 'run.stop') { const rec = await x.stop(ws, ref, by, reason, 'browser'); return send(res, 200, { ok: true, seq: rec.seq, record: rec }) }
+          if (x && op.op === 'run.cancel') { const { record: rec, cleanup } = await x.cancel(ws, ref, by, reason, 'browser'); return send(res, 200, { ok: true, seq: rec.seq, record: rec, cleanup }) }
+          if (x && op.op === 'run.resume') { const r = await x.resume(ws, ref, by, reason, 'browser', typeof op.receipt === 'string' ? op.receipt : undefined, typeof op.profile === 'string' && op.profile.trim() ? { profile: op.profile.trim() } : {}); return send(res, 200, { ok: true, seq: r.record.seq, record: r.record, job: r.job }) }
+          const r = await runOp(ws, ref, op as unknown as OpInput, { by, via: 'browser', expectSeq, advice })
+          const extra: Record<string, unknown> = { duplicate: r.duplicate ?? false }
+          // The host that executes the run (executor.host); executor.name is
+          // the agent identity since p6 and differs from it when a workflow
+          // names its agent (project_migration p1: browser answers waited for
+          // reconcile, browser decisions were never published).
+          if (x && hostOf(r.record.executor) === x.executor) {
+            if (op.op === 'question.answer') extra.job = await x.afterAnswer(ws, ref, String(op.question)) // persisted first, then queued
+            if (op.op === 'instruction.receive') { const id = Object.keys(r.record.instructions ?? {}).at(-1); if (id) extra.job = await x.afterInstruction(ws, ref, id) }
+            if (op.op === 'run.decide' && !r.duplicate) extra.checkpoint = await x.afterDecision(ws, ref, String(op.decision)).catch(e => ({ state: 'failed', error: (e as Error).message }))
+          }
+          return send(res, 200, { ok: true, seq: r.record.seq, record: r.record, ...extra })
+        }
+        throw new RequestError(404, `no route for ${method} ${url.pathname}`)
+      }
+      if (b === 'shared' && !file && method === 'POST') {
+        const input = await body(req) as Record<string, unknown>
+        const result = await addSharedRepository(agdev, ws, str(input.repository, 'repository'), str(input.path, 'path'))
+        return send(res, result.ok ? 200 : 422, result)
+      }
+      if (b === 'submodules' && !file && method === 'POST') {
+        const input = await body(req) as Record<string, unknown>
+        if (typeof input.path !== 'string') throw new RequestError(400, 'path is required')
+        if (input.create === true) {
+          const result = await addNewRepository(ws, input.path, join(area, 'sources'))
+          return send(res, result.ok ? 200 : 422, result)
+        }
+        if (typeof input.url !== 'string') throw new RequestError(400, 'url is required (or create: true for a new local repository)')
+        assertNotRetired(retiredByUrl(await loadBoundary(config.registryFile, area), input.url), `Adding ${input.url} as a submodule`)
+        const result = await ws.addSubmodule(input.path, input.url)
+        return send(res, result.ok ? 200 : 422, result)
+      }
+      // Bringing the workspace forward to the published revision, only by
+      // fast-forward; refused (nothing changed) otherwise.
+      if (b === 'sync' && !file && method === 'POST') {
+        const input = await body(req) as Record<string, unknown>
+        const ctx: import('./access.ts').AccessContext = { registryFile: config.registryFile, area, gitea: config.gitea, giteaProblem: config.giteaProblem }
+        const r = await (await import('./workspaceSync.ts')).syncWorkspace(ctx, ws, { dryRun: input.dryRun === true })
+        return send(res, r.ok ? 200 : 409, r)
+      }
+      if (b === 'workflows' && !file) {
+        if (method === 'GET') return send(res, 200, (await ws.workflowSummaries()).list)
+        if (method === 'POST') {
+          const input = await body(req) as Record<string, unknown>
+          if (typeof input.id !== 'string') throw new RequestError(400, 'id is required')
+          const documentation = input.documentation && typeof input.documentation === 'object' ? input.documentation as Documentation : typeof input.policy === 'string' ? input.policy : undefined
+          return send(res, 201, await ws.createWorkflow(input.id, typeof input.name === 'string' ? input.name : '', documentation, typeof input.template === 'string' ? input.template : 'empty'))
+        }
+      }
+      if (b === 'workflow-templates' && !file && method === 'GET') {
+        const { WORKFLOW_TEMPLATES } = await import('./templates.ts')
+        return send(res, 200, WORKFLOW_TEMPLATES)
+      }
+      if (b === 'workflows' && file && !action) {
+        if (method === 'GET') return send(res, 200, await ws.workflowResponse(file))
+        if (method === 'PUT') {
+          const input = await body(req) as Record<string, unknown>
+          const saved = await ws.saveWorkflow(file, asWorkflow(input.workflow), typeof input.base === 'string' ? input.base : undefined)
+          config.watcher?.noteOwnWrite(ws, `devdocs/workflows/${file}`, saved.rev)
+          return send(res, 200, { ok: true, ...saved })
+        }
+      }
+      // A node from a template of the person's catalog (p7/ex1), into the saved file.
+      if (b === 'workflows' && file && action === 'instantiate' && method === 'POST') {
+        const input = await body(req) as Record<string, unknown>
+        const list = (v: unknown, what: string) => { if (v === undefined) return undefined; if (!texts(v)) throw new RequestError(400, `${what} must be a list of text`); return v as string[] }
+        const { instantiateIntoWorkflow } = await import('./catalog.ts')
+        const r = await instantiateIntoWorkflow(area, ws, file, str(input.template, 'template'), { id: typeof input.id === 'string' && input.id.trim() ? input.id.trim() : undefined, repositories: list(input.repositories, 'repositories'), after: list(input.after, 'after'), before: list(input.before, 'before') })
+        config.watcher?.noteOwnWrite(ws, `devdocs/workflows/${file}`, r.rev)
+        return send(res, 200, { ok: true, ...r })
+      }
+      if (b === 'workflows' && file && action === 'approve' && method === 'POST') {
+        const input = await body(req) as Record<string, unknown>
+        if (!(APPROVAL_KINDS as readonly string[]).includes(input.kind as string)) throw new RequestError(400, 'kind must be intent or definition')
+        const result = await ws.approve(file, input.kind as ApprovalKind, typeof input.approver === 'string' ? input.approver : '')
+        config.watcher?.noteOwnWrite(ws, `devdocs/workflows/${file}`, result.rev)
+        return send(res, 200, { ok: true, ...result })
+      }
+      throw new RequestError(404, `no route for ${method} ${url.pathname}`)
+    } catch (e) {
+      if (res.headersSent) { res.end(); return }
+      if (e instanceof RequestError) return send(res, e.status, { error: e.message, detail: e.detail })
+      if (e instanceof BoundaryError) return send(res, 400, { error: e.message })
+      if (e instanceof RegistryError) return send(res, 500, { error: e.message })
+      const err = e as NodeJS.ErrnoException
+      // File system failures (permissions, disk) are reported, not hidden.
+      if (err.code) return send(res, 500, { error: `${err.code}: ${err.message}` })
+      console.error(e)
+      return send(res, 500, { error: String((e as Error).message ?? e) })
+    }
+  }
+}

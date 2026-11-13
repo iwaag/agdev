@@ -1,0 +1,497 @@
+// Definition models shared by the service and the browser. The YAML files are
+// the authority; these are the editable projections of their supported fields.
+// See docs/contract.md for the file contract.
+import type { KnowledgeAttachment, KnowledgeRef } from './knowledge.ts'
+
+export const WORKFLOW_SCHEMA = 'ag.workflow.v2'
+export const PROJECT_SCHEMA = 'ag.project.v2'
+// `review` (workflow_editor p17, docs/reviews.md): a person's review of
+// completed work, prepared by the run's agent and then managed by WFE —
+// starting the presentations, the person's decision, cleanup. No agent
+// process waits on it.
+export const NODE_TYPES = ['study', 'do', 'delegate', 'talk', 'workflow__talk', 'review'] as const
+export type NodeType = typeof NODE_TYPES[number]
+// workflow_improve p1: workflow__talk specializes consultation to the run's graph.
+export const isTalkType = (type: string): boolean => type === 'talk' || type === 'workflow__talk'
+// What a node is in a discussion (argue p4, docs/discussions.md *Activities*):
+// metadata on an ordinary node type, bound to the discussion's records by
+// `wfe discussion announce|ask|ponder|talk --node`. `talk` is a talk node;
+// the others are do nodes. Part of the definition digest and the compiled
+// graph, like a delegate's target.
+export const ACTIVITIES = ['announce', 'ask', 'ponder', 'talk'] as const
+export type Activity = typeof ACTIVITIES[number]
+export const activityType = (a: string): NodeType => (a === 'talk' ? 'talk' : 'do')
+export const ACCESS_LEVELS = ['readonly', 'editable'] as const
+export type Access = typeof ACCESS_LEVELS[number]
+export const APPROVAL_KINDS = ['intent', 'definition'] as const
+// Where devdocs lives (p4): a directory of the project root repository
+// (the default for new projects) or a repository of its own, as a submodule.
+export const DEVDOCS_MODES = ['directory', 'submodule'] as const
+export type DevdocsMode = typeof DEVDOCS_MODES[number]
+// Who decides when plans and reports are written (p5): `default` makes the
+// run itself plan, report each node and report the whole (shared/compile.ts);
+// `manual` leaves documents to explicit instructions.
+export const DOC_POLICIES = ['default', 'manual', 'custom'] as const
+export type DocPolicy = typeof DOC_POLICIES[number]
+// The three generated documentation steps a policy decides (p8/ex2): the
+// plan talk, a report after every authored node, the final report. `default`
+// is all three, `manual` none, `custom` declares each (contract.md).
+export const DOC_STEPS = ['plan', 'reports', 'final'] as const
+export type DocStep = typeof DOC_STEPS[number]
+export type DocSteps = Record<DocStep, boolean>
+export interface Documentation { policy: string; plan?: boolean; reports?: boolean; final?: boolean }
+// The normalized setting of a declaration, or null when it is not a valid
+// one (an unknown policy, `custom` without all three, or `default`/`manual`
+// with any of them). Validation says which; nothing is reconciled.
+export function docSteps(d: Documentation): DocSteps | null {
+  const declared = DOC_STEPS.filter(k => d[k] !== undefined)
+  if (d.policy === 'default') return declared.length ? null : { plan: true, reports: true, final: true }
+  if (d.policy === 'manual') return declared.length ? null : { plan: false, reports: false, final: false }
+  if (d.policy === 'custom') return declared.length === DOC_STEPS.length ? { plan: d.plan!, reports: d.reports!, final: d.final! } : null
+  return null
+}
+// How runs of a workflow are executed and requested (p6). `execution` names
+// the agent identity, the host's execution profile and project-relative
+// guides added to the common workflow contract; credentials stay in host
+// configuration. Empty execution values: the host's defaults. `intake`
+// says whether the workflow takes requests: `intake.requests` (new files
+// declare it), else the older `intake.zulip` key, named after the retired
+// Zulip intake (p6) and kept as data: on unless the file opts out with
+// `zulip: ""` (fix2); an absent intake, an empty mapping or an absent zulip
+// read as requests. Nothing Zulip-specific follows from either.
+export const INTAKE_MODES = ['requests'] as const
+// cluster_teamwork p4: whether a workflow takes requests (a delegation, a
+// submission), independent of their route. `intake.requests` when declared;
+// otherwise the historical meaning of `intake.zulip` — requests unless the
+// file opted out with `zulip: ""` (that opt-out is never silently opened).
+export const acceptsRequests = (w: { intake: { zulip: string; requests?: boolean } }) => w.intake.requests ?? w.intake.zulip === 'requests'
+// A talk node may be the run's designated result confirmation (p6): the
+// person's confirmation there maps to the result decision (docs/runs.md).
+export const CONFIRMS = ['result'] as const
+// Who may accept the result of a delegated child run (p10): the parent's
+// person (default), or the parent run's agent when the author grants it.
+export const DELEGATE_ACCEPTS = ['person', 'parent'] as const
+// An installation's stable identity (agdevctl init: <slug>-<12 hex>),
+// improve_multinodes p1.
+export const INSTANCE_ID = /^[a-z][a-z0-9-]{0,40}-[0-9a-f]{12}$/
+export const PROFILE_PATTERN = /^[a-z0-9][a-z0-9_.-]{0,63}$/
+// An execution node (worker) id (project_migration p7): a logical name, not a host name.
+export const NODE_PATTERN = /^[a-z][a-z0-9-]{0,31}$/
+// A worker lane (project_migration p8, docs/workers.md): a named set of
+// extra slots of a worker; `default` is the one slot every worker has.
+export const LANE_PATTERN = NODE_PATTERN
+export const DEFAULT_LANE = 'default'
+// How a run's attempts use harness conversations (agent_session p1):
+// `fresh` starts a new session for every attempt from the run's records and
+// files; `run` resumes the run's own retained session in each later attempt.
+// '' (not declared) is `fresh`. Records stay authoritative either way.
+export const SESSION_POLICIES = ['fresh', 'run'] as const
+export type SessionPolicy = typeof SESSION_POLICIES[number]
+export const sessionPolicyOf = (ex: { session?: string } | undefined): SessionPolicy => (ex?.session === 'run' ? 'run' : 'fresh')
+// How a node looks (p7), independent of what it does: an icon and a color
+// token of the editor's palette. Display only — never part of a digest, the
+// compiled graph or an execution rule (docs/contract.md, "Appearance").
+export const APPEARANCE_ICONS = ['study', 'do', 'delegate', 'talk', 'present', 'cleanup', 'test', 'doc', 'build', 'review', 'flag'] as const
+export const APPEARANCE_COLORS = ['blue', 'amber', 'violet', 'teal', 'green', 'rose', 'slate', 'orange'] as const
+export interface Appearance { icon: string; color: string } // '' = the type's default
+// Node presets moved into the person's node catalog in p7/ex1
+// (shared/catalog.ts SEEDS, docs/catalog.md).
+export type ApprovalKind = typeof APPROVAL_KINDS[number]
+
+// Stable identifiers: workflow IDs, node IDs and repository binding keys.
+export const ID_PATTERN = /^[a-z0-9][a-z0-9_.-]{0,63}$/
+
+// `type` and `access` stay plain strings so that a hand-edited file with an
+// unknown value is still representable; validation reports it.
+// `integrate` (project_migration p4, docs/integration.md *Guarded bindings*):
+// 'if-unchanged' stops integration when the binding's target changed since
+// the run built on it; absent or 'merge' is the ordinary integration.
+export interface RepositoryBinding { path: string; access: string; integrate?: string }
+export const INTEGRATE_MODES = ['merge', 'if-unchanged'] as const
+export interface WorkflowNode {
+  type: string
+  name: string
+  description: string
+  repositories: string[]
+  workflow?: string
+  // Delegate targets (p10, docs/delegation.md): `project` is the target
+  // project id (absent = this project), `accepts` who may accept the
+  // child's result: 'person' (default) or 'parent' (the parent run's agent).
+  project?: string
+  // improve_multinodes p1 (docs/peers.md): the stable instance id of
+  // another agdev installation the target runs on; absent = this one.
+  instance?: string
+  accepts?: string
+  confirms?: string // 'result' on the result-confirmation talk (p6)
+  activity?: string // a discussion activity (argue p4): announce | ask | ponder | talk
+  appearance?: Appearance // display only (p7)
+  template?: TemplateRef // provenance (p7/ex1): the catalog template it was made from; outside digests and the compiled graph
+  // improve_wfnode p1 (docs/contract.md *Examples*, *Expectations*): a model for
+  // concrete work, not work itself; what the author expects of its result; and,
+  // on concrete work, the examples it was specialized from.
+  example?: boolean
+  expectations?: NodeExpectation[]
+  specializes?: Specializes
+  // improve_workflow p3 (docs/knowledge.md *On a node*): the knowledge the author points at.
+  knowledge?: KnowledgeAttachment[]
+}
+// What the author expects of a node's result. `strength` is plain text so a
+// wrong value is representable and reported; absent reads as `preferred`.
+export interface NodeExpectation { key: string; strength?: string; note?: string }
+// Provenance of a replacement: the example nodes and the definition revision
+// they were read from. A record, like the revision's reason.
+export interface Specializes { examples: string[]; revision: string }
+// A first-class group of nodes (docs/contract.md *Groups*). `members` is the
+// sole authority for membership and its order; it creates no edges. P1 has
+// flat, non-overlapping `list` groups of `variable` cardinality.
+export const GROUP_KINDS = ['list'] as const
+export const GROUP_CARDINALITIES = ['variable'] as const
+export interface WorkflowGroup { name: string; kind: string; cardinality: string; description: string; members: string[]; appearance?: { color: string } }
+// Where a node came from (p7/ex1, docs/catalog.md): the template's id and
+// revision, and its expectation at that revision.
+export interface TemplateRef { id: string; revision: number; expectation: string }
+export interface Edge { from: string; to: string }
+export interface ApprovalRecord { digest: string; approver: string; at: string }
+export interface Point { x: number; y: number }
+
+export interface Workflow {
+  schema: string
+  id: string
+  name: string
+  intent: string
+  repositories: Record<string, RepositoryBinding>
+  nodes: Record<string, WorkflowNode>
+  edges: Edge[]
+  groups?: Record<string, WorkflowGroup> // improve_wfnode p1: absent = ordinary ungrouped nodes
+  // The policy is plain text so that an unsupported or missing value is
+  // representable and reported by validation ('' = the file declares none);
+  // the three steps (p8/ex2) are booleans when the file has them.
+  documentation: Documentation
+  execution: { agent: string; profile: string; guides: string[]; session?: string; node?: string; lane?: string } // session: '' or absent = fresh (SESSION_POLICIES); node (project_migration p7): the execution node its runs are performed on, '' or absent = the project's or the area's default; lane (project_migration p8): the worker lane its attempts are claimed in, '' or absent = the project's or `default`
+  // cluster_teamwork p4: `requests` — whether the workflow takes requests at
+  // all (delegations, submissions), whatever their route. Absent: what
+  // `zulip` said (requests unless `zulip: ""`); see acceptsRequests.
+  intake: { zulip: string; requests?: boolean }
+  approvals: Partial<Record<ApprovalKind, ApprovalRecord>>
+  layout: { nodes: Record<string, Point> }
+}
+
+export interface Project {
+  schema: string
+  id: string
+  name: string
+  // devdocs storage mode as declared; plain text so that a wrong value is
+  // representable and reported by validation.
+  devdocs: string
+  intent: string
+  goals: string[]
+  // Local areas (project_migration p1): folders of the root repository that
+  // the project keeps as knowledge areas of its own (a study or wedo kept
+  // locally instead of as a shared repository). A workflow may bind them like
+  // a submodule. Read from the file only; the editor never rewrites them.
+  areas?: LocalArea[]
+  // Project guides (workflow_editor p13, docs/context.md): guide files every
+  // workflow of the project inherits once, in the execution.guides notation
+  // (a project-relative path, or <project>:<path>). A workflow's own
+  // execution.guides add to them.
+  guides?: string[]
+  // project_migration p7: the execution node this project's runs are
+  // performed on unless the workflow or the request names one; p8: the
+  // worker lane they are claimed in unless the workflow names one.
+  execution?: { node?: string; lane?: string }
+  // better_git_strategy p1: the project's local layout around its checkout
+  // (docs/storage.md). Workspace-relative paths, outside the reserved
+  // source/, .agdev/ and published/. Read from the file only.
+  workspace?: WorkspaceLayout
+}
+export interface WorkspaceLayout {
+  directories: string[] // created when the workspace is provisioned
+  files: { from: string; to: string }[] // from: source-relative template; to: workspace-relative, written only when absent
+  runFiles: string[] // workspace-relative files each run receives at the same place in its envelope
+}
+export const WORKSPACE_RESERVED = ['source', '.agdev', 'published']
+// Names a run envelope holds for agdev (runspace.ts, runrecord.ts, retention.ts, integrate.ts).
+export const RUN_ENVELOPE_RESERVED = ['copy.json', 'source', 'source.removing', 'record', 'record.staging', 'record.old', 'inputs', 'integration', 'archive', 'archive.staging', 'branch-cleanup.json', 'worker-archive', 'tree', 'tree.removing']
+// A workspace-relative path, or why it cannot be one.
+export function workspaceRelPath(raw: string): string | { problem: string } {
+  const p = typeof raw === 'string' ? raw.trim().replace(/\\/g, '/').replace(/\/+$/, '').replace(/^\.\//, '') : ''
+  if (!p) return { problem: 'an empty path' }
+  if (p.startsWith('/') || /^[A-Za-z]:/.test(p)) return { problem: `"${raw}" is absolute` }
+  const parts = p.split('/').filter(x => x !== '' && x !== '.')
+  if (!parts.length || parts.includes('..')) return { problem: `"${raw}" leaves the workspace` }
+  if (WORKSPACE_RESERVED.includes(parts[0])) return { problem: `"${raw}" uses the reserved name ${parts[0]}/` }
+  if (parts[0] === '.local') return { problem: `"${raw}": a workspace has no .local/ (the whole workspace is local); name the folder directly` }
+  return parts.join('/')
+}
+export interface LocalArea { path: string; description: string }
+
+export interface Issue {
+  severity: 'error' | 'warning'
+  code: string
+  message: string
+  node?: string
+  edge?: number
+  binding?: string
+  field?: string
+}
+
+// A structural problem found while reading raw data into a model. Any shape
+// issue makes the file read-only in the editor: saving the model back would
+// rewrite a construct the model cannot represent.
+export interface ShapeIssue { path: string; message: string }
+
+export function emptyWorkflow(id: string, name: string): Workflow {
+  return {
+    schema: WORKFLOW_SCHEMA, id, name, intent: '',
+    repositories: {}, nodes: {}, edges: [], documentation: { policy: 'default' },
+    execution: { agent: '', profile: '', guides: [] }, intake: { zulip: 'requests' }, approvals: {}, layout: { nodes: {} },
+  }
+}
+
+export function cloneWorkflow(w: Workflow): Workflow {
+  return structuredClone(w)
+}
+
+const isRecord = (v: unknown): v is Record<string, unknown> =>
+  typeof v === 'object' && v !== null && !Array.isArray(v)
+
+function text(raw: Record<string, unknown>, key: string, path: string, issues: ShapeIssue[]): string {
+  const v = raw[key]
+  if (v === undefined || v === null) return ''
+  if (typeof v === 'string') return v
+  if (typeof v === 'number' || typeof v === 'boolean') {
+    issues.push({ path: `${path}.${key}`, message: `expected text, found ${typeof v}` })
+    return String(v)
+  }
+  issues.push({ path: `${path}.${key}`, message: 'expected text' })
+  return ''
+}
+
+function map(raw: Record<string, unknown>, key: string, path: string, issues: ShapeIssue[]): Record<string, unknown> {
+  const v = raw[key]
+  if (v === undefined || v === null) return {}
+  if (isRecord(v)) return v
+  issues.push({ path: `${path}.${key}`, message: 'expected a mapping' })
+  return {}
+}
+
+function list(raw: Record<string, unknown>, key: string, path: string, issues: ShapeIssue[]): unknown[] {
+  const v = raw[key]
+  if (v === undefined || v === null) return []
+  if (Array.isArray(v)) return v
+  issues.push({ path: `${path}.${key}`, message: 'expected a sequence' })
+  return []
+}
+
+function stringList(raw: Record<string, unknown>, key: string, path: string, issues: ShapeIssue[]): string[] {
+  return list(raw, key, path, issues).flatMap((v, i) => {
+    if (typeof v === 'string') return [v]
+    issues.push({ path: `${path}.${key}[${i}]`, message: 'expected text' })
+    return []
+  })
+}
+
+// Reads plain data (parsed YAML) into a workflow. Missing fields default to
+// empty so incomplete drafts load; wrongly shaped fields are shape issues.
+export function workflowFromData(raw: unknown): { workflow: Workflow; issues: ShapeIssue[] } {
+  const issues: ShapeIssue[] = []
+  const w = emptyWorkflow('', '')
+  w.documentation.policy = '' // absent from the file: validation says so
+  if (!isRecord(raw)) {
+    issues.push({ path: '$', message: raw === null || raw === undefined ? 'empty document' : 'top level must be a mapping' })
+    return { workflow: w, issues }
+  }
+  w.schema = text(raw, 'schema', '$', issues)
+  w.id = text(raw, 'id', '$', issues)
+  w.name = text(raw, 'name', '$', issues)
+  w.intent = text(raw, 'intent', '$', issues)
+  for (const [key, value] of Object.entries(map(raw, 'repositories', '$', issues))) {
+    const path = `$.repositories.${key}`
+    if (!isRecord(value)) { issues.push({ path, message: 'expected a mapping' }); continue }
+    const integrate = text(value, 'integrate', path, issues)
+    w.repositories[key] = { path: text(value, 'path', path, issues), access: text(value, 'access', path, issues), ...(integrate ? { integrate } : {}) }
+  }
+  for (const [key, value] of Object.entries(map(raw, 'nodes', '$', issues))) {
+    const path = `$.nodes.${key}`
+    if (!isRecord(value)) { issues.push({ path, message: 'expected a mapping' }); continue }
+    const node: WorkflowNode = {
+      type: text(value, 'type', path, issues),
+      name: text(value, 'name', path, issues),
+      description: text(value, 'description', path, issues),
+      repositories: stringList(value, 'repositories', path, issues),
+    }
+    if (value.workflow !== undefined && value.workflow !== null) node.workflow = text(value, 'workflow', path, issues)
+    if (value.project !== undefined && value.project !== null) node.project = text(value, 'project', path, issues)
+    if (value.instance !== undefined && value.instance !== null) node.instance = text(value, 'instance', path, issues)
+    if (value.accepts !== undefined && value.accepts !== null) node.accepts = text(value, 'accepts', path, issues)
+    if (value.confirms !== undefined && value.confirms !== null) node.confirms = text(value, 'confirms', path, issues)
+    if (value.activity !== undefined && value.activity !== null) node.activity = text(value, 'activity', path, issues)
+    if (value.appearance !== undefined && value.appearance !== null) {
+      const a = map(value, 'appearance', path, issues)
+      node.appearance = { icon: text(a, 'icon', `${path}.appearance`, issues), color: text(a, 'color', `${path}.appearance`, issues) }
+    }
+    if (value.template !== undefined && value.template !== null) {
+      const t = map(value, 'template', path, issues)
+      const rev = t.revision
+      if (typeof rev !== 'number' || !Number.isInteger(rev) || rev < 1) issues.push({ path: `${path}.template.revision`, message: 'expected a positive integer' })
+      node.template = { id: text(t, 'id', `${path}.template`, issues), revision: typeof rev === 'number' ? rev : 0, expectation: text(t, 'expectation', `${path}.template`, issues) }
+    }
+    if (value.example !== undefined && value.example !== null) {
+      if (typeof value.example === 'boolean') { if (value.example) node.example = true }
+      else issues.push({ path: `${path}.example`, message: 'expected true or false' })
+    }
+    if (value.expectations !== undefined && value.expectations !== null) {
+      node.expectations = list(value, 'expectations', path, issues).flatMap((x, i) => {
+        const p = `${path}.expectations[${i}]`
+        if (!isRecord(x)) { issues.push({ path: p, message: 'expected a mapping with key, and optionally strength and note' }); return [] }
+        const e: NodeExpectation = { key: text(x, 'key', p, issues) }
+        if (x.strength !== undefined && x.strength !== null) e.strength = text(x, 'strength', p, issues)
+        if (x.note !== undefined && x.note !== null) e.note = text(x, 'note', p, issues)
+        return [e]
+      })
+    }
+    if (value.specializes !== undefined && value.specializes !== null) {
+      const s = map(value, 'specializes', path, issues)
+      node.specializes = { examples: stringList(s, 'examples', `${path}.specializes`, issues), revision: text(s, 'revision', `${path}.specializes`, issues) }
+    }
+    if (value.knowledge !== undefined && value.knowledge !== null) {
+      // Kept as written, so that validation can say what is wrong with it: a
+      // malformed reference must not silently lose the author's intent.
+      const str = (x: Record<string, unknown>, k: string) => (x[k] === undefined || x[k] === null ? undefined : String(x[k]))
+      node.knowledge = list(value, 'knowledge', path, issues).flatMap((x, i) => {
+        const p = `${path}.knowledge[${i}]`
+        if (!isRecord(x)) { issues.push({ path: p, message: 'expected a mapping with category, note and findings' }); return [] }
+        const a: KnowledgeAttachment = {}
+        if (str(x, 'category')) a.category = str(x, 'category')
+        if (str(x, 'note')) a.note = str(x, 'note')
+        if (x.findings !== undefined && x.findings !== null) {
+          const refs = list(x, 'findings', p, issues).flatMap((f, j) => {
+            if (!isRecord(f)) { issues.push({ path: `${p}.findings[${j}]`, message: 'expected a mapping with id, repository, commit, path and sha256 (wfe knowledge ref)' }); return [] }
+            const r: KnowledgeRef = { id: str(f, 'id') ?? '', repository: str(f, 'repository') ?? '', commit: str(f, 'commit') ?? '', path: str(f, 'path') ?? '', sha256: str(f, 'sha256') ?? '' }
+            for (const k of ['title', 'summary', 'status'] as const) if (str(f, k)) r[k] = str(f, k)
+            return [r]
+          })
+          if (refs.length) a.findings = refs
+        }
+        return [a]
+      })
+    }
+    w.nodes[key] = node
+  }
+  list(raw, 'edges', '$', issues).forEach((value, i) => {
+    const path = `$.edges[${i}]`
+    if (!isRecord(value)) { issues.push({ path, message: 'expected a mapping with from and to' }); return }
+    w.edges.push({ from: text(value, 'from', path, issues), to: text(value, 'to', path, issues) })
+  })
+  if (raw.groups !== undefined && raw.groups !== null) {
+    w.groups = {}
+    for (const [key, value] of Object.entries(map(raw, 'groups', '$', issues))) {
+      const path = `$.groups.${key}`
+      if (!isRecord(value)) { issues.push({ path, message: 'expected a mapping with name, kind, cardinality, description and members' }); continue }
+      const g: WorkflowGroup = { name: text(value, 'name', path, issues), kind: text(value, 'kind', path, issues), cardinality: text(value, 'cardinality', path, issues), description: text(value, 'description', path, issues), members: stringList(value, 'members', path, issues) }
+      if (value.appearance !== undefined && value.appearance !== null) g.appearance = { color: text(map(value, 'appearance', path, issues), 'color', `${path}.appearance`, issues) }
+      w.groups[key] = g
+    }
+  }
+  const documentation = map(raw, 'documentation', '$', issues)
+  w.documentation.policy = text(documentation, 'policy', '$.documentation', issues)
+  for (const k of DOC_STEPS) {
+    const v = documentation[k]
+    if (v === undefined || v === null) continue
+    if (typeof v === 'boolean') w.documentation[k] = v
+    else issues.push({ path: `$.documentation.${k}`, message: 'expected true or false' })
+  }
+  const execution = map(raw, 'execution', '$', issues)
+  w.execution = { agent: text(execution, 'agent', '$.execution', issues), profile: text(execution, 'profile', '$.execution', issues), guides: stringList(execution, 'guides', '$.execution', issues) }
+  if (execution.session !== undefined && execution.session !== null) w.execution.session = text(execution, 'session', '$.execution', issues)
+  if (execution.node !== undefined && execution.node !== null) w.execution.node = text(execution, 'node', '$.execution', issues)
+  if (execution.lane !== undefined && execution.lane !== null) w.execution.lane = text(execution, 'lane', '$.execution', issues)
+  const intake = map(raw, 'intake', '$', issues)
+  w.intake = { zulip: intake.zulip === undefined || intake.zulip === null ? 'requests' : text(intake, 'zulip', '$.intake', issues) }
+  if (intake.requests !== undefined && intake.requests !== null) {
+    if (typeof intake.requests === 'boolean') w.intake.requests = intake.requests
+    else issues.push({ path: '$.intake.requests', message: 'expected true or false (whether the workflow takes requests, by any route)' })
+  }
+  const approvals = map(raw, 'approvals', '$', issues)
+  for (const [key, value] of Object.entries(approvals)) {
+    const path = `$.approvals.${key}`
+    if (!(APPROVAL_KINDS as readonly string[]).includes(key)) continue // unknown kinds are preserved, not modelled
+    if (!isRecord(value)) { issues.push({ path, message: 'expected a mapping' }); continue }
+    w.approvals[key as ApprovalKind] = {
+      digest: text(value, 'digest', path, issues),
+      approver: text(value, 'approver', path, issues),
+      at: text(value, 'at', path, issues),
+    }
+  }
+  const layout = map(raw, 'layout', '$', issues)
+  for (const [key, value] of Object.entries(map(layout, 'nodes', '$.layout', issues))) {
+    const path = `$.layout.nodes.${key}`
+    if (!isRecord(value) || typeof value.x !== 'number' || typeof value.y !== 'number' ||
+      !Number.isFinite(value.x) || !Number.isFinite(value.y)) {
+      issues.push({ path, message: 'expected {x: number, y: number}' })
+      continue
+    }
+    w.layout.nodes[key] = { x: value.x, y: value.y }
+  }
+  return { workflow: w, issues }
+}
+
+export function projectFromData(raw: unknown): { project: Project; issues: ShapeIssue[] } {
+  const issues: ShapeIssue[] = []
+  const p: Project = { schema: '', id: '', name: '', devdocs: '', intent: '', goals: [] }
+  if (!isRecord(raw)) {
+    issues.push({ path: '$', message: raw === null || raw === undefined ? 'empty document' : 'top level must be a mapping' })
+    return { project: p, issues }
+  }
+  p.schema = text(raw, 'schema', '$', issues)
+  p.id = text(raw, 'id', '$', issues)
+  p.name = text(raw, 'name', '$', issues)
+  p.devdocs = text(raw, 'devdocs', '$', issues)
+  p.intent = text(raw, 'intent', '$', issues)
+  p.goals = stringList(raw, 'goals', '$', issues)
+  if (raw.guides !== undefined && raw.guides !== null) p.guides = stringList(raw, 'guides', '$', issues)
+  if (raw.execution !== undefined && raw.execution !== null) {
+    const ex = map(raw, 'execution', '$', issues)
+    p.execution = {}
+    if (ex.node !== undefined && ex.node !== null) p.execution.node = text(ex, 'node', '$.execution', issues)
+    if (ex.lane !== undefined && ex.lane !== null) p.execution.lane = text(ex, 'lane', '$.execution', issues)
+  }
+  if (raw.workspace !== undefined && raw.workspace !== null) {
+    const w = map(raw, 'workspace', '$', issues)
+    const files = Array.isArray(w.files) ? w.files : w.files === undefined || w.files === null ? [] : (issues.push({ path: '$.workspace.files', message: 'expected a list of {from, to}' }), [])
+    p.workspace = {
+      directories: w.directories === undefined || w.directories === null ? [] : stringList(w, 'directories', '$.workspace', issues),
+      files: files.flatMap((f: unknown, i: number) => isRecord(f) && typeof f.from === 'string' && typeof f.to === 'string' ? [{ from: f.from, to: f.to }] : (issues.push({ path: `$.workspace.files[${i}]`, message: 'expected {from: <source path>, to: <workspace path>}' }), [])),
+      runFiles: w['run-files'] === undefined || w['run-files'] === null ? [] : stringList(w, 'run-files', '$.workspace', issues),
+    }
+  }
+  p.areas = Object.entries(map(raw, 'areas', '$', issues)).flatMap(([path, v]) => {
+    if (v === null || v === undefined) return [{ path, description: '' }]
+    if (typeof v === 'string') return [{ path, description: v }]
+    if (isRecord(v)) return [{ path, description: text(v, 'description', `$.areas.${path}`, issues) }]
+    issues.push({ path: `$.areas.${path}`, message: 'expected a mapping with description, or text' })
+    return []
+  })
+  return { project: p, issues }
+}
+
+// Repository paths are project-relative POSIX paths. "." is the project root.
+// An execution guide (p6) is a file of the run's own project, or, written
+// `<project>:<path>` (project_migration p4), a file of another managed
+// project, read from that project's committed default branch.
+export function guideRef(g: string): { project?: string; path: string | null } {
+  const m = /^([a-z0-9][a-z0-9_.-]{0,63}):(.+)$/.exec(g.trim())
+  if (m) return { project: m[1], path: normalizeRepoPath(m[2]) }
+  return { path: normalizeRepoPath(g) }
+}
+export const guideKey = (g: string) => { const r = guideRef(g); return r.path === null ? g : r.project ? `${r.project}:${r.path}` : r.path }
+
+export function normalizeRepoPath(path: string): string | null {
+  const trimmed = path.trim()
+  if (trimmed === '' ) return null
+  if (trimmed === '.' || trimmed === './') return '.'
+  if (trimmed.startsWith('/') || trimmed.includes('\\') || /^[A-Za-z]:/.test(trimmed)) return null
+  const parts = trimmed.split('/').filter(p => p !== '' && p !== '.')
+  if (parts.some(p => p === '..')) return null
+  return parts.length ? parts.join('/') : '.'
+}

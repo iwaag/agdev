@@ -1,0 +1,99 @@
+schema = "ag.agent-config.v2"
+project = "agautolab"
+
+[models."ollama/qwen3.8:27b-mlx-bf16"]
+
+# The Claude Code alias: the newest Sonnet the installed CLI knows.
+[models."anthropic/sonnet"]
+
+[models."google/gemini-2.5-flash"]
+
+[models."antigravity/gemini-3.8-flash-medium"]
+
+[models."antigravity/claude-sonnet-4-6"]
+
+[models."openai/gpt-5.6-terra"]
+effort = "medium"
+
+[models."openai/gpt-5.4-mini"]
+effort = "low"
+
+[models."openai/gpt-6-luna"]
+effort = "medium"
+
+[profiles.local]
+harness = "agcode"
+model = "ollama/qwen3.8:27b-mlx-bf16"
+
+[profiles.sonnet]
+harness = "claude_code"
+model = "anthropic/sonnet"
+
+[profiles.stub]
+harness = "fake"
+model = "ollama/qwen3.8:27b-mlx-bf16"
+
+# Google's Gemini CLI, headless. Selectable per workflow or in the instance
+# overlay; the CLI
+# resolves its own key and reports tokens but no cost, so a gemini run's
+# record carries `usage` only. `gemini-2.5-flash` is the model that answered
+# on 2026-09-04 while the default model returned 503 all day.
+[profiles.gemini]
+harness = "gemini_cli"
+model = "google/gemini-2.5-flash"
+
+# Google's Antigravity CLI (`agy`), headless. The catalog is the Antigravity
+# account's — Gemini and Claude alike — so the provider is `antigravity` and
+# the record says which model ran (Agent ≠ Model). The CLI carries its own
+# OAuth token; a run reports tokens, no cost. Two profiles so the model is a
+# choice, not a rename.
+[profiles.agy]
+harness = "agy"
+model = "antigravity/gemini-3.8-flash-medium"
+
+[profiles.agy-claude]
+harness = "agy"
+model = "antigravity/claude-sonnet-4-6"
+
+# OpenAI's Codex CLI (`codex exec`), headless, on the ChatGPT account the CLI
+# is logged into: provider `openai`, the CLI owns its auth, a run reports
+# tokens and no cost. The reasoning effort is the model's declared `effort`
+# above. `codex-mini` is the cheap one.
+[profiles.codex]
+harness = "codex"
+model = "openai/gpt-5.6-terra"
+
+[profiles.codex-mini]
+harness = "codex"
+model = "openai/gpt-5.4-mini"
+
+# cagent's workflows run on this one (project_migration p6 ex2): Claude
+# declined the Developer's chosen platform instead of developing support
+# for it. Selected per workflow with `execution.profile: luna`.
+[profiles.luna]
+harness = "codex"
+model = "openai/gpt-6-luna"
+
+# Performs one attempt of a workflow run requested through agdev
+# (workflow_editor p4, `agautolab.wfexec`): in the project's workspace, with
+# `wfe run` for its records. Its guide is agent/guides/wfrun/guide.md.
+[roles.wfrun]
+profile = "sonnet"
+requires = []
+allowed_tools = [
+    "Read", "Write", "Edit", "Glob", "Grep", "TodoWrite", "BashOutput", "KillShell",
+    "WebFetch", "WebSearch", "NotebookEdit",
+    "Bash(wfe:*)", "Bash(agdev-update:*)",
+    "Bash(git:*)", "Bash(uv:*)", "Bash(uvx:*)", "Bash(curl:*)", "Bash(wget:*)",
+    "Bash(node:*)", "Bash(npm:*)", "Bash(npx:*)", "Bash(python3:*)", "Bash(pip:*)",
+    "Bash(jq:*)",
+    "Bash(ls:*)", "Bash(cat:*)", "Bash(head:*)", "Bash(tail:*)", "Bash(wc:*)",
+    "Bash(sort:*)", "Bash(find:*)", "Bash(rg:*)", "Bash(sed:*)", "Bash(awk:*)",
+    "Bash(mkdir:*)", "Bash(cp:*)", "Bash(mv:*)", "Bash(rm:*)", "Bash(chmod:*)",
+    "Bash(touch:*)", "Bash(date:*)", "Bash(pwd:*)", "Bash(cd:*)", "Bash(which:*)",
+    "Bash(env:*)", "Bash(sleep:*)", "Bash(ps:*)", "Bash(echo:*)",
+    "Bash(tar:*)", "Bash(make:*)", "Bash(bash:*)", "Bash(sh:*)",
+]
+
+[capabilities]
+provides = ["nested_harness"]

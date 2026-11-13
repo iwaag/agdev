@@ -1,0 +1,560 @@
+# Run storage (`ag.wfe-run-copy.v1`, p9)
+
+A run the execution host performs keeps its work in **its own working copy**
+of the project: the root and every submodule the project workspace has
+checked out, each on the run's own branch. The copy exists for the run's
+whole life, across all its attempts. A held run therefore keeps its plan,
+records and unfinished work without holding the project. Other runs of the
+same project work in their own copies, and nothing a run saves reaches a
+shared branch until it is integrated. The run contract is in
+[runs.md](runs.md). A run performed by a remote execution node (project_migration p7)
+keeps this copy on the coordinator as its **record copy** and is worked in a
+copy of the worker's own; [workers.md](workers.md) says how the two relate.
+
+Code: `server/runspace.ts` (resolver, allocation, creation, index). The
+person's project workspace, the one in the registry, stays theirs. Editing
+workflows, the project and its own Git state happens there.
+
+## The workspace (better_git_strategy p1)
+
+A project workspace is an **unversioned local folder** (the envelope) around the
+project's Gitea checkout. The registry names the envelope; Git and every
+repository-relative path (`project.yaml`, `devdocs/workflows`, `devdocs/runs/…`,
+API file paths) work in `source/`, and the repository's history has no
+`source/` prefix.
+
+```text
+<workspace>/                    registered path (workspaceRoot); never in Git
+  source/                       the checkout (sourceRoot): project.yaml, devdocs/, submodules
+  .agdev/                       agdev's state (stateRoot)
+    workspace.json              layout marker (agdev.workspace.v1): provisioning | ready
+    runs/<workflow>/<run>/      run envelopes (below)
+    retention/                  retained-commit stores
+    character-dialogue/         the dialogue archive (only in the archive workspace)
+  <project-chosen entries>      local resources: host notes, settings, caches, outputs
+```
+
+- **Reserved** at a workspace root: `source/`, `.agdev/` and `published/` (the public
+  checkout(s) of external publication, created by `agdev-external-publish`, with its journal
+  in `.agdev/publication/`; see `docs/external-publication.md`). There is **no workspace `.local/`**: the
+  whole workspace is local, so a project names its local folders and files directly.
+  A project may still ignore a `.local/` inside its checkout for its own reasons; that
+  is project content, not an agdev convention.
+- **Ownership.** `source/` belongs to Git and the project; `.agdev/` to agdev; every
+  other entry to the project. Local does not mean disposable: run records, unfinished
+  work and project resources are never removed as a side effect.
+- **Declared layout** (`project.yaml`, optional):
+
+  ```yaml
+  workspace:
+    directories: [out]                                      # created at provisioning
+    files: [{from: tools/forge.env.example, to: forge.env}]   # source-relative → workspace-relative; written only when absent
+    run-files: [localenv.md]                                # copied into each run envelope at the same path
+  ```
+
+  Paths are workspace-relative; absolute paths, `..`, reserved names, `.local/` and
+  the names a run envelope uses are validation errors. There are no hooks: anything
+  project-specific that must *run* is a workflow.
+- **Provisioning** (`server/provision.ts`) is the one way a workspace is made: project
+  creation (`wfe create`, New project) and obtaining (`wfe project obtain`, Obtain,
+  `agdevctl bootstrap-projects`) both allocate the envelope under the project root
+  (`placement.md`), put the checkout in `source/` (clone, or create), initialize
+  submodules, apply the declared layout, mark it ready and register it. Only a ready
+  envelope is registered. An interrupted provisioning leaves the marker at
+  `provisioning`; the same request continues it (a partial clone is moved aside to
+  `.agdev/source.partial-<time>`, never deleted). A folder that is not absent, empty or
+  an unfinished provisioning is refused.
+- A consumer that needs a project-local file reads it beside the checkout
+  (`<checkout>/../<file>`) or from `$AGDEV_WORKSPACE`; in a run, the run envelope holds
+  the declared run files at the same relative place, so the same code works in both.
+  `$AGDEV_PROJECT_WORKSPACE` names the person's workspace for what a run reads there
+  by name (and never changes).
+- **The old layout** (the folder itself was the checkout; agdev state in
+  `.local/wfe/`) is not read: such a workspace is reported unavailable with "convert
+  it with `wfe workspace migrate`". See *Converting a workspace*.
+
+## Where a run lives
+
+```text
+<workspace>/.agdev/runs/<workflow>/<run>/     the run envelope; local to the run
+  copy.json      the manifest (host-local)
+  record/        the run's durable record (improve_wfrun p2)
+    devdocs/runs/<workflow>/<run>/run.json   the run's one live record
+    .git         an invalid gitfile: Git run here fails, instead of finding the workspace above
+  source/        the run's working copy: a clone of the project; disposable; the agent's cwd
+    devdocs/runs/<workflow>/<run>            a relative link to the folder in record/
+  inputs/<id>/   staged input sets (`../inputs/<id>` from the checkout)
+  archive/       what a retirement saved besides commits (see *Retirement*)
+  integration/   integration worktrees
+  <run files>    the project's declared run files, copied at creation
+  …              run-local outputs, environments and logs the run makes ($AGDEV_WORKSPACE)
+```
+
+Run-local writable things go in the run's own envelope, never in the project
+workspace or another run's: two runs never share a writable folder. Nothing in a
+run record names a host path.
+
+**The record and the tree have separate lifetimes.** An agent reads and writes the
+documented run path as ever and reaches the one set of bytes through the link; a
+worker's own copy keeps a real folder, which is a synchronized snapshot as before
+([workers.md](workers.md)). `server/runrecord.ts` holds the mechanics.
+
+- Git does not see the link (`.git/info/exclude`) and leaves the folder's index
+  entries alone (skip-worktree). `git add -A` never captures it; `git add <file in the
+  folder>` fails with "beyond a symbolic link"; a `reset --hard` or `checkout` across a
+  different snapshot of the folder refuses rather than overwrites. An agent saves the file
+  and leaves the folder out of its own Git commands.
+- **A publication stages the folder as a snapshot** (`stageRecord`) into the repository
+  that owns it (the root, or the devdocs submodule), honouring that repository's ignore
+  rules. What a branch holds is that snapshot, never the link.
+- **One lock.** `server/lock.ts` keys a lock by real path, so a writer holding the lock through
+  the link and one holding it on the durable path exclude each other, and the key does not depend
+  on the tree existing.
+- If something replaced the link with a real folder (a Git operation, an agent), the next
+  write folds it in (a file the record lacks or holds older moves in; `run.json` never does)
+  and links again. A plain read repairs nothing.
+
+The folders under `.agdev/runs/` are the host's **index**: one manifest
+per run. No second database can drift from them. `wfe runs index` lists
+them.
+
+**Two resolvers.** `runSpace(workspace, run)` returns where a run's files are
+read and written, and never materializes anything. `treeSpace(workspace, run)` returns a
+working tree for what needs the project's code (publication, integration, execution), or refuses
+with the state and the action.
+
+| The run has | `runSpace` | `treeSpace` |
+| --- | --- | --- |
+| a ready copy | the copy (a `Workspace` with the same logical id, rooted at `tree/`) | the same |
+| a retiring, retired or restoring copy | its record root (a `Workspace` rooted at `record/`, `copyOf.treeless`) | refused, `run-retired` |
+| a durable record but a missing tree | its record root; the tree stays reported as missing, not retired | refused, `run-copy` |
+| no copy | the project workspace: runs recorded before p9 and not migrated (completed, cancelled), and runs an IDE agent created there with `wfe run create` | the same |
+| a copy being created or damaged | nothing: the operation is refused with the problem, naming the run | refused |
+
+A copy that cannot be used is never replaced by the project tree's snapshot
+of the same run, and reading never creates, repairs or restarts anything.
+The logical workspace (registry id) of a copy is its project workspace's.
+Its physical root is the copy. `wfe` run in a copy finds its workspace by the
+usual rule (the copy is inside the registered workspace's folder).
+
+## Identity and branches
+
+| Fact | Form |
+| --- | --- |
+| Run identity | project id + workflow id + run id (as in runs.md) |
+| Run branch | `wfe/<project>/<workflow>/<run>` in every repository the run owns |
+| Integration target | each repository's default branch on Gitea for a published copy (improve_wfrun p1); for a copy made from the workspace, the branch the workspace had checked out (a detached submodule: its remote's default branch) |
+
+The project id in the branch keeps runs of different projects apart in a
+repository they share (a study, a wedo).
+
+**Allocation.** A run number is reserved under the workspace's allocation
+lock (`server/lock.ts`) by creating the run's folder and manifest. The next
+number is one past the highest `run-NNN` that is recorded in the project tree
+(`devdocs/runs/<workflow>/`), held by a copy, or named by a run branch that
+Git knows (local, or `origin/…` as last fetched). Two requests never get the
+same number. A request's receipt is kept in the manifest: the same request
+finds its run again, finished or not.
+
+## What a copy is made from
+
+**Published (improve_wfrun p1)** — every run a host with Gitea creates for an
+execution host (a person's or conversation's request, a submission, a
+delegation's child):
+
+- The root starts at the **resolved root commit of the project's published
+  source** ([runs.md](runs.md), *Definition snapshot*), the same commit the
+  definition is read at. `copy.json` has `baseFrom: "published"` and `source`
+  (`project`, `repository`, `branch`, `commit`, `selector`).
+- It is cloned from the access cache (`<area>/.local/access-cache/`,
+  [access.md](access.md)), and **every** submodule the revision pins is
+  initialized at its gitlink, nested ones too, whether or not the workspace has
+  it checked out. A submodule that cannot be read (outside this Gitea, its pin
+  on no branch) stays uninitialized with its `problem`; a definition binding it
+  is refused.
+- **Integration targets** are each repository's default branch on Gitea, never
+  the workspace's checked-out branch. Per-binding policies (`integrate:
+  if-unchanged`) are unchanged.
+- The same request (receipt) keeps the revision its copy was reserved with: a
+  creation interrupted after the reservation and retried after the default
+  branch moved on still uses the reserved commit for definition and code.
+- Run numbers also count the run folders of that revision and the run branches
+  in the root's access cache.
+- Nothing in the workspace is read for content, fetched into or changed.
+
+**From the workspace** — only where no published source exists (a host without
+Gitea), and for reconstruction:
+
+- **The committed project, never the person's uncommitted edits.**
+  - The root starts at the project workspace's `HEAD`.
+  - Results integrated from other runs' copies reach the remote, not the
+    workspace. So the workspace's branch upstream is fetched first (best
+    effort). When the workspace is only behind it, the copy starts at the
+    upstream commit instead. The manifest's `baseFrom` says which.
+  - A workspace with commits of its own that are not pushed keeps its
+    `HEAD`.
+  - Each initialized submodule starts at the gitlink that commit records. A
+    commit the workspace has and its remote does not is taken from the
+    workspace. A gitlink the workspace lacks is fetched from the submodule's
+    remote.
+  - Nothing in the person's workspace is changed.
+- The **definition** the run follows is read from the project workspace and
+  frozen into the run folder; `definition.source` says `workspace` (runs.md,
+  *Definition snapshot*).
+- **Remotes.** Every repository of the copy has the project's own `origin`
+  (the root's remote, each submodule's remote), not the workspace it was
+  cloned from. A copy pushes nowhere but its run branches (see runs.md,
+  *Publication*).
+- **Submodules** use the standard layout (`.git/modules/…` under the copy's
+  root). Each one the workspace has checked out gets the run branch at its
+  base gitlink. A submodule the workspace has not checked out stays
+  uninitialized. A **nested** submodule (a submodule's own) is treated the
+  same way (project_migration p6 ex1): when the workspace has it checked
+  out, it gets the run branch at the gitlink its parent's base records, and
+  it is published and integrated like any other repository of the run. A
+  backend superproject whose submodules carry the work is therefore one
+  binding, and its gitlinks are the pins integration records.
+- **Git configuration** is the copy's own (`.git/config`: remotes, submodule
+  URLs). Identity and credentials come from the host's environment as for
+  every other Git operation here.
+- **Local resources.** The files the project declares in `workspace.run-files`
+  (regular files, up to 16 MiB each) are copied from the project workspace to the
+  same place in the run envelope and listed in the manifest (`local`). Nothing else
+  of the project workspace is copied or shared; a run that needs more reads it
+  from `$AGDEV_PROJECT_WORKSPACE` by name, and its absence is that run's problem.
+  Git ignores `.local/` in the copy (`.git/info/exclude`) only so that transport
+  leftovers (a worker's forwarded files) are never committed. Ignored files, environments and
+  generated data are never preserved by commits; they stay in the copy, which
+  is kept (see *Lifetime*).
+
+**Creation is idempotent.** `prepareCopy` reserves, then `materialize` makes
+or finishes the copy: a clone that did not finish is removed and made again,
+an existing branch is kept as it is (its commits are the run's saved work),
+and a finished copy is returned unchanged. Its manifest says `creating`
+until the last step and `ready` after it. An interrupted creation is finished
+by the same request, under the same run number.
+
+## The manifest (`copy.json`)
+
+```json
+{
+  "schema": "ag.wfe-run-copy.v1",
+  "project": "jevlab", "workspace": "jevlab", "workflow": "experiment", "run": "run-002",
+  "branch": "wfe/jevlab/experiment/run-002",
+  "state": "ready", "created": "…", "ready": "…", "receipt": "request:…",
+  "repositories": [
+    { "path": ".", "kind": "root", "initialized": true, "base": "<commit>", "branch": "wfe/jevlab/experiment/run-002", "target": "main", "url": "<remote>" },
+    { "path": "study/study-x", "kind": "submodule", "initialized": true, "base": "<gitlink>", "branch": "wfe/…", "target": "main", "url": "<remote>" }
+  ],
+  "local": ["localenv.md"]
+}
+```
+
+It never leaves the host, but it still holds no credentials. What the run
+records about its storage is portable: `run.json` `storage` (from
+`run.create`) has the branch and, per repository, `path`, `base`, `branch`
+and `target`, with no paths on this host and no URLs.
+
+## The workspace and the published source (improve_wfrun p1)
+
+The registered workspace is the editing area. Its age, its local commits and
+its uncommitted changes do not decide which workflows exist or what a run
+follows. How it relates to the published revision is read, never assumed
+(`server/workspaceSync.ts`; `wfe workspace status`, Developer details in the editor's Workflows card):
+
+- per repository (the root and every submodule the published revision pins):
+  `same`, `behind`, `ahead`, `diverged` or `unknown`, with counts, decided from
+  commits a side is known to have (the access cache holds every Gitea branch);
+  uncommitted changes are counted apart; `atCommitted` alone is never the
+  relation;
+- the situation in a sentence and the next action (`none`, `sync`,
+  `resolve-by-hand`).
+
+Viewing, editing, trying and applying a workflow do not use the checkout
+([drafts.md](drafts.md)); drafts live in `<area>/.local/wfe-drafts/`. A checkout
+remains the working area for whoever chooses to work in one, and the base a
+run's copy is cloned beside.
+
+**Synchronization is optional** (`wfe workspace sync [--dry-run]`, Update workspace
+in Developer details). It only fast-forwards: the root on the published branch,
+clean and only behind; each submodule whose pin moved, clean and at its old pin
+(a branch is fast-forwarded, a detached checkout moved to the pin). Anything
+else is refused with the concrete reasons and nothing changes. State is read
+again before each change; nothing is stashed, reset, merged or rebased. Each
+repository's step is reported (`moved`, `refused`, `failed`, `unchanged`); after
+a partial update the named repository is fixed by hand and sync runs again,
+continuing from what already moved.
+
+## One live record
+
+The durable `run.json` is the run's only writable record, and the run's lock
+is taken on it. A copy of it that reaches a branch (a publication, an integration, or
+a run recorded there before p9) is a **snapshot**: it is never written and
+never read as the run's state while the run has a copy, retired or not.
+
+## Reconstruction
+
+`wfe runs index --rebuild` reconstructs a missing manifest from the copy
+itself. The run branch it has checked out must name this folder's workflow
+and run, and its `run.json` must name the same project. Base commits and
+targets come from the run's recorded `storage`. Nothing is cloned, checked
+out, restarted or deleted. A copy whose repository is gone stays reported,
+together with the branch that holds its saved work. Without `--rebuild` the
+index is only read.
+
+## Lifetime
+
+Copies are kept when a run is held, completed or cancelled, until someone retires one
+explicitly (*Retirement*). No age or schedule retires anything. Run branches are kept until an explicit cleanup (*Run branch cleanup*). A person
+who removes a tree by hand leaves the run reported as missing, with its branch, and
+its durable record readable.
+
+## Retirement (improve_wfrun p2, `server/retention.ts`)
+
+**Retired is a storage state, not a run state.** `copy.json` `state` goes `ready → retiring →
+retired → restoring → ready`, with `lifecycle` (who asked, phase, failure, per-host progress,
+sizes, history) and `generation`. No run event records it; the run's status, sequence, receipts,
+number and links do not change. `wfe run storage <run>`, the run view and `wfe runs storage`
+show it.
+
+**A candidate** is completed or cancelled, with no open attempt, queued job, unpublished checkpoint,
+unfinished integration or owed worker synchronization. Held, waiting and idle standing conductor
+runs are not finished. An available presentation, a review in progress and a process working in the
+tree keep the copy, with the reason. Historical delegation links do not. Eligibility is reported as
+facts, not as a request for permission. A legacy or IDE run has no managed copy and is told apart.
+
+**What is kept where.** Each repository of the copy, nested ones and those an agent initialized later:
+
+| Item | Place | Check |
+| --- | --- | --- |
+| The run folder | `record/`, already | — |
+| Every commit reachable from local branches, tags, `refs/wfe`, `refs/stash`, `HEAD`, the base, and the index's tree (staged bytes) | the project's retention repository `<workspace>/.local/wfe/retention/<repo>.git`, under refs of this run | every object reachable, `rev-list --objects` |
+| Modified, untracked and ignored files, modes and symbolic links as links | `archive/files.tgz` and the list `archive/contents.json` | extracted in staging and compared file by file; sha256 of both recorded |
+| Index and `info/exclude` of each repository | `archive/<repo>.index`, `.exclude` | copied as they are |
+| A file with the same bytes as a verified published output of the run | the shared area, under its existing identity and retention; restoration copies it back by hash and names any it cannot have | the output is re-verified; if unavailable at retirement, the file is archived |
+| What the responsible agent says is expendable (`--discard <path>=<reason>`) | nowhere; the path and reason are recorded and reported at restoration | — |
+| Anything else (unreadable, a socket or pipe with no discard) | **the copy stays** | listed as unclassified |
+
+Why a retention repository rather than a bundle per run: every copy of a project repeats its history (1.3 GB per
+gimmickimg copy), so per-run bundles would cancel most of the saving. A disposable access cache or a remote branch tip is not a
+recovery guarantee, and the retention store is neither. Commits on the shared store mean a damaged retention repository affects
+every retired run of that repository; restoration reports it as unavailable, never as empty. It collects no garbage by itself.
+
+**Order.** Mark `retiring` under the run's lock (from here `attempt.begin` and `treeSpace` refuse) → ask
+workers → retain and verify commits → write and verify the archive in staging, then rename → recheck
+everything with the publication, integration and record locks held → commit `retired` → release the tree
+(`tree.removing`, then removal). Work that arrives in time wins: the run returns to `ready` and nothing
+was released. Every step can be run again; `wfe run retire` continues, and `wfe run restore` on a `retiring`
+run abandons it. Lock order: lifecycle, publication, integration, record, manifest. The archive's disk
+is checked for twice the bytes first.
+
+**Reading a retired run** needs no checkout: the record root serves the folder; artifacts and a delegated child's
+files outside it come from the retained commit or the archive, unchanged (`retainedFile`). Nothing is restored
+by a read. Git operations on the record root fail by design.
+
+**Restoration** (`wfe run restore`, the run view, or a job that needs a tree) rebuilds in `tree.restoring` from the
+saved revisions, never from main: verifies the archive's checksums and the retained commits first (a missing or corrupt one
+leaves the run `retired` with an actionable error), recreates each repository in Git's standard relative layout with the project's own
+remotes, restores files, deletions, indexes and excludes, compares them, then renames into place and links the latest
+record. It queues nothing, integrates nothing and replays nothing. A correction or resume that needs a tree finds the job waiting
+while the claim starts the restoration in its own process; it then runs with its normal semantics and its frozen definition. Session
+reuse follows the harness contract, and a session that cannot be reused is recorded as replaced. An acceptance of a retired run is refused until
+it is restored, because it binds to the files.
+
+**Workers.** A worker that ever ran the run holds a copy. Its task (`<area>/.local/exec/storage-tasks/<worker>/`,
+announced by the heartbeat's answer) archives its non-committed files, and commits no remote has as bundle files, to
+`worker-archive/<worker>/` on the coordinator, verified by checksum. Until every such worker reports, the run stays
+`retiring` with the coordinator's tree in place: **an unreachable worker is unknown, not done.** After the commit, the
+worker removes its copy (`remove-pending`, then `removed`), so a run can be retired while a worker still holds an old copy; the
+view says so. A report of an older generation changes nothing, and files of a run that is not ready are refused, so a
+delayed message cannot overwrite a newer record or resurrect a tree. A new dispatch to a worker that has no copy brings
+those files back into the new copy; its bundles arrive as files under `.local/wfe-worker-bundles/`, not as refs. Files that come back untracked are what any untracked file in a copy is: the next checkpoint commits them to the run branch, and an integration carries them on (seen in improve_wfrun p3, `wfrun-trial stamp/run-008`). What must not be published is ignored or discarded when it is retired.
+
+**Moving bytes is not freeing them.** The archive and retention repository live on the same disk as the copies here. Local
+clones hard-link Git objects, so a copy's own `du` overstates what removing it frees: measure the
+aggregate allocation before and after, per storage location. `lifecycle.sizes` is the per-copy view.
+
+**Recovery.** A pre-p2 release cannot read relocated records: it finds an empty run folder link it does not
+understand. Going back means moving folders back (the reverse of relocation, by hand, from `record/` into the tree) after
+saving any newer events; retired runs must be restored first. That procedure is unverified. Data recovery on the current release is *Backup and recovery*.
+
+## Backup and recovery (improve_wfrun p3, `server/runBackup.ts`, `wfe backup`)
+
+**What it is.** A generation on another machine, named by `<area>/run-backup.json` (`{"host", "path", "ssh", "keep", "checkouts"}`), holding what a retired run needs to be read and restored. **It is not disaster recovery for the service.** Gitea, project workspaces, credentials and the trees of runs that are not retired are outside it; the manifest names those runs as `identityOnly`, with their numbers, receipts, manifests and records so a recovered area does not reuse them.
+
+| Held for a retired run | Checked against |
+| --- | --- |
+| `copy.json`, `record/`, `branch-cleanup.json` | hashes at capture |
+| `archive/` | the checksums the manifest recorded at retirement |
+| `worker-archive/<worker>/` | the checksum the worker reported |
+| The project's retention repository, whole | hashes under its lock, then every recorded ref with `rev-list --objects` at the destination |
+| Its published outputs on the share, because archives omit those bytes | each file's hash in the output manifest |
+
+Also held: the area's settings (no secrets), `VACUUM INTO` copies of the stores, and the release and checkout revisions. Token files and SSH keys are named, never copied. A generation has no project workspace in it.
+
+**Consistency boundary: one retired run.** Its manifest and record are copied holding its lifecycle and record locks; a retention repository is hashed and copied holding the lock retirement fetches under; archives are immutable until a run's `generation` changes. After every transfer each run's state, generation, archive checksums and retained refs are read again. A change fails the whole generation by name. Stores are consistent one by one, with their own times; they are context, and a retired run's authority is its own record. A later event on a retired run's record is simply newer than the backup.
+
+**Publication.** `staging/<id>.partial` → every listed file's hash read back at the destination → every retained ref checked with Git there → `generations/<id>` → `LATEST`, by rename. A failed or interrupted capture leaves the previous generation in place. A generation that loses a run the previous one covered is kept but does not move `LATEST` (`degraded`). A run that could never be covered is listed as `covered: false` with its reason, and reported by `wfe backup status`. Generations hard-link unchanged files to the previous one: they protect against bad captures and later logical damage, and they share one copy of each byte, so they are **not** independent copies against the backup disk failing.
+
+**Cadence.** Daily, by launchd (`com.agdev.wfe-backup`), and by hand before and after a retirement or cleanup batch. Nothing depends on it running: `wfe backup status` reports the last verified generation, its age, what it does not cover and the last failure. A generation older than a retirement does not cover that run, and cleanup refuses it. Expiry keeps the newest `keep` generations (default 7) and always `LATEST`, and runs only after a new generation verified.
+
+**Recovery of data, on the current release.**
+
+1. Find a usable generation: `wfe backup verify` (`--generation <id>`); a failure names the affected runs.
+2. Isolated: `wfe backup restore --into <empty folder>`, or with `--from <path>` on the backup host and no registry. It verifies every hash and ref, then builds `area/` with paths remapped and logical identities unchanged. No Gitea, Slack, worker or presentation setting is carried, and `recovery.json` makes `wfe exec|request|peer` refuse it. Use `WFE_REGISTRY=<folder>/area/registry.json WFE_AREA=<folder>/area wfe run show|restore …` to read and restore there. `wfe backup rehearse --into <folder> --by <name>` runs every check.
+3. Live, after losing pieces: `wfe backup reinstate --by <name> --dry-run`, then without `--dry-run`, with the executor stopped. What is missing comes back; a damaged retention repository or archive is moved aside and replaced. **What exists and is intact is never overwritten**, so an older backup cannot erase newer events; a record kept newer and refs only in the damaged copy are reported. A run whose `generation` moved past the backup's keeps what it has.
+
+Losing the coordinator whole also loses Gitea and the workspaces. This backup then recovers retired runs' records and work, not the service; re-creating a remote from a retained commit is a separate act.
+
+**Rollback to pre-p2 code is not part of this.** It would need the reverse of relocation and is **unverified**; do not present it as a fallback.
+
+## Run branch cleanup (improve_wfrun p3, `server/branchCleanup.ts`, `wfe branches`)
+
+**Branch absence is not run absence.** A retired run's identity, receipt, number, latest record, frozen definition and evidence links do not depend on its branch. Nothing here is automatic, and age, a name prefix or reachability from main decide nothing: a cancelled, unintegrated run keeps its work in retention like any other.
+
+**One answer for the CLI and the service** (`assess`: `wfe branches preview`, `GET …/runs/<wf>/<run>/branches`). A run's branch can go when:
+
+- it has a managed copy, `retired` and `released`, with no failure on its last storage operation;
+- every worker that held a copy reports `removed` or `absent`;
+- it has no open attempt, queued continuation, pending checkpoint or integration, hold, standing run, available presentation or review in progress;
+- the latest verified backup covers it at its current `generation`;
+- each branch's exact tip on the remote is fully in the retention repository, reached by this run's own retained refs, and reached by what the backup holds of them;
+- in a nested repository, a commit the parent's default branch pins stays reachable through some other remote ref, because a later collection there would otherwise break cloning the project.
+
+Only `refs/heads/wfe/<project>/<workflow>/<run>` of the owning run, in the repositories its manifest or archive names, on the configured Gitea. Retention refs, tags, main and other branches are outside any selection. A remote on another host is `outside`; a run branch with no copy here is `unknown` in the inventory and never selected.
+
+**Deleting** consumes an explicit selection of repository, ref and object. Each run is rechecked under its lifecycle lock; the entry is written to `branch-cleanup.json` (`ag.wfe-branch-cleanup.v1`, beside `copy.json`, in the backup) before the push; the push carries `--force-with-lease=<ref>:<object>`, so a branch that moved is left as it is and reported (`changed`). A failed push stays journaled, and running the same selection again continues: a ref found gone is recorded as deleted, a ref already absent with no entry is reported as such. Each run's mapping is durable before the next backup holds it; run `wfe backup create` after a batch.
+
+**Recreating** (`wfe branches recreate`) pushes the recorded object from the retention repository with a lease that the ref must not exist. One that is there at the same object is recorded; at another, it is a conflict and nothing changes. A correction of a restored run does not need this: its publication pushes the branch again.
+
+**Bytes are a separate question.** Deleting a ref removes no object. The remote collects by its own maintenance, later; other refs, reflogs and hard links may keep objects; retention and backup hold their own copy. Measure allocated bytes per location, and run ordinary maintenance only on a selected, backed-up repository. Zero is a valid result, and a batch's result is not an estimate for the rest.
+
+**Caches.** Access caches may keep a deleted ref until they refresh. Nothing reads a retired run's work through them: its record is on disk, its files come from retention, and its number stays taken because its copy folder stays.
+
+## Relocation (`wfe runs relocate`, `server/relocate.ts`)
+
+Copies made before improve_wfrun p2 keep their folder in the tree until moved, and the resolver reads them as before.
+Relocation is explicit, once, and separate from any deletion.
+
+- `--dry-run` lists what would move, what is blocked (an open attempt, a damaged copy) and changes nothing.
+- It is refused while the executor reports. Stop the executor and the service (a lock's key changes with the real path, so
+  writers must be quiet at cutover), then each run is moved under its lock; a worker's forwarded commands go
+  through the stopped service and retry.
+- Recovery copies come first (`<area>/.local/backups/p2-records-…`: consistent store copies, settings, refs, each manifest as it
+  was); the journal is `<area>/.local/migrations/p2-records.json`.
+- Per run: copy the folder to `record.staging`, compare every file, rename to `record/`, swap the tree's folder for the link, mark the
+  index, stamp the manifest, remove the old folder. Unpublished documents move with it. Running again continues
+  each run from where it stopped, and changes nothing that is done.
+
+## Migration (`wfe runs migrate`)
+
+Runs recorded in a project workspace before p9 move into copies of their
+own, explicitly and only once (code: `server/migrate.ts`).
+
+- **`--dry-run`** prints an inventory and writes nothing. For every run it
+  lists the execution state, the hold, an open attempt, queued jobs,
+  unpublished checkpoints, open presentations and the action:
+
+  | Action | Meaning |
+  | --- | --- |
+  | `migrate` | It moves (or continues an interrupted move). |
+  | `migrated` | It already moved. |
+  | `keep-terminal` | It is completed or cancelled and stays in the project tree, read through the resolver as before. |
+  | `keep-ide` | An IDE agent performs it, so it stays in the project workspace. |
+  | `blocked` | An attempt is open, or the record cannot be read. |
+
+  It also lists each repository's head and branch, and the uncommitted files
+  of the project workspace outside run folders.
+- **Preconditions.** It is refused while the executor reports (heartbeat
+  younger than 45 s); claims stay paused until the migration is
+  done. Before writing, it takes host-local recovery copies in
+  `<area>/.local/backups/p9-migrate-<time>/`:
+  - consistent copies of `exec` and `present` (`VACUUM INTO`; until
+    cluster_teamwork p5 also the Zulip notifier's and intake's stores);
+  - the area's settings;
+  - each workspace's refs, heads and uncommitted files;
+  - the inventory.
+- **What it does, per run.** The run gets its copy under its own id
+  (`reserve` with `adopt`, receipt `migrate:<workspace>/<run>`). The copy is
+  made from the committed project. The run's folder **as it is in the project
+  workspace** is placed there, including records that were never published.
+  `run.relocate` then records its storage.
+- **What does not change:**
+  - nodes, questions, answers, holds, decisions, receipts and jobs;
+  - nothing is queued, resumed or announced (`run.relocate` is not a
+    coordination event);
+  - what the run published before stays on the shared branches, and those
+    commits stay intact;
+  - checkpoints keep the mode they were made with: an old one still
+    publishes the project workspace's branches when retried, never the run
+    branch.
+- **Not attributed by guess.** Uncommitted files of the project workspace
+  outside run folders are reported with their paths and left alone.
+- **Restartable.** The journal is `<area>/.local/migrations/p9.json`.
+  Running the migration again continues each unfinished run from its last
+  step, and a copy reserved before a crash is finished rather than made
+  twice. A finished run is not touched again.
+
+## Renaming a project
+
+`wfe rename-project <from> <to> --repository <name>` renames a managed project on this host
+(`server/renameProject.ts`). The Gitea repository is renamed first, by its id, so history and
+numeric bindings stay. Writers are stopped first. `--preview`
+changes nothing; a journal in `<area>/.local/migrations/` makes a repeat continue.
+
+- **A run keeps its creation identity**: uid, branch, creation hash, frozen definition and source.
+  Its current project moves through `run.rename-project`, which records `createdAs`.
+- **Stores and settings follow the current project**: the execution, delegation and conversation
+  stores, `submitters.json` workflows and `workspaces.json` projects. Receipts, sent content, message
+  text and hashed snapshots stay. (The retired Zulip notifier's and intake's stores are not rewritten.)
+- **The registry's `formerly`** resolves what existing records stored: a child's workspace in a
+  parent's record, a parent's project in a child's, a committed snapshot, a run in an older backup
+  generation. Routing, publication and new requests do not consult it, so the old name offers
+  nothing new. A new run allocates a number above the existing copies.
+- **Backups.** Existing generations are unchanged and describe the old names; the next generation
+  describes the new ones. An isolated restore uses the generation's own registry. A live
+  `wfe backup reinstate` from an older generation resolves its workspace through `formerly` and
+  brings back a record from before the rename; `rename-project` run again converges it (delete
+  the journal's `records` step first).
+- A retired run's retention repository keeps its key, which its contents record. A new retirement
+  uses a key from the new URL, so one workspace can hold both.
+
+## Converting a workspace
+
+`wfe workspace migrate <id>...|--all [--apply]` (`server/layoutMigrate.ts`) converts
+old-layout workspaces in place. Without `--apply` it previews: run checkouts,
+retention and dialogue stores, top-level `.local/` files that move to the workspace
+root, project folders that stay in `source/.local/`, uncommitted entries, linked
+worktrees, session folders, presentation configs, and refusals (open attempts or
+queued jobs). With `--apply`, journaled per workspace in
+`<area>/.local/migrations/layout/<id>.json` and continued by running it again:
+
+1. snapshot of refs, status and submodules; the folder is renamed into `<ws>/source/`;
+2. `.local/wfe/runs` → `.agdev/runs`, `.local/wfe/retention` → `.agdev/retention`,
+   `.local/character-dialogue` → `.agdev/character-dialogue`;
+3. each run's `tree/` → `source/`;
+4. top-level files of `.local/` → the workspace root (declare in `run-files` what runs need,
+   and update their readers);
+5. repairs: `git worktree repair`, absolute submodule worktree settings, the model
+   harness's session folders (renamed to the new cwd's name, a link left at the old
+   one), presentation configs (`config.json.before-layout` kept);
+6. the snapshot must read the same; the envelope is marked ready.
+
+Everything is a rename on the same volume: nothing is copied or deleted, and
+uncommitted work stays. Undo is by hand in reverse order from the journal. Historical
+records and reports are not rewritten.
+
+**Sequence for an installation:** no open attempts; stop `wfe`, `executor`, `observer`,
+`watchdog` (`agdevctl stop …`); run `wfe workspace migrate --all` (preview) and
+`--apply` with the new release's `wfe`; `agdevctl activate <commit>`. A release with
+this layout must not serve unconverted workspaces for long: they read as unavailable
+until converted (nothing is written to them).
+
+**Conversion at service start.** The service converts what is left of the old layout
+itself before it listens (`convertAtStart`, journal by `wfe service start`), so an
+installation updated by its parent (`wfe manage update`) converts during the update:
+its lifecycle has drained attempts and stopped the executor, and no claim reaches a
+workspace before the API answers. A workspace with open work or a failed phase is left
+unavailable with its journal and the others are served; the next start or `wfe
+workspace migrate` continues it. `WFE_NO_LAYOUT_CONVERT=1` turns it off.
+

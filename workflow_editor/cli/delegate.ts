@@ -1,0 +1,581 @@
+// `wfe delegate …` (p10, docs/delegation.md): a run's agent entrusts a
+// delegate node's work to another managed workflow, reads what its child
+// asks and delivers, answers it and judges the result. Thin over
+// server/delegate.ts and the run operations; no command needs the service.
+import { readFileSync } from 'node:fs'
+import { resolve } from 'node:path'
+import { delegationState, latestResult, originText, pendingEvents, type Delegation, type DelegationEvent } from '../shared/delegation.ts'
+import { assessmentLines, type Assessment } from '../shared/assessment.ts'
+import { holderOf, runKey, type BecauseRef, type RunRecord, type RunRef } from '../shared/run.ts'
+import { readRun, resolveRef, runDir, runOp } from '../server/runs.ts'
+import { assessDelegation } from '../server/delegate.ts'
+import { runSpace } from '../server/runspace.ts'
+import { RequestError } from '../server/workspace.ts'
+import type { RunCli } from './run.ts'
+
+const COMMON = `Common options: --by <name> (outside an attempt: who records; an executing
+  attempt (WFE_ATTEMPT) records as the run's agent), --attempt <id> (default
+  WFE_ATTEMPT), --receipt <id> (a retransmission is recorded once), --json,
+  --workspace <id> (default: the workspace containing the current directory).
+<run> is <workflow>/<run-id> of the delegating (parent) run; <d> is its
+delegation id (d1, d2, …).`
+
+export const DELEGATE_HELP: Record<string, string> = {
+  request: `wfe delegate request <run> <node> --request <file|-> [--original <file>] [--replaces <d>]
+
+Entrusts the running delegate node's work to the workflow it names
+(project/workflow in the run's definition). Before anything is written the
+target is resolved to its one workspace on this host (an ambiguous or
+missing one is refused, never guessed), checked to validate and to accept
+requests (every workflow does unless it opts out: intake.requests: false, or
+the older intake: {zulip: ""}), and
+checked for cycles (its definitions delegating back here, or this run
+descending from that workflow). A refusal is about that definition or this
+host, not about whether the project takes work: wfe request still reaches
+the workflow, but as a plain request, so nothing brings its questions or its
+result back to this run (front/converse/run-045). Then:
+  Writes  delegations/<d>/request.md (your request, exactly as the child
+          receives it) and delegations/<d>/original-input.md (the person's
+          own words this run started from, or --original), and records the
+          dispatch: the node waits on the delegation.
+  Then    WFE delivers it directly: it creates the child run (found again
+          by its receipt) and binds it; the child works in its worker's
+          execution slot (one per worker). Nothing polls: end your attempt when
+          only the child's work remains; its questions and its result resume
+          this run.
+  Ending  an attempt with any other node still recorded as running holds
+          the run as interrupted, however normal the wait (front/converse/
+          run-027: its talk node). Complete such a node when its own part is
+          done, and give what is done with the child's result a node after
+          the delegate node (wfe run adjust; --completing completes the
+          running node in the same change). The output names nodes still
+          running.
+Write the request for someone who knows nothing of this run: what is wanted,
+the constraints, what you need back and in what form.
+The output also shows (information, not a requirement) the target's current
+node catalog expectations, who accepts its result (accepts) and that you
+relay its questions and presentations to the person you act for. What the
+child is actually given is frozen when it is created; its result is
+assessed against that snapshot when it comes back (wfe delegate show).
+One delegation per delegate node at a time. To replace a failed or rejected
+child, judge it first (dispose), then --replaces <d>. A retransmission of
+the same request is recorded once.
+The target is the workflow as published on its project's default branch
+(fetched now), whatever that project's workspace here holds; the dispatch
+records that revision and the child is created from it (wfe delegate targets
+shows what is offered and ready).
+Creating a workflow and running it are separate results (improve_wfrun p1:
+gimmickimg's freework was asked to define partial-animation and to make a
+scene; it made the scene itself, and partial-animation never ran). When both
+are wanted, delegate the creation, check the new workflow with wfe delegate
+targets once that child's work is integrated, then delegate to it from a
+delegate node naming it (wfe run adjust). wfe delegate show says which
+workflow and revision a child actually ran.`,
+  targets: `wfe delegate targets [<project>[/<workflow>]]
+
+What a delegate node can reach now: every project with a workspace here, each
+workflow as published on its default branch (repository@commit, fetch state),
+and whether a delegation to it would be delivered: it validates (the first
+errors are shown), it accepts requests (intake), and the project has a
+workspace here for the child's copy. "ready" means all three.
+A workflow that is only in a workspace, not on the default branch, is not
+offered. Reads only; the published side may be read from a cache up to 30 s
+old, said as "recent".`,
+  list: `wfe delegate list <run>
+
+The run's delegations: node, target, state (dispatching, working,
+attention, result, stopped, satisfied, rejected, abandoned, orphaned), the
+child, and the facts not yet taken up. Reads only.`,
+  show: `wfe delegate show <run> <d>
+
+One delegation in full: the request and original by hash, the child (its
+run, request topic and run view), every relayed fact (questions with the
+documents or deliverables they present, the result manifest, failures,
+holds), your answers, instructions and correction requests, and the
+disposition. Reads only.
+With a result, its assessment (workflow_editor fix6): what the child's
+records show as of that result beside what its frozen node catalog expects —
+whether what it produced was presented, whether the person's own answer
+about it is traceable (accepts: person), whether a page of it is still
+serving — and what is unknown. The same checks come back as reminders when
+you judge the result satisfied and when you report it.
+It starts with the findings (or that there are none in what WFE checks),
+then the child's claim (outcome, report) beside its records (files changed
+and removed, outputs, report paths not in its copy), and ends with what WFE
+cannot judge, as questions that fit the child's work (tidy p2): read the
+files with wfe delegate file before judging. A corrected result says which
+correction it answers; an earlier judgement does not cover it.`,
+  'take-up': `wfe delegate take-up <run> <d> <n>...
+
+Records that you read relayed facts n… of delegation <d> (wfe delegate show).
+The delegate node resumes running. Taking up a result prints its assessment. Taking up tells the record you read
+the facts; answering and disposing do not wait for it. An attempt that ends
+with a fact it was started for not taken up is held as interrupted, like
+work left ready, so recovery or the person looks at it.`,
+  answer: `wfe delegate answer <run> <d> <question> --answer <text> [--because answer:<q>[:<n>]]
+
+Answers the child's question (its id, as the child asked it). The answer is
+posted in the child's request topic and recorded there as the child's
+answer, from you (or from the person whose words you relay with --because).
+The delegate node waits again.
+  A question that agrees the child's plan, or anything else within this
+  run's request, is yours to answer.
+  A question that confirms the child's result (it presents deliverables) is
+  an acceptance: when the delegate node says accepts: person, answer it only
+  with your person's taken-up answer (--because answer:<q>); ask your person
+  first with wfe run ask. With accepts: parent you may accept it yourself.
+  Read what a question presents first: wfe delegate file <run> <d> <path>.
+A question the child already closed is refused; nothing is sent.`,
+  instruct: `wfe delegate instruct <run> <d> --instruction <text> [--because answer:<q>[:<n>]|instruction:<i>]
+
+Sends the child a further instruction (it is recorded as the child's
+additional instruction, read at its next step; nothing running is
+interrupted). --because when you relay your person's words.`,
+  dispose: `wfe delegate dispose <run> <d> --disposition satisfied|rejected|abandoned --note <text> [--event <n>] [--manifest <digest>] [--yes]
+
+Judges the delegation, and closes it:
+  satisfied  the child's latest result (its completed event, taken up)
+             serves the request; the delegate node may complete now.
+  rejected   that result does not serve it; replace the child (request
+             --replaces <d>), fail the node, or ask your person.
+  abandoned  no usable result will come (a failure, a cancellation, a
+             delivery that never became a child); no result is needed.
+To have the same child add what is missing instead, keep the delegation
+open and return the result: wfe delegate revise.
+--event / --manifest name the result you assessed; a newer result, or one
+returned for correction, is refused (never passed with --yes).
+Before satisfied is recorded the result is assessed (wfe delegate show):
+when the child's records show something left out, WFE answers with
+reminders and records nothing. Repair (revise, relay the person's actual
+answer) and judge again, or give the same command with --yes when you judge
+it right as it is (for this command only; a later report is assessed again).
+This is your receipt of the result, not the child's acceptance (that is its
+own decision, from its confirmation) and not your run's result decision.`,
+  revise: `wfe delegate revise <run> <d> --instruction <text> --reason <text> [--event <n>] [--manifest <digest>] [--evidence <what you checked>] [--because answer:<q>[:<n>]|instruction:<i> | --follow-up <rv> | --reopen]
+
+Returns the child's current completed result to the same child for
+correction (workflow_editor fix6), instead of closing the delegation:
+  Records  the result returned (its event and manifest), why (--reason) and
+           what the child is to add (--instruction); the delegate node
+           waits again (state correcting).
+  Then     WFE delivers it to the child, which records it as a
+           correction; that reopens the completed
+           child: its agent adds the missing work as new nodes (its ordinary
+           adjustment) and performs it — completed work is kept, not
+           repeated — and its next completion comes back as a new result
+           to take up and assess.
+The result must be the latest, taken up, and not already returned; the
+child must be completed (not cancelled, failed or executing). A closed
+delegation is not reopened: dispose rejected and --replaces is replacement.
+Returning what the commissioned work left out is part of assessing it:
+it needs nobody's go-ahead. Without --because or --follow-up the
+correction is your own finding, recorded as yours; name what you
+checked (--evidence: the file you read, the command you ran and its
+output). Materially new work, or a change of what was asked, is the
+person's to decide: ask them instead.
+--reopen --evidence: a result you judged satisfied and now find
+deficient (tidy p3). Your own finding reopens your own judgement of the
+latest result: the satisfied disposition is kept in the record
+(reopened, origin agent). Do not cite the person's words for it; a
+go-ahead or an instruction is not their finding, and nothing here
+records that anyone reviewed the result.
+--because when the correction carries your person's words. Those words
+also reopen a result you had judged satisfied (p18: the person asks later
+for a change to what you accepted): the same child corrects it, and the
+satisfied disposition is kept in the record (reopened).
+--follow-up <rv> (p17): the person's human review <rv> of this child's
+presentation asked for changes after you had judged the result satisfied.
+The satisfied disposition is kept in the record (reopened) and the
+delegation is open again for this child; the delegate node waits for the
+corrected result. Name the person's feedback in --instruction. A child
+that is cancelled, executing or whose workspace is unavailable is refused,
+never reopened in appearance only.
+Acceptances and integrations of the earlier result stay as they were; the
+corrected result is accepted and integrated by the child's own rules.`,
+  cancel: `wfe delegate cancel <run> <d> --reason <text> [--because answer:<q>[:<n>]|instruction:<i>]
+
+Cancels the delegation's child run, as its requester: its queued work is
+dropped and a running attempt of it is stopped; its records, copy and
+branch stay. This is the explicit act: holding or cancelling your own run
+never cancels the child. The cancellation comes back as a relayed fact;
+then judge the delegation (dispose --disposition abandoned).`,
+  attribute: `wfe delegate attribute <run> <d> <correction n> --origin agent|person|review --from <whose finding> --reason <evidence> --by <you>
+
+Corrects, explicitly and later, whose finding a recorded correction
+request was (tidy p3). The request keeps what it recorded (its from and
+because); the attribution is appended beside it with who recorded it,
+when and why, and readers show both. It sends nothing to the child, and
+a correction is never a review of the result, whoever it is attributed to.`,
+  verify: `wfe delegate verify <run> <d> [--event <n>]
+
+For a child on another installation (improve_multinodes p2): fetches the
+commit the result names from the repository it names (Git only; nothing
+else of that installation is read) and hashes each report and artifact the
+manifest records as committed there. VERIFIED: the bytes match; DIFFERS or
+MISSING: they do not, or the path is not in the commit; NOT VERIFIABLE: the
+manifest records it as not committed (its hash is the child's claim), or the
+commit cannot be fetched. Exit 1 when something differs or is missing, or
+nothing could be fetched. The manifest's digest alone is never verification.`,
+  file: `wfe delegate file <run> <d> <path> [--out <file>]
+
+Prints a file of the child's working copy (a path of the child's project,
+as its questions and result name it), or copies it to --out. Says whether
+its bytes are the ones the delegation's facts recorded (by hash).`,
+  sync: `wfe delegate sync
+
+Relays what every bound child recorded to its parent now, delivers what
+open local delegations owe their children (the executor's reconcile does
+both by itself) and queues the parents' continuations. Safe to repeat.`,
+}
+
+export const DELEGATE_INDEX = `wfe delegate <subcommand> … (p10: entrusting a delegate node's work to another workflow)
+
+  request <run> <node> --request <file>   dispatch the delegate node's request
+  list <run>                              the run's delegations and their state
+  show <run> <d>                          one delegation: child, facts, answers
+  take-up <run> <d> <n>...                record that you read relayed facts
+  answer <run> <d> <q> --answer <text>    answer the child's question
+  instruct <run> <d> --instruction <text> send the child a further instruction
+  dispose <run> <d> --disposition …       judge the result (satisfied / rejected / abandoned)
+  revise <run> <d> --instruction <text>   return the result to the same child for correction
+  cancel <run> <d> --reason <text>        cancel the child run (an explicit act of its own)
+  attribute <run> <d> <n> --origin …      correct later whose finding correction request <n> was
+  file <run> <d> <path>                   read a file the child presents
+  verify <run> <d> [--event <n>]          a remote result: fetch its commit and check the manifest's hashes
+  targets [<project>[/<workflow>]]        published workflows a delegation can reach, and whether each is ready
+  sync                                    relay children's facts now
+
+Contract: workflow_editor/docs/delegation.md. Details: wfe delegate help <subcommand>.`
+
+function eventLines(e: DelegationEvent): string[] {
+  const out = [`  ${String(e.n).padStart(2)}. ${e.type}${e.question ? ` ${e.question}` : ''}${e.confirms ? ' (confirms the result)' : e.plan ? ' (agrees the plan)' : ''}${e.to ? ` to ${e.to}` : ''} — ${e.takenUp ? `taken up by ${e.takenUp.by}` : e.wakes ? 'NOT TAKEN UP' : 'recorded'} (child seq ${e.child.seq}, ${e.at})`]
+  for (const l of e.text.split('\n')) if (l.trim()) out.push(`      ${l}`)
+  if (e.document) out.push(`      document: ${e.document.path} (${e.document.sha256.slice(0, 12)}, ${e.document.bytes} bytes)`)
+  for (const f of e.subject ?? []) out.push(`      presents: ${f.path} (${f.sha256.slice(0, 12)}, ${f.bytes} bytes)`)
+  if (e.presentation) out.push(`      presentation ${e.presentation.id} (revision ${e.presentation.revision.slice(7, 19)})`)
+  if (e.manifest) {
+    const m = e.manifest
+    out.push(`      result manifest ${m.digest.slice(7, 19)}: execution ${m.execution}${m.decision ? `, decision ${m.decision.decision} by ${m.decision.by}` : ', no decision'}${m.branch ? `, branch ${m.branch}` : ''}`)
+    if (m.outcome) out.push(`      outcome: ${m.outcome}`)
+    for (const f of [...(m.report ? [m.report] : []), ...m.artifacts]) out.push(`      ${f === m.report ? 'report' : 'artifact'}: ${f.path} (${f.sha256.slice(0, 12)}, ${f.bytes} bytes${f.commit ? `, in ${f.commit.slice(0, 10)}` : ', not committed yet'})`)
+  }
+  return out
+}
+
+// The agdev link's view of a remote delegation (improve_multinodes p1).
+// The link's view of a remote delegation (improve_multinodes p2): delivery
+// and acceptance, each operation and its receipt, the latest observation of
+// the remote run with its freshness, what waits, what is kept aside.
+export function linkLines(l: import('../server/peerlink.ts').LinkView): string[] {
+  const o = l.observed
+  return [
+    `  link: request ${l.request} to ${l.peer} — delivery: ${l.delivery}; acceptance: ${l.acceptance}`,
+    `  remote run: ${l.remoteRun ?? 'none yet'}${l.remoteUrl ? ` (${l.remoteUrl})` : ''}; ${l.freshness}${o ? `; last observed ${o.execution}${o.cancelled ? ', cancelled' : ''}${o.attempt ? ', an attempt open' : ''}${o.hold ? `, held (${o.hold})` : ''}, seq ${o.seq}${o.questions.length ? `, open questions ${o.questions.join(', ')}` : ''}${o.corrections.length ? `, open corrections ${o.corrections.join(', ')}` : ''} (told ${o.told ?? '?'})` : ''}`,
+    `  the other installation applies: ${l.capabilities.join(', ') || 'nothing beyond peer/1 (answers, instructions, corrections and cancellation are refused here)'}`,
+    ...l.operations.map(x => { const n = x.id.split(':').slice(2).join(''); return `  sent ${x.kind}${n ? ` ${n}` : ''}: ${x.delivery}; ${x.outcome}` }),
+    ...l.waiting.map(w => `  waiting: ${w}`),
+    ...l.kept.map(k => `  kept aside: ${k}`),
+    ...(l.problem ? [`  link problem: ${l.problem}`] : []),
+  ]
+}
+
+async function peerLink(store: import('../server/delegate.ts').DelegateStore, d: Delegation) {
+  if (!store.ctx.exec) return null
+  const { PeerStore, selfInstance } = await import('../server/peerlink.ts')
+  const self = selfInstance(store.ctx.area)
+  if (!self) return null
+  const s = new PeerStore({ area: store.ctx.area, registryFile: store.ctx.registryFile, exec: store.ctx.exec })
+  try { return s.linkOf(d, self) } finally { s.close() }
+}
+
+export function describeDelegation(d: Delegation, rec: RunRecord, assessment?: Assessment | null): string[] {
+  return [
+    `Delegation ${d.id} (${d.uid}) from node ${d.node} to ${d.target.project}/${d.target.workflow}${d.target.source ? ` at ${d.target.source.repository}@${d.target.source.commit.slice(0, 10)}` : ''} (${d.target.instance ? `installation ${d.target.instance}` : `workspace ${d.target.workspace}`}): ${delegationState(d)}`,
+    `  request: ${d.request.path} (${d.request.sha256.slice(0, 12)})${d.original ? `; original: ${d.original.path}` : ''}; requester ${d.requester}${d.onBehalfOf ? ` for ${d.onBehalfOf}` : ''}; result acceptance: ${d.accepts === 'parent' ? 'this run\'s agent may accept' : 'the person\'s (relay their answer)'}`,
+    `  dispatched ${d.dispatched.at} by ${d.dispatched.by}${d.predecessor ? `, replacing ${d.predecessor}` : ''}`,
+    d.child?.instance ? `  child: ${d.child.project} ${d.child.workflow}/${d.child.run} (${d.child.uid}) on installation ${d.child.instance}${d.child.url ? ` — ${d.child.url}` : ''}; its record is that installation's` : d.target.instance ? '  child: none yet (wfe peer status shows the delivery and whether it was accepted)' : d.child ? `  child: ${d.child.project} ${d.child.workflow}/${d.child.run} (${d.child.uid}) in workspace ${d.child.workspace}${d.transport && 'route' in d.transport && d.transport.route === 'direct' ? `; created directly by WFE (receipt ${d.transport.delivery})` : d.transport && !('route' in d.transport) ? `; bound from Zulip request post ${d.transport.message} in #${d.transport.stream} › ${d.transport.topic} (retired route)` : ''}` : d.delivery === 'direct' ? '  child: none yet (WFE delivers it directly: the next reconcile, or wfe delegate sync)' : '  child: none — dispatched on the retired notifier → intake route; nothing delivers it now (judge or abandon it)',
+    ...(d.target.instance ? [] : [`  delivery: ${d.rerouted ? `notifier post → intake (retired) until seq ${d.rerouted.seq}, then direct (WFE; rerouted ${d.rerouted.at} by ${d.rerouted.by}: ${d.rerouted.reason.replace(/\s+/g, ' ').slice(0, 120)})` : d.delivery === 'direct' ? 'direct (WFE)' : 'notifier post → intake (the retired route it was dispatched on; nothing is delivered for it now)'}`]),
+    ...(d.events.length ? ['  facts relayed:', ...d.events.flatMap(eventLines)] : ['  facts relayed: none yet']),
+    ...(() => { const m = latestResult(d)?.manifest?.remote; return m ? [`  remote result: ${m.repository ?? 'repository unknown'} @ ${m.commit ?? 'commit unknown'} — ${m.published === true ? 'published on its run branch' : m.published === false ? 'NOT on its published run branch' : 'publication unknown'}; ${m.integrated ? 'integrated there' : 'not integrated there'}; accepting it here is this run's disposition`] : [] })(),
+    ...d.answers.map(a => `  answer ${a.n} to ${a.question} from ${a.from}${a.from !== a.by ? ` (relayed by ${a.by})` : ''} at ${a.at}: ${a.text.replace(/\s+/g, ' ').slice(0, 200)}`),
+    ...d.instructions.map(a => `  instruction ${a.n} from ${a.from} at ${a.at}: ${a.text.replace(/\s+/g, ' ').slice(0, 200)}`),
+    ...(d.revisions ?? []).map(r => `  correction request ${r.n} (returns result event ${r.event}${r.manifest ? `, manifest ${r.manifest.slice(7, 19)}` : ''}) at ${r.at}, ${originText(r, d)}: ${r.instruction.replace(/\s+/g, ' ').slice(0, 200)} — because: ${r.reason.replace(/\s+/g, ' ').slice(0, 160)}`),
+    ...(d.reopened ?? []).map(x => `  reopened at ${x.at} by ${x.by}: the ${x.disposition.kind} judgement of event ${x.disposition.event ?? '—'} (${x.disposition.by}) set aside — ${x.review ? `human review ${x.review} asked for changes` : x.because ? `${x.because.from}'s words` : `${x.by}'s own finding${x.evidence ? ` (checked: ${x.evidence.replace(/\s+/g, ' ').slice(0, 160)})` : ''}`}`),
+    d.disposition ? `  judged ${d.disposition.kind} by ${d.disposition.by} at ${d.disposition.at}${d.disposition.manifest ? ` (manifest ${d.disposition.manifest.slice(7, 19)})` : ''}: ${d.disposition.note}` : d.closed ? `  closed: ${d.closed.reason}` : '',
+    ...(rec.nodes[d.node] ? [`  node ${d.node}: ${rec.nodes[d.node].state}${rec.nodes[d.node].wait ? `; next move: ${holderOf(rec, d.node)}` : ''}`] : []),
+    ...(assessment ? assessmentLines(assessment) : []),
+  ].filter(Boolean)
+}
+
+// Published workflows a delegation can reach and whether a request to each
+// would be delivered (improve_wfrun p1): it validates, accepts requests and
+// its project has a workspace here.
+async function targets(c: RunCli, store: import('../server/delegate.ts').DelegateStore, which?: string): Promise<number> {
+  const access = store.ctx.exec?.ctx.gitea ? store.ctx.exec.accessContext() : undefined
+  if (!access) throw c.refused('published workflows are read from Gitea, which is not configured here')
+  const [project, workflow] = (which ?? '').split('/')
+  const { loadRegistry } = await import('../server/registry.ts')
+  const { publishedWorkspace } = await import('../server/published.ts')
+  const reg = await loadRegistry(store.ctx.registryFile)
+  const projects = [...new Set(reg.workspaces.map(w => w.project).filter((p): p is string => !!p))].filter(p => !project || p === project).sort()
+  if (project && !projects.length) throw c.refused(`project ${project} has no workspace on this host, so a delegation cannot create its child here`)
+  const rows: Record<string, unknown>[] = []
+  const lines: string[] = []
+  {
+    for (const p of projects) {
+      let pub
+      try { pub = await publishedWorkspace(access, reg.workspaces.find(w => w.project === p)!, { discovery: true }) } catch (e) { lines.push(`${p}: published workflows cannot be read: ${(e as Error).message}`); rows.push({ project: p, problem: (e as Error).message }); continue }
+      const src = pub.source
+      lines.push(`${p}  ${src.repository}@${src.commit.slice(0, 10)} (${src.branch}, ${src.fetch.state} ${src.fetch.at})`)
+      const { list } = await pub.workflowSummaries()
+      const shown = list.filter(w => !workflow || w.id === workflow || w.file === `${workflow}.yaml`)
+      if (workflow && !shown.length) lines.push(`  ${workflow}: not on the default branch at this revision`)
+      for (const w of shown) {
+        const errors = w.id ? (await pub.workflowResponse(w.file)).issues.filter(i => i.severity === 'error') : []
+        const ready = !!w.id && !w.problem && !errors.length && !!w.intake
+        lines.push(`  ${(w.id ?? w.file).padEnd(24)} ${ready ? 'ready' : 'NOT READY'}  valid: ${w.problem ? `unreadable (${w.problem.message})` : errors.length ? `${errors.length} error${errors.length === 1 ? '' : 's'} — ${errors.slice(0, 2).map(i => i.message).join('; ')}` : 'yes'}; requests: ${w.intake ? 'yes' : 'opted out'}`)
+        rows.push({ project: p, workflow: w.id ?? null, file: w.file, source: src, ready, problem: w.problem?.message ?? null, errors: errors.map(i => ({ code: i.code, message: i.message })), intake: !!w.intake })
+      }
+    }
+  }
+  c.out(lines.join('\n') || 'No project with a workspace here.', { targets: rows })
+  return 0
+}
+
+export async function delegateCommand(c: RunCli): Promise<number> {
+  const [sub, ...args] = c.positional
+  if (!sub || sub === 'help') {
+    const topic = args[0]
+    console.log(topic && DELEGATE_HELP[topic] ? `${DELEGATE_HELP[topic]}\n\n${COMMON}` : DELEGATE_INDEX)
+    return topic && !DELEGATE_HELP[topic] ? 2 : 0
+  }
+  if (!DELEGATE_HELP[sub]) throw c.usage(`no delegate subcommand "${sub}" (see: wfe delegate help)`)
+  if (c.flag('help')) { console.log(`${DELEGATE_HELP[sub]}\n\n${COMMON}`); return 0 }
+  const store = c.exec().delegate
+  const wrap = async <T>(f: () => Promise<T>): Promise<T> => {
+    try { return await f() } catch (e) {
+      if (e instanceof RequestError) throw c.refused(e.message, e.detail)
+      throw e
+    }
+  }
+  if (sub === 'sync') {
+    // cluster_teamwork p4: and what open direct delegations owe their children.
+    const notes = await wrap(async () => [...await store.rebuild(), ...await store.relay(), ...await store.deliver()])
+    c.out(notes.join('\n') || 'Nothing new to relay or deliver.', { ok: true, notes })
+    return 0
+  }
+  if (sub === 'targets') return targets(c, store, args[0]) // needs no workspace of the caller's
+  const ws = await c.workspace()
+  const ref = async (): Promise<RunRef> => {
+    if (!args[0]) throw c.usage('<run> is required')
+    return wrap(() => resolveRef(ws, args[0]))
+  }
+  const attempt = c.opt('attempt') ?? process.env.WFE_ATTEMPT ?? undefined
+  const by = c.opt('by')
+  const receipt = c.opt('receipt')
+  const record = async (r: RunRef) => {
+    const rec = (await wrap(async () => readRun(await runSpace(ws, r), r))).record
+    if (!rec) throw c.refused(`run ${runKey(r)} cannot be read`)
+    return rec
+  }
+  // Who records: the same rules as wfe run (an attempt records as the
+  // run's agent; outside one, a host-performed run needs --by).
+  const recorder = (rec: RunRecord) => {
+    if (attempt) {
+      if (by?.trim() && by.trim() !== rec.executor.name) throw c.refused(`this process is attempt ${attempt} of ${rec.executor.name}; it records as ${rec.executor.name}, not as ${by.trim()} (name your person's words with --because)`)
+      return rec.executor.name
+    }
+    if (!by?.trim() && rec.executor.host) throw c.refused(`who records this? Pass --by <your name>: run ${rec.workflow}/${rec.run} is performed by ${rec.executor.name} on the execution host, and only its executing attempt records under that name.`)
+    return by?.trim() || undefined
+  }
+  const because = (): BecauseRef | undefined => {
+    const v = c.opt('because')
+    if (!v) return undefined
+    const m = /^(answer|instruction):([a-z0-9]+)(?::(\d+))?$/.exec(v)
+    if (!m) throw c.usage('--because is answer:<question>[:<answer index>] or instruction:<instruction id>')
+    return m[1] === 'answer' ? { kind: 'answer', question: m[2], ...(m[3] ? { answer: Number(m[3]) } : {}) } : { kind: 'instruction', instruction: m[2] }
+  }
+  const meta = () => ({ ...(attempt ? { attempt } : {}), ...(receipt ? { receipt } : {}) })
+  const need = (k: string, what: string) => { const v = c.opt(k); if (!v?.trim()) throw c.usage(`--${k} is required: ${what}`); return v }
+  const delegation = (rec: RunRecord, id: string | undefined) => {
+    if (!id) throw c.usage('<d> is required (d1, d2, …; wfe delegate list <run>)')
+    const d = rec.delegations?.[id]
+    if (!d) throw c.refused(`run ${rec.workflow}/${rec.run} has no delegation ${id}${rec.delegations ? ` (it has ${Object.keys(rec.delegations).join(', ')})` : ''}`)
+    return d
+  }
+  const after = (rec: RunRecord, d: Delegation, what: string) => {
+    const n = rec.nodes[d.node]
+    c.out([what, `Delegation ${d.id}: ${delegationState(d)}; node ${d.node} is ${n?.state}${n?.wait ? ` (next move: ${holderOf(rec, d.node)})` : ''}.`].join('\n'), { ok: true, ref: runKey(rec), seq: rec.seq, delegation: d })
+    return 0
+  }
+  switch (sub) {
+    case 'request': {
+      const r = await ref()
+      const node = args[1]
+      if (!node) throw c.usage('<node> is required: the running delegate node')
+      const file = need('request', 'the request text (a file, or - for stdin)')
+      const text = readFileSync(file === '-' ? 0 : resolve(file), 'utf8')
+      const original = c.opt('original') ? readFileSync(resolve(c.opt('original')!), 'utf8') : undefined
+      const rec = await record(r)
+      const res = await wrap(() => store.dispatch(ws, r, node, { request: text, original, predecessor: c.opt('replaces'), by: recorder(rec), via: 'cli', ...meta() }))
+      const context = res.duplicate ? [] : await dispatchContext(store, res.delegation)
+      const running = res.record.execution.active
+      const next = running.length
+        ? `Still recorded as running: ${running.join(', ')}. Ending the attempt now would hold this run as interrupted: complete ${running.length === 1 ? 'it' : 'them'} (or fail, or wait on something) first; work that needs the child's result belongs in a node after ${node}.`
+        : 'When only the child\'s work remains, end your attempt: its questions and its result resume this run.'
+      return after(res.record, res.delegation, `${res.duplicate ? 'Already dispatched (same request); nothing changed.' : `Dispatched ${res.delegation.id}: ${node} → ${res.delegation.target.project}/${res.delegation.target.workflow} (workspace ${res.delegation.target.workspace}).`} WFE creates and binds the child directly.${res.notes.length ? `\n${res.notes.join('\n')}` : ''}${context.length ? `\n${context.join('\n')}` : ''}\n${next}`)
+    }
+    case 'list': {
+      const rec = await record(await ref())
+      const all = Object.values(rec.delegations ?? {})
+      c.out(all.length ? all.map(d => `${d.id}  ${d.node.padEnd(16)} → ${`${d.target.project}/${d.target.workflow}`.padEnd(24)} ${delegationState(d).padEnd(11)} ${d.child ? `${d.child.workflow}/${d.child.run}` : '(no child yet)'}${pendingEvents(d).length ? `  — ${pendingEvents(d).map(e => `${e.type} #${e.n}`).join(', ')} not taken up` : ''}`).join('\n') : 'No delegations.', { ref: runKey(rec), delegations: all.map(d => ({ ...d, state: delegationState(d) })) })
+      return 0
+    }
+    case 'show': {
+      const rec = await record(await ref())
+      const d = delegation(rec, args[1])
+      const a = latestResult(d) ? await wrap(() => assessDelegation(store, rec, d)) : null
+      const link = d.target.instance ? await peerLink(store, d) : null
+      c.out([...describeDelegation(d, rec, a), ...(link ? linkLines(link) : [])].join('\n'), { ref: runKey(rec), delegation: { ...d, state: delegationState(d) }, assessment: a, ...(link ? { link } : {}) })
+      return 0
+    }
+    case 'take-up': {
+      const r = await ref()
+      const rec = await record(r)
+      const d = delegation(rec, args[1])
+      const ns = args.slice(2).map(Number)
+      if (!ns.length || ns.some(n => !Number.isInteger(n) || n < 1)) throw c.usage('<n>... is required: the fact numbers (wfe delegate show)')
+      const res = await wrap(async () => runOp(await runSpace(ws, r), r, { op: 'delegation.take-up', delegation: d.id, events: ns, ...meta() } as never, { by: recorder(rec), via: 'cli' }))
+      // A result taken up comes with its assessment (fix6), once, with the take-up.
+      const nd = res.record.delegations![d.id]
+      const result = nd.events.find(e => ns.includes(e.n) && e.type === 'completed' && e.n === latestResult(nd)?.n)
+      const a = result && !res.duplicate ? await wrap(() => assessDelegation(store, res.record, nd, result)) : null
+      return after(res.record, nd, [res.duplicate ? 'Already recorded (same receipt); nothing changed.' : `Taken up: ${ns.map(n => `#${n}`).join(', ')} of ${d.id}.`, ...(a ? [`Result event ${result!.n} of ${d.id}:`, ...assessmentLines(a), nextAfterAssessment(rec, d, a)] : [])].join('\n'))
+    }
+    case 'answer': {
+      const r = await ref()
+      const rec = await record(r)
+      const d = delegation(rec, args[1])
+      const q = args[2]
+      if (!q) throw c.usage('<question> is required: the child\'s question id (q1, q2, …)')
+      const res = await wrap(() => store.answer(ws, r, d.id, q, need('answer', 'the answer text'), { by: recorder(rec), via: 'cli', because: because(), ...meta() }))
+      return after(res.record, res.record.delegations![d.id], res.duplicate ? 'Already recorded (same receipt); nothing changed.' : d.target.instance ? `Answered ${q} of ${d.id}; it goes to ${d.target.instance} over the agdev link, which records it on its run and says so (wfe delegate show: link operations). A question closed there comes back as answer-refused.` : `Answered ${q} of ${d.id}; it is posted in the child's request topic and recorded there.`)
+    }
+    case 'instruct': {
+      const r = await ref()
+      const rec = await record(r)
+      const d = delegation(rec, args[1])
+      const why = because()
+      const res = await wrap(() => store.instruct(ws, r, d.id, need('instruction', 'the instruction'), { by: recorder(rec), via: 'cli', ...(why ? { because: why } : {}), ...meta() }))
+      return after(res.record, res.record.delegations![d.id], res.duplicate ? 'Already recorded (same receipt); nothing changed.' : d.target.instance ? `Instruction for ${d.id} recorded; it goes to ${d.target.instance} over the agdev link (its receipt shows in wfe delegate show).` : `Instruction for ${d.id} recorded; it is posted in the child's request topic.`)
+    }
+    case 'dispose': {
+      const r = await ref()
+      const rec = await record(r)
+      const d = delegation(rec, args[1])
+      const kind = need('disposition', 'satisfied, rejected or abandoned')
+      const ev = c.opt('event') !== undefined ? Number(c.opt('event')) : undefined
+      const res = await wrap(() => store.dispose(ws, r, d.id, { disposition: kind, note: need('note', 'what you found'), event: ev, manifest: c.opt('manifest'), yes: c.flag('yes') }, { by: recorder(rec), via: 'cli', ...meta() }))
+      return after(res.record, res.record.delegations![d.id], res.duplicate ? 'Already recorded (same receipt); nothing changed.' : `Delegation ${d.id} judged ${kind}.${kind === 'satisfied' ? ` Node ${d.node} may complete now (wfe run complete).` : ''}`)
+    }
+    case 'revise': {
+      const r = await ref()
+      const rec = await record(r)
+      const d = delegation(rec, args[1])
+      const ev = c.opt('event') !== undefined ? Number(c.opt('event')) : undefined
+      const res = await wrap(() => store.revise(ws, r, d.id, { instruction: need('instruction', 'what the child is to add or change'), reason: need('reason', 'why the result is returned'), event: ev, manifest: c.opt('manifest'), because: because(), ...(c.opt('follow-up') ? { followUp: c.opt('follow-up') } : {}), ...(c.flag('reopen') ? { reopen: true } : {}), ...(c.opt('evidence') ? { evidence: c.opt('evidence') } : {}) }, { by: recorder(rec), via: 'cli', ...meta() }))
+      const rv = res.record.delegations![d.id].revisions?.at(-1)
+      return after(res.record, res.record.delegations![d.id], res.duplicate ? 'Already recorded (same receipt); nothing changed.' : `Returned result event ${rv?.event} of ${d.id} to the child ${d.child?.workflow}/${d.child?.run} for correction (request ${rv?.n}). It is posted in the child's request topic; the child reopens, adds the work and completes again — its new result resumes this run. End your attempt when only the child's work remains.`)
+    }
+    case 'attribute': {
+      const r = await ref()
+      const rec = await record(r)
+      const d = delegation(rec, args[1])
+      const n = Number(args[2])
+      if (!Number.isInteger(n) || n < 1) throw c.usage('<correction n> is required (wfe delegate show lists the correction requests)')
+      const res = await wrap(async () => runOp(await runSpace(ws, r), r, { op: 'delegation.attribute', delegation: d.id, revision: n, origin: need('origin', 'agent, person or review'), from: need('from', 'whose finding it was'), reason: need('reason', 'the evidence for the attribution'), ...meta() } as never, { by: recorder(rec), via: 'cli' }))
+      const rv = res.record.delegations![d.id].revisions?.find(x => x.n === n)
+      c.out(`Correction request ${n} of ${d.id}: ${rv ? originText(rv) : '?'}.`, { ok: true, revision: rv })
+      return 0
+    }
+    case 'cancel': {
+      const r = await ref()
+      const rec = await record(r)
+      const d = delegation(rec, args[1])
+      if (!d.child && !d.target.instance) throw c.refused(`delegation ${d.id} has no child yet; nothing to cancel (abandon it instead: dispose --disposition abandoned)`)
+      const who = recorder(rec) ?? rec.executor.name
+      const why = because()
+      const reason = need('reason', 'why the child is cancelled')
+      if (d.target.instance) {
+        // improve_multinodes p2: the other installation cancels its own run.
+        const res = await wrap(() => store.cancelRemote(ws, r, d.id, { reason: `${reason}${why ? ` (on ${why.kind === 'answer' ? `answer ${why.question}` : `instruction ${why.instruction}`} of ${rec.workflow}/${rec.run})` : ''}`, by: who }))
+        c.out(res.duplicate ? `A cancellation of ${d.id}'s remote run was already asked (${res.state}); nothing new is sent.` : `Asked ${d.target.instance} to cancel ${d.child ? `${d.child.project} ${d.child.workflow}/${d.child.run}` : `the request (not accepted yet: it is refused when it arrives)`} over the agdev link. Its receipt says whether it was applied, is being applied (an attempt is stopped) or refused (for a run that completed first: its result stands); a cancellation comes back as a relayed fact. Then judge the delegation (dispose --disposition abandoned).`, { ok: true, cancel: res })
+        return 0
+      }
+      const kid = d.child!
+      const cws = await wrap(() => store.workspace(kid.workspace))
+      const cref = { workflow: kid.workflow, run: kid.run }
+      const child = await wrap(async () => (await readRun(await runSpace(cws, cref), cref)).record)
+      if (child?.cancelled) throw c.refused(`the child ${cref.workflow}/${cref.run} is already cancelled (${child.cancelled.reason})`)
+      const res = await wrap(() => c.exec().cancel(cws, cref, who, `cancelled by its requester ${who} (delegation ${d.uid}): ${reason}${why ? ` (on ${why.kind === 'answer' ? `answer ${why.question}` : `instruction ${why.instruction}`} of ${rec.workflow}/${rec.run})` : ''}`, 'delegation'))
+      const notes = await wrap(() => store.relay())
+      c.out([`Cancelled the child ${kid.project} ${cref.workflow}/${cref.run}.`, ...notes, 'Judge the delegation next: wfe delegate dispose … --disposition abandoned.'].join('\n'), { ok: true, child: { ...cref, cancelled: res.record.cancelled }, notes })
+      return 0
+    }
+    case 'verify': {
+      const rec = await record(await ref())
+      const d = delegation(rec, args[1])
+      const ev = c.opt('event') !== undefined ? d.events.find(e => e.n === Number(c.opt('event'))) : latestResult(d)
+      const r = await wrap(() => store.verifyRemote(d, ev))
+      const counts = (k: string) => r.files.filter(f => f.status === k).length
+      c.out([`${d.id} result event ${ev?.n ?? '?'}: ${r.detail}.`, ...r.files.map(f => `  ${f.status.toUpperCase().padEnd(12)} ${f.path} (${f.sha256.slice(0, 12)}) — ${f.detail}`),
+        `${counts('verified')} verified, ${counts('differs')} differ, ${counts('missing')} missing, ${counts('unverifiable')} not verifiable by Git. Verified means: the bytes in the fetched commit hash as the manifest says; it says nothing about whether the content serves the request.`,
+        ...(r.outputs.length ? ['Shared outputs the result names (against this host\'s share):', ...r.outputs.map(o => `  ${o.status.toUpperCase().padEnd(12)} ${o.id} ${o.ref} (${o.manifest.slice(0, 19)}…) — ${o.detail}`), 'Verified means: the folder\'s manifest is the one the result names and every file hashes as it says; an UNAVAILABLE share is not evidence of an absent output.'] : [])].join('\n'), r)
+      return r.files.some(f => f.status === 'differs' || f.status === 'missing') || r.outputs.some(o => o.status === 'altered' || o.status === 'missing') || !r.available ? 1 : 0
+    }
+    case 'file': {
+      const rec = await record(await ref())
+      const d = delegation(rec, args[1])
+      const path = args[2]
+      if (!path) throw c.usage('<path> is required: a path of the child\'s project')
+      const check = (sha: string, expected: string | null) => expected ? (expected === sha ? 'matches the recorded hash' : `DIFFERS from the recorded hash ${expected.slice(0, 12)} (changed since the child presented it)`) : 'not named by any recorded fact'
+      if (c.opt('out')) {
+        const r = await wrap(() => store.copyChildFile(d, path, resolve(c.opt('out')!)))
+        c.out(`Copied ${r.path} (${r.bytes} bytes, ${r.sha256.slice(0, 12)}) to ${c.opt('out')}; ${check(r.sha256, r.expected)}.`, r)
+        return 0
+      }
+      const r = await wrap(() => store.childFile(d, path))
+      if (c.flag('json')) { c.out('', { path: r.path, sha256: r.sha256, expected: r.expected, bytes: r.bytes.length, text: r.bytes.toString('utf8') }); return 0 }
+      process.stdout.write(r.bytes)
+      console.error(`\n[${r.path}: ${r.bytes.length} bytes, ${r.sha256.slice(0, 12)}; ${check(r.sha256, r.expected)}]`)
+      return 0
+    }
+  }
+  return 2
+}
+
+// What a dispatch tells the parent (fix6): information, not a requirement —
+// the target's catalog expectations now (a preview: the child freezes its own
+// at creation), who accepts its result, and the parent's relay role.
+async function dispatchContext(store: { ctx: { area: string } }, d: Delegation): Promise<string[]> {
+  const { snapshotForRun } = await import('../server/catalog.ts')
+  const snap = await snapshotForRun(store.ctx.area).catch(() => null)
+  const out = [`For ${d.onBehalfOf ?? 'the person this run serves'}: ${d.accepts === 'person' ? `the child's result is theirs to accept (accepts: person) — relay their own answer, not yours` : 'this run\'s agent may accept the child\'s result (accepts: parent)'}. The child asks you, and presents to you; you relay its questions and presentations to them.`]
+  if (snap?.state === 'supplied' && snap.snapshot.templates.length) {
+    out.push(`The node catalog the child will be given, as it is now (${snap.snapshot.templates.length} template${snap.snapshot.templates.length === 1 ? '' : 's'}; its result is assessed against the snapshot it actually receives):`)
+    for (const t of snap.snapshot.templates) out.push(`  - ${t.id} r${t.revision}: ${t.expectation.trim().split('\n').join(' ')}`)
+  } else if (snap?.state === 'unavailable') out.push(`The node catalog cannot be read now (${snap.problem}).`)
+  return out
+}
+
+// After an assessment shown at take-up: the parent's next moves (fix6).
+function nextAfterAssessment(rec: RunRecord, d: Delegation, a: Assessment): string {
+  const run = runKey(rec)
+  const open = a.checks.filter(c => c.status !== 'ok')
+  return open.length
+    ? `Next: inspect what the child left out, then return it to the same child (wfe delegate revise ${run} ${d.id} --instruction "…" --reason "…"), relay the person's actual answer, or judge it right as it is (dispose … --yes). Nothing here acts for the child.`
+    : `Next: compare the claim with the files (to judge, above), then judge it (wfe delegate dispose ${run} ${d.id} --disposition satisfied|rejected --note "what you checked"), or return it for correction (wfe delegate revise).`
+}
+
+// Where a parent's delegation files are (for messages and the browser).
+export const delegationDir = (r: RunRef, d: string) => `${runDir(r)}/delegations/${d}`

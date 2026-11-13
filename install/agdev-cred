@@ -1,0 +1,469 @@
+#!/usr/bin/env python3
+"""The credentials this installation's operations use: what each is, for whom, where it is kept, who uses it.
+
+  agdev-cred list                                   every entry, no values
+  agdev-cred show <id>                              one entry and the state of its storage, no values
+  agdev-cred register <id> --type T --account A …   add or update an entry (metadata and storage reference)
+  agdev-cred import <id> --from FILE …              copy a private file into config/secrets/<id> and register it
+  agdev-cred check <id> [--operation OP]            the storage is there and readable; a live check where the type has one
+  agdev-cred path <id>                              the file to hand to a tool that reads its own credential file
+  agdev-cred exec <id>[,<id>…] [--env NAME] -- CMD  run CMD with the credential(s) in its environment, output redacted
+  agdev-cred use <id> --operation OP --result R     record that an operation used it (when a tool read it directly)
+  agdev-cred copy <id> --host H --path P            record a copy this installation made elsewhere
+  agdev-cred status <id> <active|replaced|revoked|missing> --reason TEXT
+  agdev-cred usage [<id>]                           the usage records
+
+The inventory is `<root>/config/credentials.json` (0600, outside Git); usage is appended to
+`<root>/config/credentials-usage.jsonl`. Nothing here prints a secret value: `exec` replaces any value of
+the credentials it loaded by `<redacted:ID>` in the command's output. Agents sharing one OS account can all
+read these files; this is bookkeeping and convenience, not isolation (docs/credentials.md).
+Exit 0 ok, 1 a check or command failed, 2 usage, 3 missing/unreadable credential or inventory problem.
+"""
+from __future__ import annotations
+
+import argparse
+import datetime as dt
+import json
+import os
+import pwd
+import re
+import shlex
+import shutil
+import socket
+import ssl
+import subprocess
+import sys
+import threading
+import urllib.request
+from pathlib import Path
+
+TYPES = ("ssh-key", "sudo-password", "gitea-token", "slack-bot", "model-login", "token", "file")
+STATUSES = ("active", "pending", "missing", "replaced", "revoked")
+ENV_LINE = re.compile(r"^\s*(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)=(.*)$")
+
+
+class Problem(Exception):
+    def __init__(self, message: str, code: int = 3):
+        super().__init__(message)
+        self.code = code
+
+
+def now() -> str:
+    return dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def installation_root() -> Path:
+    if os.environ.get("AGDEV_ROOT"):
+        return Path(os.environ["AGDEV_ROOT"])
+    if os.environ.get("AGDEV_LIFECYCLE"):
+        return Path(os.environ["AGDEV_LIFECYCLE"]).parent.parent
+    invoked = Path(sys.argv[0]).absolute()
+    if invoked.parent.name == "bin" and invoked.parent.parent.name == "area":
+        return invoked.parents[3]
+    raise Problem("cannot tell which installation this is: set AGDEV_ROOT or pass --inventory", 2)
+
+
+class Inventory:
+    def __init__(self, path: Path):
+        self.path = path
+        self.usage_path = path.with_name("credentials-usage.jsonl")
+
+    def load(self) -> dict:
+        if not self.path.exists():
+            return {"version": 1, "credentials": {}}
+        try:
+            data = json.loads(self.path.read_text())
+        except (OSError, json.JSONDecodeError) as e:
+            raise Problem(f"inventory {self.path} is unreadable: {e}")
+        data.setdefault("credentials", {})
+        return data
+
+    def save(self, data: dict) -> None:
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = self.path.with_name(f".{self.path.name}.{os.getpid()}")
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w") as f:
+            json.dump(data, f, indent=1, sort_keys=True)
+            f.write("\n")
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, self.path)
+
+    def get(self, cid: str) -> dict:
+        entry = self.load()["credentials"].get(cid)
+        if entry is None:
+            raise Problem(f"no credential {cid!r} in {self.path} (agdev-cred list)")
+        return entry
+
+    def update(self, cid: str, **fields) -> dict:
+        data = self.load()
+        entry = data["credentials"].setdefault(cid, {"registered": now()})
+        for key, value in fields.items():
+            if value is not None:
+                entry[key] = value
+        entry["updated"] = now()
+        self.save(data)
+        return entry
+
+    def record_use(self, cid: str, **fields) -> None:
+        record = {"at": now(), "id": cid, "os_account": pwd.getpwuid(os.getuid()).pw_name, "host": socket.gethostname(), **fields}
+        with open(self.usage_path, "a", opener=lambda p, f: os.open(p, f, 0o600)) as out:
+            out.write(json.dumps(record, sort_keys=True) + "\n")
+
+    def usage(self, cid: str | None) -> list[dict]:
+        if not self.usage_path.exists():
+            return []
+        rows = [json.loads(line) for line in self.usage_path.read_text().splitlines() if line.strip()]
+        return [r for r in rows if cid is None or r.get("id") == cid]
+
+
+# ---- storage --------------------------------------------------------------------------------------------
+
+def storage_file(entry: dict) -> Path | None:
+    storage = entry.get("storage") or {}
+    if storage.get("kind") == "file":
+        return Path(storage["path"]).expanduser()
+    if storage.get("kind") == "ansible-vault":
+        return Path(storage["file"]).expanduser()
+    return None
+
+
+def storage_state(entry: dict) -> dict:
+    storage = entry.get("storage") or {}
+    path = storage_file(entry)
+    if path is None:
+        return {"kind": storage.get("kind", "none"), "where": storage.get("where"), "checkable": False}
+    state = {"kind": storage["kind"], "path": str(path), "exists": path.exists()}
+    if path.exists():
+        st = path.stat()
+        state.update(mode=oct(st.st_mode & 0o777), owner=pwd.getpwuid(st.st_uid).pw_name, size=st.st_size,
+                     modified=dt.datetime.fromtimestamp(st.st_mtime, dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+                     readable=os.access(path, os.R_OK))
+        if st.st_mode & 0o077 and storage["kind"] == "file":
+            state["warning"] = "readable by group or others"
+    return state
+
+
+def read_secret_file(cid: str, entry: dict) -> str:
+    path = storage_file(entry)
+    if path is None:
+        raise Problem(f"{cid}: its storage ({(entry.get('storage') or {}).get('kind')}) is not a file this tool can read")
+    if (entry.get("storage") or {}).get("kind") == "ansible-vault":
+        raise Problem(f"{cid}: kept in an Ansible vault; Ansible reads it itself (use `agdev-cred use` to record the use)")
+    if not path.exists():
+        raise Problem(f"{cid}: {path} does not exist (status {entry.get('status')}; replace it and `agdev-cred check {cid}`)")
+    try:
+        return path.read_text()
+    except PermissionError:
+        raise Problem(f"{cid}: {path} is not readable by {pwd.getpwuid(os.getuid()).pw_name}")
+
+
+def env_values(cid: str, entry: dict, as_env: str | None) -> dict[str, str]:
+    text = read_secret_file(cid, entry)
+    if as_env:
+        return {as_env: text.strip()}
+    values = {}
+    for line in text.splitlines():
+        m = ENV_LINE.match(line)
+        if m:
+            raw = m.group(2).strip()
+            try:
+                parts = shlex.split(raw)
+                values[m.group(1)] = parts[0] if parts else ""
+            except ValueError:
+                values[m.group(1)] = raw
+    if not values:
+        raise Problem(f"{cid}: {storage_file(entry)} holds no KEY=VALUE lines; pass --env NAME for a raw token file")
+    missing = [k for k in (entry.get("storage") or {}).get("keys", []) if k not in values]
+    if missing:
+        raise Problem(f"{cid}: {storage_file(entry)} lacks {', '.join(missing)}")
+    return values
+
+
+class Redactor:
+    def __init__(self, secrets: dict[str, str]):
+        # longest first, so a value containing another is replaced whole; very short values are not secrets
+        self.pairs = sorted(((v, cid) for v, cid in secrets.items() if len(v) >= 6), key=lambda p: -len(p[0]))
+
+    def __call__(self, text: str) -> str:
+        for value, cid in self.pairs:
+            text = text.replace(value, f"<redacted:{cid}>")
+        return text
+
+
+def secret_values(cid: str, entry: dict) -> dict[str, str]:
+    try:
+        text = read_secret_file(cid, entry)
+    except Problem:
+        return {}
+    out = {text.strip(): cid}
+    for line in text.splitlines():
+        m = ENV_LINE.match(line)
+        if m:
+            raw = m.group(2).strip().strip("'\"")
+            if m.group(1).upper().endswith(("KEY", "TOKEN", "PASSWORD", "SECRET")):
+                out[raw] = cid
+    return out
+
+
+# ---- live checks ----------------------------------------------------------------------------------------
+
+def http_json(url: str, headers: dict, insecure: bool) -> tuple[int, dict | None]:
+    ctx = ssl._create_unverified_context() if insecure else None
+    req = urllib.request.Request(url, headers=headers)
+    try:
+        with urllib.request.urlopen(req, timeout=15, context=ctx) as res:
+            return res.status, json.loads(res.read() or b"null")
+    except urllib.error.HTTPError as e:
+        return e.code, None
+    except (urllib.error.URLError, OSError) as e:
+        raise Problem(f"cannot reach {url.split('/api')[0]}: {getattr(e, 'reason', e)}", 1)
+
+
+def live_check(cid: str, entry: dict) -> tuple[str, str]:
+    kind = entry.get("type")
+    if kind == "gitea-token":
+        token = read_secret_file(cid, entry).strip()
+        url = (entry.get("target") or "").rstrip("/")
+        code, me = http_json(f"{url}/api/v1/user", {"Authorization": f"token {token}"}, insecure=False)
+        if code != 200 or not me:
+            return "failed", f"{url} answered {code} to /api/v1/user"
+        return "ok", f"acts as {me.get('login')}"
+    if kind == "ssh-key":
+        path = storage_file(entry)
+        done = subprocess.run(["ssh-keygen", "-y", "-P", "", "-f", str(path)], capture_output=True, text=True)
+        return ("ok", "private key loads (no passphrase)") if done.returncode == 0 else ("failed", "ssh-keygen cannot load it")
+    if kind == "sudo-password" and (entry.get("storage") or {}).get("kind") == "ansible-vault":
+        storage = entry["storage"]
+        if not Path(storage.get("vault_password_file", "")).expanduser().exists():
+            return "failed", "the vault password file is missing"
+        return "skipped", "kept in an Ansible vault; verified by the operation that becomes root"
+    return "skipped", "no live check for this type"
+
+
+# ---- commands -------------------------------------------------------------------------------------------
+
+def emit(value) -> None:
+    print(json.dumps(value, indent=1, sort_keys=True))
+
+
+def cmd_list(inv: Inventory, args) -> int:
+    creds = inv.load()["credentials"]
+    if args.json:
+        emit({cid: {k: e.get(k) for k in ("type", "account", "target", "status", "purpose", "verified")} for cid, e in creds.items()})
+        return 0
+    if not creds:
+        print(f"no credentials in {inv.path}")
+    for cid, e in sorted(creds.items()):
+        ver = e.get("verified") or {}
+        print(f"{cid:28} {e.get('type', '?'):13} {e.get('status', '?'):8} as {e.get('account', '?')} @ {e.get('target', '?')}")
+        print(f"{'':28} {e.get('purpose', '')}  [verified {ver.get('result', 'never')} {ver.get('at', '')}]")
+    return 0
+
+
+def cmd_show(inv: Inventory, args) -> int:
+    entry = inv.get(args.id)
+    emit({"id": args.id, **entry, "storage_state": storage_state(entry), "uses": len(inv.usage(args.id)),
+          "last_use": (inv.usage(args.id) or [None])[-1]})
+    return 0
+
+
+def storage_from(args) -> dict | None:
+    if args.file:
+        s = {"kind": "file", "path": str(Path(args.file).expanduser().absolute())}
+    elif args.vault:
+        file, _, key = args.vault.partition(":")
+        s = {"kind": "ansible-vault", "file": file, "key": key, "vault_password_file": args.vault_password_file}
+    elif args.external:
+        s = {"kind": "external", "where": args.external}
+    else:
+        return None
+    if args.keys:
+        s["keys"] = args.keys.split(",")
+    return s
+
+
+def cmd_register(inv: Inventory, args) -> int:
+    existing = inv.load()["credentials"].get(args.id)
+    if existing is None and not (args.type and args.account):
+        raise Problem("a new entry needs --type and --account", 2)
+    entry = inv.update(args.id, type=args.type, service=args.service, target=args.target, account=args.account,
+                       purpose=args.purpose, owner=args.owner, consumers=args.consumer or None, storage=storage_from(args),
+                       created=args.created, expires=args.expires, status=args.status or (None if existing else "active"),
+                       notes=args.notes)
+    emit({"id": args.id, **entry, "storage_state": storage_state(entry)})
+    return 0
+
+
+def cmd_import(inv: Inventory, args) -> int:
+    source = Path(args.source).expanduser()
+    if not source.is_file():
+        raise Problem(f"{source} is not a file")
+    target = inv.path.parent / "secrets" / args.id
+    target.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    if target.exists() and target.read_bytes() != source.read_bytes() and not args.replace:
+        raise Problem(f"{target} exists with other content; pass --replace to replace it (the old one is kept as .previous)")
+    if target.exists() and args.replace:
+        shutil.copy2(target, target.with_suffix(".previous"))
+    fd = os.open(target, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "wb") as out:
+        out.write(source.read_bytes())
+    args.file, args.vault, args.external = str(target), None, None
+    return cmd_register(inv, args)
+
+
+def cmd_check(inv: Inventory, args) -> int:
+    entry = inv.get(args.id)
+    state = storage_state(entry)
+    if state.get("checkable", True) and not state.get("exists"):
+        result, detail = "failed", f"{state.get('path')} does not exist"
+    elif state.get("checkable", True) and not state.get("readable"):
+        result, detail = "failed", f"{state.get('path')} is not readable by {pwd.getpwuid(os.getuid()).pw_name}"
+    else:
+        try:
+            result, detail = live_check(args.id, entry)
+        except Problem as p:
+            result, detail = "failed", str(p)
+    if result != "skipped":
+        inv.update(args.id, verified={"at": now(), "result": result, "detail": detail})
+    if args.operation or result != "skipped":
+        inv.record_use(args.id, operation=args.operation or "check", run=args.run, result=f"check {result}", detail=detail)
+    emit({"id": args.id, "result": result, "detail": detail, "storage_state": state})
+    return 0 if result in ("ok", "skipped") else 1
+
+
+def cmd_path(inv: Inventory, args) -> int:
+    entry = inv.get(args.id)
+    path = storage_file(entry)
+    if path is None or not path.exists():
+        raise Problem(f"{args.id}: no file at its storage reference ({storage_state(entry)})")
+    if not os.access(path, os.R_OK):
+        raise Problem(f"{args.id}: {path} is not readable by {pwd.getpwuid(os.getuid()).pw_name}")
+    print(path)
+    return 0
+
+
+def pump(stream, out, redact) -> None:
+    for line in iter(stream.readline, ""):
+        out.write(redact(line))
+        out.flush()
+
+
+def cmd_exec(inv: Inventory, args) -> int:
+    ids = [i for i in args.ids.split(",") if i]
+    if args.env and len(ids) != 1:
+        raise Problem("--env names the variable of one raw credential file", 2)
+    command = args.command
+    if not command:
+        raise Problem("nothing to run after --", 2)
+    env, secrets = dict(os.environ), {}
+    for cid in ids:
+        entry = inv.get(cid)
+        env.update(env_values(cid, entry, args.env))
+        secrets.update(secret_values(cid, entry))
+    redact = Redactor(secrets)
+    try:
+        proc = subprocess.Popen(command, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, errors="replace")
+    except OSError as e:
+        raise Problem(f"cannot start {command[0]}: {e}", 1)
+    threads = [threading.Thread(target=pump, args=(proc.stdout, sys.stdout, redact)),
+               threading.Thread(target=pump, args=(proc.stderr, sys.stderr, redact))]
+    for t in threads:
+        t.start()
+    code = proc.wait()
+    for t in threads:
+        t.join()
+    for cid in ids:
+        inv.record_use(cid, operation=args.operation or "exec", run=args.run, requester=args.requester,
+                       remote_account=inv.get(cid).get("account"), command=os.path.basename(command[0]),
+                       result="ok" if code == 0 else f"exit {code}")
+    return code
+
+
+def cmd_use(inv: Inventory, args) -> int:
+    entry = inv.get(args.id)
+    inv.record_use(args.id, operation=args.operation, run=args.run, requester=args.requester,
+                   remote_account=args.remote_account or entry.get("account"), target=args.target, result=args.result,
+                   detail=args.detail)
+    return 0
+
+
+def cmd_copy(inv: Inventory, args) -> int:
+    entry = inv.get(args.id)
+    copies = [c for c in entry.get("copies") or [] if not (c.get("host") == args.host and c.get("path") == args.path)]
+    copies.append({"host": args.host, "path": args.path, "by": args.by, "at": now(), "consumer": args.consumer})
+    emit({"id": args.id, "copies": inv.update(args.id, copies=copies)["copies"]})
+    return 0
+
+
+def cmd_status(inv: Inventory, args) -> int:
+    inv.get(args.id)
+    entry = inv.update(args.id, status=args.status, status_reason=args.reason)
+    emit({"id": args.id, "status": entry["status"], "note": "local bookkeeping only: nothing was revoked at the service"})
+    return 0
+
+
+def cmd_usage(inv: Inventory, args) -> int:
+    for row in inv.usage(args.id)[-args.last:]:
+        print(json.dumps(row, sort_keys=True))
+    return 0
+
+
+def main(argv: list[str] | None = None) -> int:
+    p = argparse.ArgumentParser(prog="agdev-cred", description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    p.add_argument("--inventory", help="the inventory file (default <root>/config/credentials.json)")
+    sub = p.add_subparsers(dest="cmd", required=True)
+    ls = sub.add_parser("list"); ls.add_argument("--json", action="store_true")
+    sh = sub.add_parser("show"); sh.add_argument("id")
+
+    def meta(sp):
+        sp.add_argument("id")
+        sp.add_argument("--type", choices=TYPES)
+        sp.add_argument("--service", help="what it authenticates to (gitea, slack, ssh, sudo, claude, …)")
+        sp.add_argument("--target", help="the host or service URL")
+        sp.add_argument("--account", help="the account it authenticates as at the target")
+        sp.add_argument("--purpose")
+        sp.add_argument("--owner", help="who is responsible for it")
+        sp.add_argument("--consumer", action="append", help="an operation or service that uses it (repeatable)")
+        sp.add_argument("--keys", help="KEY,KEY a KEY=VALUE file must hold")
+        sp.add_argument("--created", help="creation time, only when known")
+        sp.add_argument("--expires")
+        sp.add_argument("--status", choices=STATUSES)
+        sp.add_argument("--notes")
+        sp.add_argument("--vault-password-file", default="~/.ansible/vault_pass.txt")
+
+    rg = sub.add_parser("register"); meta(rg)
+    where = rg.add_mutually_exclusive_group()
+    where.add_argument("--file", help="the existing file that holds it (it stays where it is)")
+    where.add_argument("--vault", metavar="VAULTFILE:KEY", help="an Ansible vault file and the variable in it")
+    where.add_argument("--external", metavar="TEXT", help="kept by something else (a keychain, a login); a description")
+    im = sub.add_parser("import"); meta(im)
+    im.add_argument("--from", dest="source", required=True); im.add_argument("--replace", action="store_true")
+    ck = sub.add_parser("check"); ck.add_argument("id"); ck.add_argument("--operation"); ck.add_argument("--run")
+    pa = sub.add_parser("path"); pa.add_argument("id")
+    ex = sub.add_parser("exec"); ex.add_argument("ids"); ex.add_argument("--env", help="put a raw token file into this variable")
+    ex.add_argument("--operation"); ex.add_argument("--run"); ex.add_argument("--requester")
+    us = sub.add_parser("use"); us.add_argument("id"); us.add_argument("--operation", required=True)
+    us.add_argument("--result", required=True); us.add_argument("--run"); us.add_argument("--requester")
+    us.add_argument("--remote-account"); us.add_argument("--target"); us.add_argument("--detail")
+    cp = sub.add_parser("copy"); cp.add_argument("id"); cp.add_argument("--host", required=True)
+    cp.add_argument("--path", required=True); cp.add_argument("--by"); cp.add_argument("--consumer")
+    st = sub.add_parser("status"); st.add_argument("id"); st.add_argument("status", choices=STATUSES)
+    st.add_argument("--reason", required=True)
+    ug = sub.add_parser("usage"); ug.add_argument("id", nargs="?"); ug.add_argument("--last", type=int, default=50)
+    argv = list(sys.argv[1:] if argv is None else argv)
+    command = argv[argv.index("--") + 1:] if "--" in argv else []
+    args = p.parse_args(argv[:argv.index("--")] if "--" in argv else argv)
+    args.command = command
+    try:
+        inv = Inventory(Path(args.inventory) if args.inventory else installation_root() / "config" / "credentials.json")
+        return {"list": cmd_list, "show": cmd_show, "register": cmd_register, "import": cmd_import, "check": cmd_check,
+                "path": cmd_path, "exec": cmd_exec, "use": cmd_use, "copy": cmd_copy, "status": cmd_status,
+                "usage": cmd_usage}[args.cmd](inv, args)
+    except Problem as problem:
+        print(f"agdev-cred: {problem}", file=sys.stderr)
+        return problem.code
+
+
+if __name__ == "__main__":
+    sys.exit(main())

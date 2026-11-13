@@ -1,0 +1,51 @@
+# Workflow definition (ag.workflow.v2). Edit here or in the workflow editor.
+
+schema: ag.workflow.v2
+id: freework
+name: Free work
+intent: |-
+  Serve the person's request starting from their braindump and one conversation.
+  Work out what to do, add that work to the run as nodes of its own, do it there,
+  and talk with the person whenever that helps, until the request is served.
+documentation:
+  policy: custom
+  plan: false
+  reports: false
+  final: true
+execution:
+  agent: agdev-agent
+  profile: sonnet
+  guides: []
+intake:
+  zulip: requests
+repositories:
+  project: {path: ., access: editable}
+nodes:
+  talk:
+    type: talk
+    name: Talk
+    description: Understand the request and hold the consultation it needs. The work itself is added as nodes of its own and done there, not in this talk.
+    repositories: []
+  workflow__talk:
+    type: workflow__talk
+    name: Discuss the workflow
+    description: |-
+      Before substantive work, build the actual run graph: add suitable work nodes with wfe run adjust (wfe run help adjust; wfe run nodes <run> shows the catalog).
+      Present that recorded graph to the Developer, or to the agent that entrusted this run, and ask for agreement on the work, its order, intended results and checks. Keep that invitation visible even when you can proceed without waiting. A prose plan alone is not the graph.
+      Use the run's delivery route for the presentation and wfe run ask when an answer is needed; record answers and changes against this run. Do not claim agreement without an answer.
+      Agreement records direction, not permission to execute. An already authorized task need not wait for another approval. Start and perform the work on its own nodes, not inside talk or workflow__talk; revise the graph when the work changes.
+      When presenting the graph, mention the placeholder node, discuss with the requester what runs at that position, and after agreement replace the placeholder with the actual nodes via wfe run adjust at the same position.
+    repositories: []
+  placeholder:
+    type: do
+    name: Placeholder
+    appearance: {icon: flag, color: slate}
+    description: "A stand-in for work whose actual nodes are not decided yet. Do not perform work here. It is mentioned in the workflow_talk node, where the requester and the agent settle what really runs at this position. When the workflow is agreed, replace this node with the actual nodes using wfe run adjust --definition (remove the placeholder, add the nodes with the same dependencies, keeping edges to and from the position), recording the reason. If it is still pending when execution reaches it, do not run it: settle the workflow first (ask the requester) or, if truly nothing is needed, complete it with an outcome starting 'Dropped:' with the reason."
+    repositories: []
+    template:
+      id: placeholder
+      revision: 1
+      expectation: When part of a workflow can only be fixed after discussing it with the requester (what to do there depends on the talk), I expect a placeholder node at that position, named in the workflow_talk node, instead of guessing nodes up front. After agreement the placeholder is replaced by the actual nodes in the same position.
+edges:
+  - {from: talk, to: workflow__talk}
+  - {from: workflow__talk, to: placeholder}

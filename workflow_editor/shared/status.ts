@@ -1,0 +1,218 @@
+// A run's status as people read it (project_migration p8 ex1): one short
+// state, one short reason, and the waits behind them, derived from the
+// record's work, control and execution facts and — where the reader has
+// them — the execution host's queue and a child's current situation. No
+// second status ledger: every word here is recomputed from those facts, and
+// the full sentences (a hold's reason, a wait's reason) stay available as
+// detail. Shared by the service, the CLI, the browser and the Front Desk.
+import type { Delegation } from './delegation.ts'
+import { isAwaitingPerson, reviewStateText } from './humanReview.ts'
+import { dueReason, expectationStates, type HoldCause, type RunState } from './run.ts'
+
+export type StatusState =
+  | 'working' | 'stopping' // an attempt is open
+  | 'waiting' // the next move is someone else's: a person, a child run, an external result
+  | 'queued' | 'due' | 'stalled' // the next move is the executor's: queued, owed (host facts unknown), owed with nothing queued
+  | 'paused' | 'interrupted' | 'unknown' // held
+  | 'failed' | 'done' | 'cancelled' | 'not-started' | 'idle'
+  | 'listening' | 'suspended' | 'closed' // p18: a standing conductor at rest (open for input, facilitation ended, room closed)
+
+// One thing the run waits on. `kind` person: a question; delegation: a child
+// run's work; external: a named result. `text` is the short form, `detail`
+// the record's own words, `condition` what continues it.
+export interface StatusWait {
+  node: string
+  kind: 'person' | 'review' | 'delegation' | 'external' // review (p17): a human review round
+  target: string
+  text: string
+  condition: string
+  detail: string
+  child?: { project: string; workflow: string; run: string | null; state: string | null }
+}
+
+export interface RunStatus {
+  state: StatusState
+  label: string // Waiting, Queued, Paused, Interrupted, …
+  reason: string // the short reason
+  text: string // `${label} · ${reason}`
+  tone: 'working' | 'waiting' | 'queued' | 'held' | 'warn' | 'done' | 'muted'
+  waits: StatusWait[]
+  hold?: { kind: string; cause: HoldCause | null; reason: string; since: string; by: string }
+  detail: string | null // the full sentence behind the reason, when there is one
+}
+
+// What the reader knows beyond the record. `job`: the run's queued or
+// claimed job on its execution host (null: none; undefined: not known).
+// `children`: a delegation's child as read now (keyed by delegation id).
+// `person`: whose answers read as "Your answer". `names`: node labels.
+export interface StatusFacts {
+  // `decision` (improve_wfrun p4): how the queued job is admitted — start
+  // (warden decided), defer (deferred; `deferUntil`), null: awaiting warden's
+  // decision; absent: the host has no coordination (admitted as queued).
+  job?: { state: 'queued' | 'claimed'; reason?: string; decision?: 'start' | 'defer' | null; deferUntil?: string | null; deferReason?: string | null } | null
+  children?: Record<string, { situation: string | null; hold?: string | null; execution?: string | null; run?: string | null }>
+  person?: string | null
+  names?: Record<string, string>
+}
+
+const cap = (s: string) => s ? s[0].toUpperCase() + s.slice(1) : s
+const list = (xs: string[]) => xs.length <= 2 ? xs.join(' and ') : `${xs.slice(0, -1).join(', ')} and ${xs.at(-1)}`
+const short = (s: string, n = 80) => (s.length > n ? `${s.slice(0, n - 1).trimEnd()}…` : s)
+
+// A hold's cause in a few words. Holds recorded before causes existed are
+// read from their sentence as far as it says.
+export function causeText(cause: HoldCause | null | undefined, reason = '', names: Record<string, string> = {}): string {
+  const named = (ids: string[]) => list(ids.map(id => names[id] ?? id))
+  const nodes = (ids: string[], what: string) => ids.length === 1 ? `${cap(named(ids))} node ${what}` : `${cap(named(ids))} ${what}`
+  if (cause) {
+    switch (cause.code) {
+      case 'left-running': return `${nodes(cause.nodes, 'left running at exit')}`
+      case 'left-ready': return `${nodes(cause.nodes, 'left ready at exit')}, nothing waiting`
+      case 'left-examples': return `${cap(named(cause.nodes))} not specialized at exit`
+      case 'nothing-recorded': return 'Ended with none of its work recorded'
+      case 'missed-event': return `${cause.events.map(e => `${e.type === 'completed' ? 'Result' : cap(e.type)} of ${e.delegation}`).join(', ')} not taken up`
+      case 'process': return cap(short(cause.detail, 70))
+      case 'lost': return 'Process lost; outcome unconfirmed'
+    }
+  }
+  let m = /exited with (.+?) recorded as running/.exec(reason)
+  if (m) return nodes(m[1].split(', '), 'left running at exit')
+  m = /exited with (.+?) ready and nothing waiting/.exec(reason)
+  if (m) return `${nodes(m[1].split(', '), 'left ready at exit')}, nothing waiting`
+  if (/without taking up delegation event/.test(reason)) return 'Delegation fact not taken up'
+  if (/process was gone|not known/.test(reason)) return 'Process lost; outcome unconfirmed'
+  return reason ? cap(short(reason.replace(/^the executor /, ''), 70)) : 'Attempt ended with work unfinished'
+}
+
+function childWords(state: string | null | undefined, hold?: string | null): string | null {
+  if (hold === 'stopped') return 'paused by its person'
+  if (hold === 'interrupted' || hold === 'unknown') return 'interrupted'
+  switch (state) {
+    case 'executing': return 'working'
+    case 'stopping': return 'stopping'
+    case 'awaiting-person': return 'waiting for an answer'
+    case 'awaiting-review': return 'awaiting a human review'
+    case 'awaiting-delegation': return 'waiting for its own delegation'
+    case 'awaiting-external': return 'waiting for an external result'
+    case 'due': return 'continuing'
+    case 'not-started': return 'queued to start'
+    case 'completed': return 'done'
+    case 'cancelled': return 'cancelled'
+    case 'stopped': return 'paused by its person'
+    case 'interrupted': return 'interrupted'
+    case 'unknown': return 'interrupted (process lost)'
+    default: return null
+  }
+}
+
+// The child of a delegation as its own facts relayed to the parent say,
+// without reading it: a recorded hold not resumed since.
+function relayedChild(d: Delegation): { hold: string | null } {
+  let hold: string | null = null
+  for (const e of d.events) {
+    if (e.type === 'held') hold = e.hold ?? 'interrupted'
+    if (e.type === 'resumed') hold = null
+  }
+  return { hold }
+}
+
+export function waitsOf(s: Pick<RunState, 'nodes' | 'questions' | 'delegations' | 'execution' | 'input'> & Partial<Pick<RunState, 'reviews'>>, facts: StatusFacts = {}): StatusWait[] {
+  const person = facts.person ?? s.input.author ?? s.input.onBehalfOf ?? null
+  const out: StatusWait[] = []
+  for (const w of s.execution.waiting) {
+    const n = s.nodes[w.node]
+    const detail = n?.wait?.reason ?? ''
+    if ('question' in w.on) {
+      const q = s.questions[w.on.question]
+      const to = q?.to ?? w.holder
+      out.push({ node: w.node, kind: 'person', target: to, text: person && to === person ? 'Your answer' : `Answer from ${to}`, condition: 'an answer continues it', detail: q ? `${q.id}: ${short(q.text, 160)}` : detail })
+    } else if ('delegation' in w.on) {
+      const d = s.delegations?.[w.on.delegation]
+      const target = d ? `${d.target.project} ${d.target.workflow}` : w.holder
+      const now = d ? facts.children?.[d.id] : undefined
+      const words = d ? childWords(now?.situation, now?.hold ?? relayedChild(d).hold) : null
+      const troubled = !!words && /interrupted|paused|stopping|cancelled/.test(words)
+      out.push({
+        node: w.node, kind: 'delegation', target, text: `${target} result${troubled ? ` (child ${words})` : ''}`,
+        condition: 'the child\'s question or result continues it', detail: `${detail}${words ? `; the child is ${words}` : ''}`,
+        ...(d ? { child: { project: d.target.project, workflow: d.target.workflow, run: d.child?.run ?? null, state: words } } : {}),
+      })
+    } else if ('review' in w.on) {
+      const r = s.reviews?.[w.on.review]
+      const open = !r || isAwaitingPerson(r)
+      const who = r?.reviewer ?? w.holder
+      out.push({ node: w.node, kind: 'review', target: open ? who : 'WFE', text: open ? (person && who === person ? 'Your review' : `Review by ${who}`) : r ? reviewStateText(r) : 'Human review', condition: open ? 'the person starts the review and approves or requests changes' : 'WFE stops what the review started', detail: r ? `${r.id}: ${r.summary.replace(/\s+/g, ' ').slice(0, 160)}` : detail })
+    } else {
+      const deadline = n?.wait?.deadline
+      const over = deadline && Date.parse(deadline) < Date.now()
+      out.push({ node: w.node, kind: 'external', target: w.on.external, text: `${short(detail || w.on.external, 60)}${over ? ' (overdue)' : ''}`, condition: `the result ${w.on.external} continues it${deadline ? `, expected by ${deadline}` : ''}`, detail: `${detail} (${w.holder})` })
+    }
+  }
+  return out
+}
+
+// What a standing run holds for an explicit resume (p18), as detail.
+const heldDetail = (s: Partial<Pick<RunState, 'standing'>>): string | null => s.standing?.held.length ? `Held until the person resumes: ${s.standing.held.join(', ')}` : null
+
+const status = (state: StatusState, label: string, reason: string, tone: RunStatus['tone'], waits: StatusWait[], extra: Partial<RunStatus> = {}): RunStatus =>
+  ({ state, label, reason, text: `${label} · ${reason}`, tone, waits, detail: null, ...extra })
+
+export function runStatus(s: Pick<RunState, 'nodes' | 'questions' | 'delegations' | 'execution' | 'control' | 'cancelled' | 'decisions' | 'instructions' | 'input'> & Partial<Pick<RunState, 'reviews' | 'corrections' | 'standing' | 'definition'>>, facts: StatusFacts = {}): RunStatus {
+  const waits = waitsOf(s, facts)
+  const names = facts.names ?? {}
+  const ctl = s.control
+  if (s.cancelled) return status('cancelled', 'Cancelled', short(s.cancelled.reason), 'muted', [], { detail: s.cancelled.reason })
+  if (ctl.attempt) {
+    if (ctl.stop) return status('stopping', 'Stopping', `Stop requested by ${ctl.stop.by}`, 'warn', waits, { detail: ctl.stop.reason })
+    const doing = s.execution.active.map(id => names[id] ?? id)
+    return status('working', 'Working', doing.length ? `On ${list(doing)}` : 'Between steps', 'working', waits)
+  }
+  if (ctl.hold) {
+    const h = ctl.hold
+    const hold = { kind: h.kind, cause: h.cause ?? null, reason: h.reason, since: h.since, by: h.by }
+    if (h.kind === 'stopped') return status('paused', 'Paused', short(h.reason) || `by ${h.by}`, 'held', waits, { hold, detail: `Stopped by ${h.by}: ${h.reason}` })
+    return status(h.kind === 'unknown' ? 'unknown' : 'interrupted', h.kind === 'unknown' ? 'Unknown' : 'Interrupted', causeText(h.cause, h.reason, names), 'held', waits, { hold, detail: h.reason })
+  }
+  // p18: a standing conductor whose room is closed is finalized until it reopens.
+  if (s.execution.state === 'completed' && s.standing?.state === 'closed') return status('closed', 'Closed', 'Conversation closed; reopening continues this run', 'done', [], { detail: heldDetail(s) })
+  if (s.execution.state === 'completed') {
+    const d = s.decisions.at(-1)?.decision
+    // improve_wfnode p1: finished work does not make a required expectation met.
+    const unmet = s.definition ? expectationStates({ definition: s.definition, nodes: s.nodes }).filter(x => x.strength === 'required' && x.status === 'unmet') : []
+    const reason = d === 'accepted' ? 'Result accepted' : d === 'rejected' ? 'Result rejected' : 'Every step completed'
+    if (unmet.length) return status('done', 'Done', `${reason}; required unmet: ${list(unmet.map(x => `${x.label} on ${names[x.node] ?? x.node}`))}`, 'warn', [])
+    return status('done', 'Done', reason, 'done', [])
+  }
+  const due = dueReason(s)
+  if (facts.job) {
+    const j = facts.job
+    if (j.state === 'claimed') return status('queued', 'Starting', 'Its execution node took the job', 'queued', waits, { detail: due ?? j.reason ?? null })
+    // improve_wfrun p4: what the job waits for is warden's decision, not a slot.
+    if (j.decision === 'defer') return status('queued', 'Deferred', `By coordination${j.deferUntil ? `, until ${j.deferUntil.replace(/\.\d{3}Z$/, 'Z')}` : ''}${j.deferReason ? `: ${short(j.deferReason, 60)}` : ''}`, 'queued', waits, { detail: j.deferReason ?? due ?? j.reason ?? null })
+    if (j.decision === 'start') return status('queued', 'Queued', 'Starts when its execution node next claims', 'queued', waits, { detail: due ?? j.reason ?? null })
+    if (j.decision === null) return status('queued', 'Queued', 'Awaiting coordination\'s decision', 'queued', waits, { detail: due ?? j.reason ?? null })
+    return status('queued', 'Queued', 'Waiting for its execution node', 'queued', waits, { detail: due ?? j.reason ?? null })
+  }
+  if (s.execution.state === 'not-started') return facts.job === null ? status('stalled', 'Not started', 'Nothing is queued to start it', 'warn', waits) : status('not-started', 'Not started', 'Waiting to be started', 'muted', waits)
+  if (due) return facts.job === null
+    ? status('stalled', 'Stalled', `${cap(due)}; nothing queued to continue it`, 'warn', waits, { detail: due })
+    : status('due', 'Continuing', cap(due), 'queued', waits, { detail: due })
+  // p17: everything but human reviews is done: the agent's work is
+  // complete, and the run is not (its review is the person's).
+  if (waits.length && waits.every(w => w.kind === 'review') && Object.entries(s.nodes).every(([id, n]) => n.state === 'completed' || n.state === 'cancelled' || waits.some(w => w.node === id))) {
+    const open = waits.filter(w => w.target !== 'WFE')
+    return status('waiting', 'Work complete', open.length ? `Awaiting human review${waits.length > 1 ? ` (${waits.length} rounds)` : ''}` : waits[0].text, open.length ? 'waiting' : 'queued', waits, { detail: waits.map(w => w.detail).join('; ') })
+  }
+  if (waits.length) {
+    const order = ['person', 'review', 'delegation', 'external']
+    const first = [...waits].sort((a, b) => order.indexOf(a.kind) - order.indexOf(b.kind))[0]
+    const more = waits.length - 1
+    return status('waiting', 'Waiting', `${first.text}${more ? ` (+${more} more)` : ''}`, 'waiting', waits, { detail: waits.map(w => w.detail).join('; ') })
+  }
+  // p18: at rest between turns — not work, not stalled, no slot.
+  if (s.execution.state === 'idle') return s.standing?.state === 'open'
+    ? status('listening', 'Idle', 'Ready for the conversation\'s next message', 'muted', [], { detail: heldDetail(s) })
+    : status('suspended', 'Suspended', 'Facilitation ended; nothing unsolicited comes to it', 'muted', [], { detail: heldDetail(s) })
+  if (s.execution.failed.length) return status('failed', 'Failed', `${list(s.execution.failed.map(id => names[id] ?? id))} failed`, 'warn', [], { detail: s.execution.failed.map(id => s.nodes[id]?.failure?.reason ?? '').filter(Boolean).join('; ') || null })
+  return status('idle', 'Idle', 'Nothing to do now', 'muted', [])
+}

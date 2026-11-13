@@ -1,0 +1,1123 @@
+# Workflow run contract (`ag.workflow-run.v2`, p3/pre1, p4, p5)
+
+A **run** is one execution of a workflow: the input it was given, the fixed
+definition it follows, and a record of what the executor reported. It lives in
+devdocs beside the definitions and is version-controlled like them. The
+definition contract (`ag.workflow.v1`, approvals, validation) is in
+[contract.md](contract.md).
+
+A run record is an operational record. It says what the executor and the
+people involved recorded, in order. It is not authenticated or tamper-proof
+evidence, and `running` means "the executor reported that work started", not
+"a process is alive".
+
+**Every operation holds the run's lock** (p4, `server/lock.ts`): the read,
+the `--expect-seq` check, the transition and the atomic replacement of
+`run.json` happen under a cross-process lock, so the CLI, the service and the
+executor never lose each other's records. `--expect-seq` still refuses an
+operation based on an outdated view; the lock does not replace it. A
+retransmitted operation with the same `receipt` is not recorded twice.
+`run.json` is changed only through these operations; external edits of it are
+not a safe concurrent route (definitions and Markdown stay editable by hand,
+writers taking turns per file).
+
+## Where things live
+
+**A run the execution host performs lives in its own working copy (p9,
+[storage.md](storage.md)).** The tree below is read and written at that copy's
+documented path (`<project workspace>/.agdev/runs/<workflow>/<run>/source/`), on the run's
+branch `wfe/<project>/<workflow>/<run>`; the folder itself is durable, beside the tree, and outlives it
+(improve_wfrun p2). The project workspace holds runs
+recorded before p9 that were not migrated, and runs an IDE agent creates
+there with `wfe run create`. Every operation resolves the place first
+(`runSpace`). A run's folder that reaches the project's shared branch (an
+integration) is a snapshot; the copy's `run.json` stays the live record.
+
+```text
+devdocs/runs/<workflow-id>/<run-id>/
+  braindump.md          the person's own input (or request.md, see Input)
+  plan.md               the agreed plan (default policy: the _plan step's document)
+  report-<node>.md      a report per authored node (default policy)
+  report.md             the final report (default policy)
+  run.json              the record: current state and its history
+  context/
+    node-catalog.json   the person's node catalog as the run was given it (p7/ex1, catalog.md)
+  definition/
+    <workflow-id>.yaml  the run's workflow, copied byte for byte
+  …                     anything else the executor writes (manual policy: names are its choice)
+```
+
+The p3 layout (`devdocs/<workflow-id>/runs/<run-id>/`) and
+`ag.workflow-run.v1` records are not read or converted. A project that still
+has p3 run folders gets a `runs-old-layout` diagnostic; a v1 `run.json` in the
+new layout is shown as an unsupported schema, never as an empty listing.
+
+| Information | Authority |
+| --- | --- |
+| The person's words | `braindump.md` |
+| A request an agent constructed | `request.md` (+ `original-input.md` when given) |
+| How the work is approached | `plan.md` and reports — prose; the tools never parse it |
+| The executed definitions | `definition/*.yaml`, fixed for the run's lifetime |
+| Node states, questions, answers, relations, artifact references, acceptance, history | `run.json` |
+| Current editable definitions | `devdocs/workflows/*.yaml` (not the run's) |
+
+Every path in these files is project-relative POSIX or run-relative. Machine
+paths, credentials and local process details stay out; local execution
+settings belong in the workspace or run envelope beside the checkout, outside Git
+([storage.md](storage.md)).
+
+Saving a file never commits. The saved files are the current work record
+before any publication. A browser view follows saved files before any commit.
+
+A history view (`/at/<ref>`, `wfe run show --rev <ref>`, `?rev=` on the HTTP
+run and file endpoints) reads the run from a commit of the repository that
+owns devdocs, resolved by `server/devdocs.ts` ([contract.md](contract.md),
+*devdocs storage modes*): `<commit>` of that repository, or `root:<commit>`,
+a project root commit whose devdocs gitlink is followed in submodule mode.
+The view names the owning repository, the commit and, when followed, the root
+commit. Report and input files come from that same commit. Missing historical
+files never fall back to the working tree. Artifacts outside devdocs cannot
+be read from a devdocs commit; use the current run to read them.
+
+### Identifiers
+
+| Identifier | Pattern | Notes |
+| --- | --- | --- |
+| Workflow id, node id | `^[a-z0-9][a-z0-9_.-]{0,63}$` | from the definition contract |
+| Run id (= directory name) | `^run-[a-z0-9][a-z0-9_.-]{0,59}$` | `run-001`, `run-002`, … by default (next number after the highest `run-NNN`), or `run-<name>` |
+| Run reference | `<workflow-id>/<run-id>` | unique in a project; two invocations of one workflow have two run ids |
+| Run identity | project id + workflow id + run id | `run.json` names its `project`; a record naming another project is a `location` problem. Machine paths are never identifiers |
+| Question id | `^q[0-9]{1,6}$` | `q1`, `q2`, … in order of asking, per run |
+| History sequence | integer, 1, 2, 3, … | strictly increasing, no gaps |
+
+Timestamps are ISO 8601 UTC with milliseconds (`2026-10-10T12:34:56.789Z`,
+JavaScript `toISOString()`). They come from the writer's clock and are
+display facts only: nothing expires, fails or completes because of a time.
+
+**Creating a run never overwrites.** The run directory is created exclusively;
+an existing name is refused ("run-001 already exists") and nothing in it is
+changed. A name that does not match the pattern is refused before anything
+is written.
+
+## Input
+
+| Kind | File | Who wrote the words | Required facts |
+| --- | --- | --- | --- |
+| `braindump` | `braindump.md` | the person | `author` (the person's name) |
+| `request` | `request.md` | an agent, on someone's behalf | `requester` (the agent), `entrustedBy` (reference), optional `onBehalfOf` |
+
+`braindump.md` holds the person's own words. An agent that saves them is
+recorded as `recordedBy`; that does not make them an agent's request. An agent
+that writes its own request — rewording a person's input, or delegating — uses
+`request.md` and records the reference to what entrusted it: a run and node
+(`{kind: "run", workflow, run, node}`), a project file (`{kind: "file",
+path}`), or a free reference such as a conversation (`{kind: "note", text}`).
+An entrance for requests from external agents is not part of p4.
+A run records where its words were said as `input.source` (a conversation
+message, a submission, a delegation item, another installation's message)
+and `run.create` carries that entrance's receipt: the same input never
+creates a second run. Runs requested through the retired Zulip intake (p6
+until cluster_teamwork p5, [intake.md](intake.md)) keep `source {kind: zulip,
+realm, message, stream, topic, sender, senderName, at}` and the receipt
+`zulip:<realm>:<message id>`; they are read as recorded.
+When a derived request was built from a person's input, `--original <file>`
+keeps that input beside it as `original-input.md`. No tool writes a human
+author it was not given.
+
+## Definition snapshot
+
+At creation the workflow is read from `devdocs/workflows/`, validated with the
+editor's rules (errors refuse the run; warnings are kept as facts), and copied
+byte for byte to `definition/<id>.yaml`. The copy keeps layout, approvals and
+comments.
+
+**Which `devdocs/workflows/` (improve_wfrun p1).** A run in its own copy on a
+host with Gitea follows the project's **published source**: its default branch
+on Gitea, resolved once to a root commit with a fetch that succeeded now (or a
+root commit named at creation: a delegation's dispatched revision). The
+definition is read at that commit (devdocs at the root's pin when it is a
+submodule) and the copy starts from the same commit ([storage.md](storage.md)),
+so definition and code never come from two revisions. The registered
+workspace is not read for it, whatever it holds. A default branch that cannot
+be fetched refuses the run (`fetch-failed`); a workflow that is not on it
+refuses with `no workflow "…"`. A trial of editing content is the explicit
+exception: the workspace file's exact bytes on the published code.
+`run.json` `definition.source` says which:
+
+| `kind` | Fields | Meaning |
+| --- | --- | --- |
+| `published` | `project`, `selector` (`default-branch`/`commit`), `repository`, `branch`, `commit`, `definitions` (`path`, `repository`, `commit`), `fetch` | definition and code from that root commit |
+| `trial` | `workspace`, `file`, `sha256`, `head`, `dirty`, `baseline` (`project`, `repository`, `branch`, `commit`), `draft` (`id`, `revision`, `author`) | with `draft`: that saved draft revision's bytes ([drafts.md](drafts.md)). Otherwise the bytes of a workspace file (`wfe request --editing`; hash checked against what the person saw). Either way on the published code at `baseline`; uncommitted project code is not part of it |
+| `workspace` | `workspace`, `reason`, `head`, `branch`, `dirty` | a workspace's files: an IDE agent's `wfe run create` in the workspace, or a host without Gitea |
+
+A record without `definition.source` was created before p1. Its meaning is
+unchanged; nothing is rewritten.
+
+**Delegate nodes execute (p10).** A delegate node's work is entrusted to a
+run of another managed workflow — its `project`/`workflow` target — through
+`wfe delegate`: the parent records the dispatch, the child is an ordinary
+request run of the target workflow, and the parent completes the node only
+after judging the child's result. The relationship, its operations and who
+decides what are [delegation.md](delegation.md). (Until p10 a workflow with a
+delegate node was refused: `delegate-unsupported`.)
+
+`run.json` records, per bundled workflow: the bundle file, the source file it
+was copied from, `sha256` of the copied bytes, the semantic definition digest
+(`definitionDigest`, the same projection as definition approval), and the
+approval states at that moment. The byte digest is what reading checks: a
+bundle file that is missing or differs from its recorded `sha256` makes the
+record **inconsistent**.
+
+The bundle never changes. Later edits, renames or deletion of the source
+workflow do not change the run's graph. The run view shows the snapshot, its
+source, and compares it with this workspace's file (same definition, changed,
+renamed, deleted). A run on a changed definition is a new run (`--predecessor
+<run-ref>` records the link).
+
+**The effective graph is frozen (p5).** At creation the root workflow is
+compiled with its documentation policy (`shared/compile.ts`) and the result
+is recorded as `definition.effective` — compiler version, policy, nodes
+(generated steps with their purpose, document and instructions) and edges —
+in `run.create` and the state. Readiness, replay and every operation follow
+that graph. Reading checks it against the bundle: same policy, same authored
+nodes, edges between known nodes, and — when the recorded compiler is the
+current one — exactly what it compiles to; a disagreement makes the record
+unusable (`bundle`), never silently recompiled. A graph frozen by another
+compiler version is followed as recorded. A record without
+`definition.effective` was created before p5 and follows its authored graph
+(no generated steps); nothing converts it. A workflow the compiler refuses
+(no nodes, broken edges, an unknown policy) is refused at creation (422)
+before anything is written.
+
+Definition approval stays a statement about a definition. Its state is
+recorded and shown; it is not a gate, not permission to execute and not
+acceptance of a result.
+
+**The person's node catalog (p7/ex1).** Every entrance freezes the
+operating area's node catalog into `context/node-catalog.json` and records
+`context.catalog` (`supplied` with file, sha256, generation and count; or
+`unavailable` with the problem). An empty catalog is an explicit empty
+snapshot. Reading checks the file by hash, like the bundle. Each attempt is
+given this snapshot in its brief and records it in `attempt.begin`'s
+`settings.catalog`; a later catalog edit reaches new runs only. The input's
+`sha256` is recorded with it (what a request-sourced adjustment binds to).
+See [catalog.md](catalog.md).
+
+Repository context: at creation the record keeps, for the project root and
+each repository the bundled workflows bind, the checked-out commit, the branch
+and the number of uncommitted entries. That is context. It does not snapshot
+repository contents, and a commit hash does not include uncommitted files.
+
+## `run.json`
+
+```json
+{
+  "schema": "ag.workflow-run.v1",
+  "project": "rts-vs-bot",
+  "workflow": "build-game",
+  "run": "run-001",
+  "created": "2026-10-10T12:00:00.000Z",
+  "input": { "kind": "braindump", "file": "braindump.md", "author": "A. Person", "recordedBy": "Omni Agent" },
+  "executor": { "name": "Omni Agent", "backend": "claude-code / claude-opus-5-5" },
+  "predecessor": null,
+  "definition": {
+    "root": "build-game",
+    "workflows": {
+      "build-game": {
+        "file": "definition/build-game.yaml", "source": "devdocs/workflows/build-game.yaml",
+        "sha256": "…", "definitionDigest": "sha256:…",
+        "approvals": { "intent": "approved", "definition": "stale" }
+      }
+    },
+    "warnings": []
+  },
+  "context": { "repositories": [ { "path": ".", "head": "1ad073e…", "branch": "main", "dirty": 0 } ] },
+  "nodes": {
+    "survey": { "state": "completed", "updated": "…", "started": "…", "ended": "…",
+                "outcome": { "text": "…", "artifacts": ["devdocs/runs/build-game/run-001/report1.md"] },
+                "notes": [], "wait": null }
+  },
+  "questions": {},
+  "artifacts": [],
+  "decisions": [],
+  "cancelled": null,
+  "execution": { "state": "in-progress", "counts": { … }, "ready": [ … ], "blocked": [ … ] },
+  "started": "…", "ended": null, "updated": "…", "seq": 7,
+  "history": [ { "seq": 1, "at": "…", "by": "Omni Agent", "via": "cli", "op": "run.create", … } ]
+}
+```
+
+### One reducer, current state and history
+
+Every state-changing operation is one **history entry** (`seq`, `at`, `by`,
+`via`, `op`, its parameters, and the `change` it made). The current state is
+exactly what `shared/run.ts` `replay()` computes from the history and the
+bundled graph. An operation appends the entry and writes the replayed state
+in the same atomic replacement of `run.json`.
+
+Reading replays the history and compares it with the stored state. Missing,
+malformed or inconsistent records are visible errors — never an empty or
+successful run — and are never rewritten automatically: operations refuse a
+record that does not read cleanly. `wfe run check` names the difference. The
+CLI and the service use the same module, so they cannot disagree on rules.
+
+`via` is `cli` or `browser`. `by` is the declared actor; the browser asks for
+a name. Both are declarations, as approvers are. **Who records (p9):**
+
+- An executing attempt (`WFE_ATTEMPT` in its environment) records as the
+  run's agent, and refuses `--by` naming anyone else.
+- When the agent stops, resumes or cancels because of a person's answer or
+  instruction, it names those words with `because` (`--because
+  answer:<q>[:<n>]` or `instruction:<i>`). The reducer checks they exist and
+  records whose words they were, in the hold or cancellation too.
+- A control operation that carries an attempt id must be the open attempt's.
+- Outside an attempt, a run the execution host performs is recorded only
+  under a name given with `--by`. No default puts the agent's name on someone
+  else's act.
+- Runs an IDE agent performs itself keep the default, which is the run's
+  executor.
+- **An agent operating another run** (project_migration p8): an executing
+  attempt of run A that records on run B — instructs, answers, stops,
+  resumes, cancels or decides, as a person does from the run view — records
+  as A's agent (`by`), never as B's, and refuses `--by` naming anyone else.
+  The entry names the attempt as `operator: {run: <project>/<workflow>/<run>,
+  attempt}`; it is not B's fencing (`attempt`), so B's own execution reports
+  stay B's. Whose words the act carries is `--from` (answers, instructions)
+  or `--because`. An ended attempt records nothing.
+
+### Node states
+
+| State | Meaning | Entered by |
+| --- | --- | --- |
+| `pending` | Work has not started | creation |
+| `running` | The executor recorded that work started (reported progress, not process health) | `start` when ready; `start` again (resume) from `waiting` or `failed`; `take-up` |
+| `waiting` | Work awaits an identified answer or external result | `ask`, `wait` |
+| `completed` | The executor recorded completion with an outcome | `complete` from `running` |
+| `failed` | A recorded problem prevents continuation | `fail` from `running` or `waiting` |
+| `cancelled` | Work was explicitly discontinued (final) | `cancel` from `pending`, `running`, `waiting` or `failed`; run cancellation |
+
+- A node is **ready** when it is `pending` and every predecessor is
+  `completed`. Only a ready node can start. A join therefore waits for all of
+  its predecessors.
+- `failed` and `cancelled` never satisfy a dependency. A pending node behind
+  one is **blocked** (derived, shown, not stored as a state).
+- Resuming a `failed` node (`start`) needs a reason and is recorded as such;
+  nothing retries by itself.
+- `complete` needs an outcome text and may name artifacts.
+- `progress` adds a note to a `running` or `waiting` node without changing
+  its state. It updates the node's `updated` time.
+
+Independent branches may be performed one after another; nothing runs nodes
+by itself, and no timer changes a state.
+
+### Examples (improve_wfnode p1)
+
+An example ([contract.md](contract.md) *Examples*) is not work:
+
+- it stays `pending`, is never in `ready` or `blocked`, and `execution.counts` and the
+  work/documentation split leave it out; `execution.examples` lists those not yet
+  specialized, separately from work progress;
+- starting or cancelling it is refused (`example-not-executable`), which is a semantic
+  error and not a request for permission. So nothing can dispatch it, ask from it or complete it;
+- it gets no report step. What follows it waits for it, the final report included;
+- a run with one never reads as completed. With nothing else to do the run is
+  `in-progress` and owes a revision ([adjustments.md](adjustments.md) *Specializing
+  examples*). No human approval is involved;
+- an attempt that exits with nothing running, ready or waiting beside unresolved
+  examples is held as interrupted (cause `left-examples`), like work left ready.
+  The Observer and a recovery agent read it the same way.
+
+### Expectation assessments (improve_wfnode p1)
+
+A node's `expectations` ([contract.md](contract.md) *Expectations*) are frozen with the
+graph, with the meaning of each documented key in `effective.meanings`: later catalog,
+definition or code changes do not reword them for an existing run. Groups are frozen
+in `effective.groups` the same way.
+
+`wfe run expectation <run> <node> <key> met|unmet|unverified` (op
+`expectation.assess`) records one compact statement on the node record
+(`nodes.<id>.assessments.<key>`): status, note, evidence, who, when and whether an attempt
+recorded it (`reporter: agent`). A later statement replaces it; history keeps both.
+Evidence uses the same checked kinds as work recorded afterwards: files by hash, commits,
+history entries, and this run's presentations, outputs and questions.
+
+| Strength | Status | Reads |
+| --- | --- | --- |
+| any | none, or `unverified` | Unverified |
+| any | `met` (needs evidence or a note) | Met |
+| preferred | `unmet` (needs a note) | Alternative: the agent chose differently and said so |
+| required | `unmet` (needs a note) | Unmet |
+
+Neither attaching a key, nor an artifact, nor completing the node states anything.
+Strength gates nothing. A finished run with a required expectation unmet still
+completes, and its status says so (`Done · …; required unmet: Browser on show`, tone
+warn). There is no compliance engine and no report file per key. The CLI's `wfe run show`,
+the brief, the continuation and the run view read the same `expectationStates`.
+
+### Documentation steps (p5)
+
+Under the `default` policy the run has generated steps beside the authored
+nodes ([contract.md](contract.md), *Documentation policy*): `_plan`,
+`_report.<node>` and `_final-report`. They are nodes of the run: the same
+states, operations, attempt fencing, receipts, stops and resumption. An
+authored node's `completed` and its report's `running` are separate facts,
+and the run is `completed` only when `_final-report` is.
+
+| Step | Document | Completes when |
+| --- | --- | --- |
+| `_plan` (type talk) | `plan.md` | its document is checked **and** the latest question asked from `_plan` was asked about that same content and its answer was taken up (`agreement`) |
+| `_report.<node>` | `report-<node>.md` | its document is checked |
+| `_final-report` | `report.md` | its document is checked |
+
+- **Where documents go (tidy p1).** Every bootstrap brief names the run
+  folder as a path relative to the agent's working directory (the copy's
+  root), whatever the policy, and the document path of every documentation
+  step, including those not reached yet (`documentationBrief`). Before
+  this, a step's path was named only once it was ready, and a `manual` run
+  got none; "this run's folder" in a request or a node description was
+  resolved against the root about half the time (agops `recover`: 11 of 21
+  runs; protoprey `freework/run-003` replaced another run's root
+  `report.md`).
+
+- **Document evidence.** Before `complete` of a step (and `ask` from
+  `_plan`), the file layer (`server/runs.ts` `checkDocument`) requires the
+  document to be a regular, nonempty file of the run folder — not a
+  symbolic link, not resolving elsewhere — and passes `{path, sha256,
+  bytes}` to the reducer, which checks its shape and path and records it on
+  the node (`document`) and among the outcome's artifacts. Evidence offered
+  by a caller is discarded. File presence is not a claim that the prose is
+  right.
+- **Plan agreement.** A question from `_plan` records the plan.md it asked
+  about (`question.document`); the plan is therefore written before it is
+  consulted on. A revision is asked about again, and a later question
+  supersedes earlier answers. Completing `_plan` records which question
+  agreed (`agreement`, `--agreement` to name it). A withdrawal is not
+  agreement, and plan agreement is neither definition approval nor
+  acceptance of the result. Whether an answer *is* agreement is the
+  executor's reading of the person's words: taking it up and completing the
+  step is the executor's claim.
+- **Failure.** A failed or cancelled authored node blocks its report, its
+  successors and the final report, so the run cannot complete. A partial
+  report may be attached to the failed node (`attach --node`); it does not
+  complete a step. Nothing writes a report or a final report for the
+  executor.
+- **Interruption.** An attempt that ends while a report step is running is
+  interrupted like any other; after `run.resume` the next attempt continues
+  the report, and the completed work is not repeated.
+- The execution brief (`server/exec.ts` `documentationBrief`) names the
+  policy and, for each running, ready or waiting step, its purpose,
+  document and frozen instructions. Under `manual` (and in runs created
+  before p5) it says that no plan or report is asked unless a node or the
+  person asks.
+- Error codes: `document-missing`, `document-path`, `document-empty`,
+  `plan-not-agreed`.
+
+### Status in short (project_migration p8 ex1)
+
+`shared/status.ts` `runStatus()` is the one reading every view and API
+uses: a state, a label and a short reason (`text` = `label · reason`),
+the waits behind it each with its target and what continues it, the hold
+with its cause, and the full sentence as `detail`. It is recomputed from
+the record — and, where the reader has them, the execution host's job for
+the run, a child's current situation and node names — never stored.
+
+| Situation | Text (examples) |
+| --- | --- |
+| a question to the run's person | `Waiting · Your answer` (to someone else: `Waiting · Answer from <them>`) |
+| a delegation | `Waiting · jevlab study result`; a child known paused or interrupted is said in it (`… (child interrupted)`) |
+| an external wait | `Waiting · <its reason>` (`(overdue)` past its deadline) |
+| the executor's move, a job queued | `Queued · Awaiting warden's decision` / `Deferred · By warden, until …` / `Queued · Starts when its execution node next claims` (improve_wfrun p4; `Queued · Waiting for its execution node` without coordination), `Starting · Its execution node took the job` once claimed |
+| the executor's move, no host facts | `Continuing · Answer to q1 arrived`, `… Result from jevlab study arrived` |
+| the executor's move, nothing queued (host facts) | `Stalled · …; nothing queued to continue it` |
+| a person's stop | `Paused · <their recorded reason>` |
+| an interruption | `Interrupted · Talk node left running at exit` (from the hold's cause; older holds from their sentence) |
+| a lost process | `Unknown · Process lost; outcome unconfirmed` |
+| running | `Working · On <node>`; `Stopping · Stop requested by <who>` |
+| failed, done, cancelled | `Failed · <node> failed`, `Done · Every step completed` / `Result accepted`, `Cancelled · <reason>` |
+
+Several waits read as the first (a person's, then a delegation, then an
+external result) with `(+n more)`; each stays in `waits`. A hold is the
+status even while a question is also pending: an answer alone never
+resumes a held run. `Watching` is not used: nothing in WFE watches on a
+run's behalf.
+
+### Standing runs (workflow_editor p18)
+
+A conversation's conductor is **one run for the conversation's life**, not
+one run per response. Its record carries `standing` (absent on every other
+run) and its graph grows turn by turn:
+
+```json
+"standing": { "role": "conductor", "conversation": "<id>", "state": "open",
+              "since": "…", "seq": 41, "by": "conversation", "reason": "…",
+              "replaces": "ponderer/conduct/run-012",
+              "wakes": [ { "n": 3, "node": "ponder-w3", "seq": 57, "at": "…", "by": "conversation", "events": ["i7"] } ],
+              "held": ["i2", "d1#4"] }
+```
+
+| Fact | Meaning |
+| --- | --- |
+| execution `idle` | every node is completed and the run stands `open` or `suspended`: it **rests** between turns. Not completed, not stopped: no attempt, no slot, no polling turn. `ended` stays null. Situation `awaiting-input` (open), `suspended` (facilitation ended), `due` (an event no attempt was briefed with); status *Idle · Ready for the conversation's next message* / *Suspended · Facilitation ended…* |
+| `state: open` | the room is open and facilitated: its events continue the run |
+| `state: suspended` | facilitation ended: nothing unsolicited comes to it, its own asks and delegations still do; at rest it wakes for nothing |
+| `state: closed` | the room is closed: nothing continues it (a child's fact waits, `due` is not reported). At rest its execution is finalized as `completed` (status *Closed · …*); with work still open (an ask, a review, a delegation) it keeps waiting and nothing is asserted done |
+| `held` | events a transition found waiting — unacknowledged instructions and delegation facts not taken up — when the run was established for an existing conversation or its room reopened. They continue nothing until `standing.release` (the person's resume); an attempt that runs for another reason may read them, and missing them is no interruption |
+| `wakes` | each continuation from rest |
+| instruction `seen` | the attempt that began after the instruction arrived; once it ended the instruction is consumed, acknowledged or not, and wakes nothing again |
+| `replaces` | a cancelled conductor this one explicitly replaces; cancellation is never undone |
+
+Operations (all by WFE's conversation service, as the room changes; none
+from an attempt):
+
+| Operation | From → to |
+| --- | --- |
+| `run.create` with `standing: {conversation, replaces?}` | a new conductor: `open` |
+| `standing.establish {conversation, state, reason, replaces?}` | a run that did not stand: the conductor a conversation created from its attempt, or the p18 transition of an existing room. A completed run becomes `idle` (open/suspended); everything unacknowledged is held |
+| `standing.facilitate` | `suspended` → `open` (facilitation starts again) |
+| `standing.suspend` | `open` → `suspended` (facilitation ended) |
+| `standing.close` | `open`/`suspended` → `closed` |
+| `standing.reopen {state}` | `closed` → `open`/`suspended`; what waits is held |
+| `standing.release {events?}` | clears held events (all, or those named) |
+| `run.adjust` with `source: {kind: wake, events}` | the **wake**: only while the run stands `open`, nothing is ready or running and no attempt is open, for events it waits to be continued for (instructions not acknowledged, seen or held). It adds exactly one node (a `ponder` WFE appends) and changes nothing else |
+
+Each is refused on a cancelled run, and from a state it does not apply to
+(`standing-state`); a wake that does not qualify is refused
+(`standing-busy`, `standing-event`, `standing-none`). An ordinary run's
+completion is unchanged: nothing here applies to a run without `standing`.
+
+### Waiting
+
+A waiting node records `wait: {reason, holder, on}` where `on` is
+`{question: "q1"}`, `{external: "<reference>"}`, (p10) `{delegation: "d1"}` or (p17) `{review: "rv1"}` (a human review round, [reviews.md](reviews.md)), and `holder` names who or
+what holds the next move: the person a question is addressed to or the named
+external party. An external wait may declare a `deadline` (observer p3,
+`wfe run wait … --deadline`): when the result is expected at the latest. It
+is a statement for monitors ([observation.md](observation.md)), not a timer. The view derives the
+current holder: once a question has an answer that is not yet taken up, the
+holder is the executor.
+
+### Questions
+
+`ask` records a question with a stable id, its text, to whom it is addressed,
+and optionally its node; a running node then waits on it. A node waits on one
+thing at a time; asking from an already waiting node is refused.
+
+| Record | Effect on the node |
+| --- | --- |
+| `answer` (text; `from` who gave it, `by` who recorded it) | none — the node keeps waiting. Several answers may be recorded; each names its question. An agent relaying the person's reply from the IDE records `from` = the person, `by` = itself |
+| `take-up` (who took it up, which answer) | the node waiting on that question resumes `running` |
+| `withdraw` (reason) | the question is closed without an answer; a node waiting on it resumes `running` |
+
+An answer records the person as `from` and, when it came from a conversation
+or a delegation, that message as `source`. (Answers from the retired Zulip
+intake recorded the post as `source`, its receipt and `via: zulip`.)
+
+### Additional instructions (p6)
+
+`instruction.receive` records a person's further input that is not an
+answer: `instructions.<id>` (`i1`, `i2`, … in order) with its text, `from`,
+`source`, the nodes recorded as running when it arrived (`during`) and
+`ack: null`. It changes no node and is refused only on a cancelled run.
+Acknowledgment and the node-boundary rules are below (*Node boundaries*).
+
+### Instruction acknowledgment (p6, p11)
+
+The executor acknowledges instructions with `instruction.ack` (executor
+operation, fenced by the open attempt): the ids, a `response` —
+`incorporate` (into upcoming work), `clarify` (it asks the person) or
+`new-run` (it explains why the request needs a new run) — and a note saying
+what it will do. Each instruction is acknowledged once.
+
+Acknowledgment is a record, not a gate (p11): no transition waits for an
+unacknowledged instruction, and the `instructions-pending` refusal no longer
+exists. Receipt (`instruction.receive`) holds the run's lock like every
+operation, so the order is the history's. An instruction recorded on a
+completed run is kept for an attempt that reopens work, and nothing
+continues the run for it.
+
+**An instruction continues a run nobody executes** (project_migration p8).
+After it is recorded, a run with no open attempt and no hold that is not
+completed or cancelled — waiting on a question, a delegation or an external
+result, or left with ready work — gets a continuation job (receipt
+`instruction:<workspace>/<workflow>/<run>/<id>`), so its agent reads the
+instruction now rather than at whatever wakes it next. An open attempt reads it
+at its next node boundary; a held run when it is resumed. Every entrance does
+this: `wfe run instruct`, the run view, a conversation, a delegation's direct delivery.
+
+Completed nodes can be started again and the graph revised (`wfe run
+adjust`), so an instruction that changes completed work is incorporated like
+any other.
+
+### Corrections (workflow_editor fix6)
+
+A run created from a delegation can have its completed result returned by
+the delegating run (`wfe delegate revise`, [delegation.md](delegation.md)
+*Correction*). WFE's direct delivery records it on the child as
+`correction.receive`: `corrections.<c>` (`c1`, `c2`, …) with the delegation
+uid and request number, the result it returns (the completing entry's seq),
+the reason, what to add, whose words (`from`), the post (`source`) and the
+attempt open then (`during`). It is refused (`correction-state`) unless the
+execution is completed with no other open correction, and
+(`result-superseded`, checked against the history under the same lock)
+when the run completed again after the result it returns.
+
+**From the requesting run (tidy p3).** A run created by `wfe request` whose
+input names the run that requested it (`input.entrustedBy = {kind: run,
+project, workflow, run}`) can have its result returned by that run:
+`wfe run return <ws>/<wf>/<run> --requester <project>/<workflow>/<run>
+--instruction … --reason … [--evidence …] [--result-seq <n>]` (HTTP
+`POST …/runs/<wf>/<run>/return`). The correction carries `request: {run}`
+instead of a delegation, and `evidence`. The reducer refuses
+(`request-relation`) a requester that is not the recorded one (a delegated
+child is its parent's to revise; a run with no recorded requester is
+nobody's); inside an attempt, the attempt must be the requester's own
+(`not-requester`); `--result-seq` names the result assessed
+(`result-superseded` otherwise). A retransmission with the same receipt
+records once. The run is continued as below. Its next completion is a new
+result, which the requester awaits again.
+
+`wfe run result <ws>/<wf>/<run> [--requester …] [--file <path>]` (HTTP
+`GET …/runs/<wf>/<run>/result?requester=…`) shows the latest result as its
+receiver sees it, from the same rendering as a delegated result
+([delegation.md](delegation.md) *The claim beside the evidence*): its
+identity (completing entry, frozen position, manifest), the claim beside
+its records, the corrections it received, `to judge:` questions, and the
+route — the return command for the recorded requester only; an observer is
+told who requested it and that observing grants nothing.
+
+While a correction is not addressed the execution is `in-progress` with no
+ready node, the situation is `due` ("correction c1 from … arrived") and the
+run gets a continuation job (receipt `correction:<ws>/<wf>/<run>/<c>`; queued
+again by reconcile and after an attempt that ended while it arrived). The
+result it returned is not announced again: its completion was followed by a
+change of execution, so the next completion is a new result.
+
+It is addressed by the first entry after which the run has work again — an
+adjustment that adds nodes, a completed node started again (`addressed.how:
+work`) — or by `correction.take-up` with `noChange` and a note (`no-change`:
+the run completes again as it is). `correction.take-up` without `noChange`
+records only that it was read (executor operation; `wfe run correction`).
+An attempt that ends with a correction that arrived before it still not
+addressed is held `interrupted` (cause `missed-correction`), like work left
+ready. The brief and the continuation show open corrections in full; `wfe
+run state` names them. The execution brief and a resumed session's continuation list the
+unacknowledged instructions in full; `wfe run state` shows them with the
+answers not yet taken up, and `wfe run instructions` and the run view show
+them all.
+
+An answer to another question leaves a node waiting. Recording an answer is
+not taking it up, taking it up is not completing the node, and none of these
+is accepting a result.
+
+### Execution summary (`execution`)
+
+Derived after every operation; the counts keep mixed facts visible.
+
+| `state` | When |
+| --- | --- |
+| `cancelled` | the run was cancelled (`cancel` without a node) |
+| `completed` | every node is `completed` |
+| `not-started` | every node is `pending` |
+| `in-progress` | some node is `running` or `waiting`, or some node is ready |
+| `stopped` | none of the above: nothing runs, waits or is ready, and some node is `failed` or `cancelled` |
+| `idle` | (p18) a standing run whose nodes are all completed, while its room is not closed (*Standing runs*) |
+
+A correction a delegating run returned the result with (fix6, below) keeps
+an otherwise `completed` execution `in-progress` until it is addressed; so
+do changes a person requested in a human review (p17, [reviews.md](reviews.md)).
+
+`execution` also lists `counts` per state, `ready` and `blocked` node ids, the
+`active` (running) and `waiting` nodes with holders, and `failed` nodes.
+Execution succeeds only when every node is `completed`. Run `started` is the
+first node start, `ended` the operation that made the state `completed`,
+`stopped` or `cancelled` (cleared again if a later resume reopens it).
+
+### Acceptance
+
+`decide <run> --decision accepted|rejected --by <name> --evidence <ref>`
+records a decision on the result, with actor and evidence. `accepted` is only
+recorded on a `completed` execution; `rejected` at any time. A completion
+record, an answer, or a definition approval never creates a decision.
+
+**Integration (p9, [integration.md](integration.md)).** For a run with its
+own copy, an acceptance records the exact revision it binds to (`revision`:
+the tree of each repository the run owns) and queues its integration into
+the project's shared branches. That is a separate operation (`wfe run
+integrate`), journaled per repository and recorded as `run.integrate` when
+complete. Saved, accepted, partially integrated and integrated are shown
+apart. One acceptance per result (project_migration p3/ex1): accepting what
+the latest acceptance already binds is refused (`already-accepted`); a
+changed result is accepted again ([integration.md](integration.md)).
+
+**Feedback (project_migration p3/ex1).** Each form in the run view says what
+became of its submission beside its button: *Recording…* while in flight
+(the button disabled, a second click sends nothing), then what was recorded,
+or why nothing was, with the text kept. A recorded answer the executor has
+not taken up is shown on its question as *Recorded … Waiting for <agent>*,
+apart from any failure.
+
+### Result confirmation (p6)
+
+A workflow may designate one talk node `confirms: result`. Its question
+presents the deliverables (`ask … --subject <path>`, required there): the
+file layer records each by path, hash and size (`question.subject`). When the
+person's answer, taken up by the executor, confirms them, the executor
+records the decision that answer is: `decide <run> --decision accepted
+--question <q>` (fenced by its attempt). The reducer requires the latest
+question of the confirming node, its answer taken up, no earlier decision
+from it, and the deliverables unchanged since they were presented
+(`subject-changed` otherwise: present them again). The decision records
+`confirmation: {question, answer, from, source, subject}` and an evidence
+text naming them. It may precede the execution's completion; the two stay
+separate facts and are shown separately. A question from `_plan` or any
+other node is refused (`not-result-confirmation`): plan agreement never
+becomes acceptance, and the person does not approve twice. An ambiguous
+answer is the executor's to follow up with another question.
+
+### Presentations and adjustments (p7)
+
+A run may present its result for review — a frozen bundle served on this
+host with an explanation, bound to the confirmation question and decision —
+and may change its future work through recorded revisions of its
+definition. Both are additive parts of this record (`presentations`,
+`definition.revisions`, `definition.active`, absent until first used) with
+their own operations (`presentation.register`, `presentation.observe`,
+`run.adjust`): see [presentations.md](presentations.md) and
+[adjustments.md](adjustments.md). Open presentations do not hold execution
+completion (p11); `wfe present status` shows them.
+
+### Reminders at operation boundaries (workflow_editor fix5)
+
+Before an agent's operation is recorded, WFE checks the run's records for
+omissions that are easy to miss and still easy to repair. The check runs
+inside the operation, against the record the operation would replace and
+under the run's lock. If a reminder applies, the operation is refused
+before anything is recorded, posted or queued. The refusal lists every
+applicable reminder in one response, with what the records show, what
+stays unknown, concrete repair commands, and that the same command with
+`--yes` continues. `--yes` passes these reminders only and only for that
+command. Invalid arguments, stale revisions or seqs, attempt ownership and
+invalid graphs stay errors. No human approval is involved.
+
+A reminder is not proof of an omission. WFE cannot observe every shell
+action, and cannot judge whether a result needs a presentation.
+
+| Code | At | When |
+| --- | --- | --- |
+| `presentation-missing` | the completion that completes the run; completing the last work node; an outward result report; a result-confirmation question that presents nothing | work completed after the latest presentation was registered (and not linked to it), and no present node is planned |
+| `presentation-serving` | the run-completing completion; a report; completing a cleanup node; completing a node that took an answer about a presentation | a presentation is still recorded as serving, and no cleanup node is planned |
+| `expectation-unstated` | completing a node | it has expectations with no statement (improve_wfnode p1, seen in trial: `scene-world/run-002` finished with all three unstated) |
+| `presentation-inside-work` | `wfe present register` | registered from a talk, work, confirmation or discussion-activity node |
+| `cleanup-unplanned` | `wfe present register` | no cleanup node is planned |
+| `document-missing` | completing a documentation step (`_plan`, `_report.<node>`, `_final-report`) | its document is not a nonempty file of the run folder, so the completion would record none (tidy p1: protoprey freework/run-006 completed `_final-report` "Report written" after the command that wrote it had failed) |
+| `unrecorded-activity` | a question, a report, the run-completing completion | the run's catalog has templates and no work node is visible, but something suggests work was done: changed paths in the run's copy outside its records, artifacts outside the run folder or published outputs, or a talk that has run for more than 10 minutes |
+| `discussion-activity`, `discussion-open` | completion | a discussion activity completed with a plain completion; a conductor run ending with its discussion open (fix3) |
+| `conversation-unanswered` | the completion that puts a standing conductor to rest | the person's latest words in a room it conducts have no reply, result, question or announcement from it since; a progress note does not count (tidy p1: ponderer/conduct/run-048 said it would summarize, judged three results and rested silent) |
+| `results-unreported` | the completion that puts a standing conductor to rest | a delegation's latest result, its judgement or a correction request is later than the run's last reply, result, synthesis, question or announcement in the room it conducts (tidy p2: ponderer/conduct/run-048's #452 promised to report two corrections; `conversation-unanswered` cannot see such a result once a reply exists). It clears when the run speaks in the room. tidy p3: runs it requested and awaited there (`conversation ask --run`) count too (their latest result or correction), and a delegation's phrase says how many correction requests it needed and whether a satisfied judgement was set aside. It compares record times; whether a post accounts well is not judged |
+| `delegated-presentation-missing`, `delegated-review-unrecorded`, `delegated-presentation-serving`, `delegated-document-missing` | a delegating run's outward report, the completion that completes it, `wfe delegate dispose --disposition satisfied` | the assessment of a delegated result found the child's omission or an unknown (fix6, [delegation.md](delegation.md) *Assessing a result*) |
+
+Roles come from structured records, never node names:
+
+- **present**: the catalog's `present` template, the `present` icon, or a
+  node a presentation was registered from;
+- **cleanup**: the `cleanup` template or icon;
+- **work**: the `work` template; or (fix6) an untemplated `do`/`study` node
+  the run added itself (not in its original definition) whose records show
+  substantive work: artifacts, or files of the run's copy written while it
+  ran, outside the run folder, at least one of them not a note (`.md`,
+  `.txt`, `.json`, …). misc/freework/run-002 wrote its work nodes by hand
+  and was never asked to present. Other untemplated nodes are the
+  designer's or serve other ends (front/converse adds `tell` and `report`
+  nodes; reporting, documentation, coordination record no such files), so
+  they count as visible work for the self-check but are not presented;
+- `confirms: result`, talk, activity and documentation steps come from the
+  graph.
+
+"Planned" means pending, running or waiting. The completion that completes
+the run is the transition to execution `completed`. Documentation steps
+such as `_final-report` do not hold it.
+
+The files are read from every repository the run owns (the root and its
+sub-repositories) and attributed to the node that was running when each was
+last written (fix6). The refusal text names the facts first and ends with
+one line, `In short: <code>: <omission> → <repair> | …`, so a read of only
+its tail (`| tail -3`) still carries why to act and what to do
+(misc/freework/run-003 and run-004 read only the tail of fix5's wording,
+which was directions to `--yes`). Each reminder's `summary` is in the
+structured detail too. fix5's "records that need no viewing" escape is gone;
+the common sentence about `--yes` and uncertainty stays.
+
+There are three responses to a reminder:
+
+- do the omitted work: add a present or cleanup node with `wfe nodes
+  instantiate … --run` and `wfe run adjust`, or stop the page with `wfe
+  present stop`;
+- record work already done (`wfe run record-done`, [adjustments.md](adjustments.md));
+- continue consciously with `--yes`.
+
+After a repair the ordinary command passes when its conditions no longer
+hold. A self-check that the records cannot resolve needs `--yes` once the
+agent has considered it.
+
+A person's incoming answer is never refused or delayed. When an answer
+concerns a presentation, it is shown with the pending answer in the brief,
+the continuation and `wfe run state`, and once at `wfe run take-up`, with
+a reminder: decide whether it asks for more work (present a new revision;
+the page may stay up) or whether the review is finished and cleanup is
+due. Nothing stops a page or adds work by itself. WFE's own records
+(attempt ends, intake, a discussion completing a node for a run) are not
+evaluated.
+
+Paths: the CLI (`--yes`; exit 1 with the reminders on stderr, detail under
+`--json`); HTTP `POST …/ops` and `POST …/adjust` (`"yes": true`; 409
+`{detail: {code: "reminder", reminders}}`; adjust also takes `completing`);
+a remote worker, which forwards `--yes` with the command; the run view,
+which shows the reminder and records only after the person explicitly
+continues. A retransmission with the same receipt records nothing and is
+not evaluated again.
+
+The checks of a conductor's rest (`discussion-open`,
+`conversation-unanswered`, `results-unreported`) read this area's
+discussions (`server/restChecks.ts`) and are added by the CLI and by HTTP
+`POST …/ops` alike (tidy p2; before it they were the CLI's only).
+
+A presentation the person asked to keep after the review (`wfe present
+keep`, `presentation.retain`, fix6: the note, whose words and who stops it
+later) is not a forgotten cleanup for `presentation-serving`.
+
+Why: gimmickimg/freework/run-010 recorded its experiment as nodes and
+completed with no presentation. run-011 presented it only because a
+separate request asked. run-001…008 did their work inside the talk and
+left review pages serving (workflow_editor fix4 report).
+
+### Reporting a result (tidy p2)
+
+As a run's result starts going back, its agent is given the questions the
+result will be judged by. It is advice printed with an ordinary operation,
+once, never a refusal, and records nothing (`server/resultEvidence.ts`):
+
+- with `wfe run start` of the run's final-report step;
+- with the completion after which only reporting is left (documentation
+  steps, present, cleanup, review, the result confirmation), when no
+  final-report step is pending;
+- not for a standing conductor, and not when the completion completes the
+  run (nothing is left in which to act).
+
+It asks every run to say which files and records changed and at which
+commit, which checks actually ran and with what results, and what is
+unverified, deliberately unchanged or left open, and notes that the report
+and the paths it names are read where it says they are. Ordinary work is asked whether the
+project's entry, guide and setup or acquisition instructions still match
+the change, and to correct them in a node of the run (the catalog's `tidy`
+fits) rather than only in the report. A run with a `tidy` node is asked for
+that evidence instead of another pass. The questions that fit the run's
+changes follow (documentation, delivery, removals and moves, tests; chosen as
+in [delegation.md](delegation.md) *Assessing a result*), with what chose
+them. A delegated child's brief says that its result is assessed beside its
+files where its requester receives it.
+
+Documentation stays optional: nothing here makes a report mandatory. A
+documentation step that completes without its document still gets
+`document-missing`.
+
+Why: tidy p1. protoprey freework/run-006 completed `_final-report` "Report
+written" with no report. run-007 reported "7 tests pass" while its eighth
+test never ran. run-006 read `data/deliveries.json` without the status check
+and missed an adoption that pointed at agsfx's run copy. lowerpoly
+freework/run-004 put one host's addresses into its new README.
+
+### Artifacts
+
+`attach` records a project-relative path (usually a report in the run
+folder), optionally with its node and a title. `complete --artifact` does the
+same for a node's outcome. A path that leaves the project is refused; a path
+that does not exist when attached is recorded with a warning and shown as
+missing.
+
+## Execution by autolab (p4)
+
+A person requests a run through agdev (Project Editor → Request a run,
+or `wfe request`): the run is created with their words and the executor —
+autolab, `agautolab.wfexec` — is queued. Two kinds of fact are kept apart:
+
+| Where | What |
+| --- | --- |
+| `run.json` (durable work record) | `control`: the open attempt (id, reason, backend), how the last one ended, a hold, a requested stop; the history of `attempt.begin`, `attempt.end`, `run.stop`, `run.resume` |
+| `<area>/.local/exec/exec.sqlite` (the coordinator) | the queue with each job's admission, each attempt's worker, process id, times and log, publication checkpoints, every worker's heartbeat and load, warden's coordination decisions, events and turns (`server/exec.ts`, [workers.md](workers.md), [coordination.md](coordination.md)) |
+
+**Activity (p8/ex2).** `GET runs/<wf>/<run>/exec` (and `wfe exec status
+<run>`) gives each attempt an `activity` summary read from its own log on
+the host that has it (`server/activity.ts`; `null` on any other host):
+`unit` (`turn`, or `null` for a log whose format is not counted), `count`,
+`last` (the log's last write), `bytes`, and `problem` when the log is there
+but cannot be read (then nothing is counted and the view says so, never
+"another host"). A turn is one distinct assistant
+message id of a Claude Code stream-json log; the count belongs to that
+attempt (one session) and starts again with the next. Only the agent process
+writes its log, so heartbeats, reconnections and polling are never counted;
+the service reads only what was appended (up to the last complete line), so
+re-reading never counts twice. No log text leaves the service. The run view's
+activity line (`src/runActivity.ts`) states the current work with this count
+and age, or the state that replaces them: queued, starting, waiting for a
+person, held, stopping, a session whose process is gone, another host, not
+connected, finished, cancelled. A history view states none of them.
+
+**Where an attempt works (p9).** `wfe exec claim` hands the executor the
+logical workspace (`workspace`) and the directory the agent works in
+(`cwd`): the run's own copy. The run's project defaults are read from the copy, and
+the brief names the copy, its branch and the project workspace (the
+person's; local resources are read from there by name).
+
+**Settings (p6).** The run's workflow names the agent identity, the host
+profile and project guides (contract.md, *Execution, intake and result
+confirmation*). `wfe exec claim` takes what the host offers (`--profiles-json`,
+`--contract <name>=<sha256>`), resolves the run's settings from its frozen
+definition (the profile from a person's resume when one was chosen, *Holds*
+above) and records them with `attempt.begin` (`settings`: agent, profile,
+backend, contract and the context bundle by snapshot id and hashes); the host
+composes the prompt from the common contract, the context text it was handed
+(the snapshot's exact bytes, [context.md](context.md)) and the brief.
+
+**Sessions (agent_session p1).** Which harness conversation an attempt
+runs in is the run's frozen session policy (`fresh` or `run`), resolved at
+claim and recorded in `attempt.begin` before launch; `run.json` keeps the
+run's `sessions[]` (ids, attempts, configuration, replacement reasons) and
+`wfe run session <run>` shows them. See [sessions.md](sessions.md).
+
+**Attempts.** One run can take several launches of the agent. `attempt.begin`
+(by the execution host when it claims a job) opens one; while it is open the
+executor's own reports (`start`, `progress`, `wait`, `complete`, `fail`,
+`ask`, `take-up`, `withdraw`, `attach`) must carry its id (`WFE_ATTEMPT`), and
+nobody else records execution meanwhile. A stopped or superseded attempt's
+late report is refused (`attempt-stale`). `attempt.end` says how the process
+ended: `exited`, `stopped`, `interrupted` or `unknown`. An exit that leaves a
+node recorded as running, or ready work with nothing waiting on a person, is
+recorded as `interrupted`, never as success.
+
+A wait is the record's, not a process's: the attempt that records it ends,
+frees its slot, and the answer, the child's fact or the external result
+starts a new attempt (project_migration p8 ex1). Every node the attempt
+started is completed, failed or waiting when it ends; a node left running
+beside a normal wait still holds the run as interrupted
+(front/converse/run-027: its talk node beside a delegation). Work that needs
+what is awaited is a node after the waiting one.
+
+**Why a hold was derived** (project_migration p8 ex1). Ends recorded since
+then carry `explain: cause`, and the hold they derive keeps a structured
+`cause` beside its sentence `reason`:
+
+| `cause.code` | Meaning |
+| --- | --- |
+| `left-running` (`nodes`) | the attempt ended with these nodes recorded as running |
+| `left-ready` (`nodes`) | ready work and nothing waiting |
+| `nothing-recorded` (`nodes`) | the attempt ended with none of the run's work ever recorded (no node started, nothing asked, nothing delegated) |
+| `missed-event` (`events`: `{delegation, n, type}`) | a child's fact the attempt was launched for was not taken up |
+| `process` (`detail`) | the execution host saw the process end abnormally |
+| `lost` | the process was gone; its outcome is unknown |
+
+Older holds have no `cause`; readers fall back to the sentence.
+
+**Holds.** `stopped`, `interrupted` and `unknown` hold the run: nothing
+begins until a person records `run.resume` with an instruction (after looking
+at the run's files — side effects may have happened after the last record).
+An `interrupted` or `unknown` hold may instead be lifted by a recovering agent
+with `run.recover` (observer p3, [observation.md](observation.md)): Observer
+asks a recovery run to investigate, and the record names the incident, the
+ended attempt and the recovering run; a `stopped` hold is only a person's.
+
+**Resuming on another profile (project_migration p6 ex2).** A person's
+`run.resume` may carry `profile` (`wfe run resume --profile <name>`, or the
+profile field of the run view's resume form): one of the execution host's
+profiles, which later attempts resolve instead of the frozen definition's.
+It is recorded in `control.profile` (`name`, `seq`, `at`, `by`, `previous`:
+the earlier choice, null for the definition's) and shown in Run details. It
+changes which model serves the run, not who performs it: the agent, the
+guides, the bindings and the session policy stay the definition's, no
+revision is made, and a profile the host does not offer drops the next job
+with the reason. It exists because a run that has started work cannot be
+adjusted while a node runs, and an adjustment never changes `execution`
+([adjustments.md](adjustments.md)); a held run is exactly where a person
+looks at it and decides how it continues.
+
+- `run.stop` while an attempt is open is a request (`control.stop`, shown
+  as "stopping"). The hold is recorded only when the attempt's end confirms
+  that the process is gone. Its reports are fenced from then on.
+- The checkpoint that follows saves the copy to the run branch. A save that
+  fails stays visible on that run, and `wfe exec publish` retries it.
+- **A hold keeps the run's plan, records and work in its own copy (p9) and
+  reserves nothing else:** other requests in the project are created and
+  executed meanwhile.
+- Resuming continues in the same copy, from the run's own base. The project's
+  newer commits are not merged in; the brief names how many there are and
+  where, and the agent asks again when they change an agreed plan or a
+  reviewed result.
+- Cancellation (`run.cancel`) is final: after it, reports, resumption and
+  further attempts are refused. The run's copy, records and saved branch
+  stay as they are.
+
+**Human waits.** A talk node asks and the agent ends its session; no process
+runs during the wait, and the wait reserves nothing (p9). An answer is persisted first, then the resumption is
+queued (once per answer, by receipt). A stopped run is not resumed by an
+answer. Recording an answer, taking it up, completing the node and accepting
+the result remain separate records.
+
+**Admission (p9, improve_wfrun p4).** Until p4 one attempt executed at a
+time per worker lane. Since p4 a queued job starts when warden decided it
+does ([coordination.md](coordination.md)): a worker holds as many attempts
+at once as were admitted, a job awaiting a decision or deferred waits with
+that said, and the status reads `Queued · Awaiting warden's decision`,
+`Deferred · By warden …` or `Queued · Starts when its execution node next
+claims`. An area without coordination keeps one attempt per lane
+([workers.md](workers.md), "Lanes"). Nothing else is shared:
+
+- Every run works in its own copy, so no run reserves its project. A held, a
+  waiting or a working run never refuses another request (until p9, a begun
+  run held its workspace).
+- A run has at most one queued or claimed job.
+- Stopping a run drops only that run's queued job, and terminates only its
+  own attempt.
+- A run without a copy of its own (recorded before p9) is not executed; it
+  is migrated first (`wfe runs migrate`).
+
+**Recovery.** After a restart, an attempt whose process is gone is ended as
+`unknown`; one whose process lives is adopted. Requests and answers whose
+queue entry was lost are queued again under their receipts. Nothing is
+completed, failed or rerun by itself.
+
+**Launch ownership (agent_session p1 ex1).** An attempt's process may work
+only after `wfe exec started` registered it: the executor spawns it behind a
+launch gate that opens after that record, and an executor that dies before
+then leaves a process that exits without doing work. So a `launching` row
+(no process registered) is ended as `unknown` after two minutes. A launch
+that fails after the spawn ends the attempt only once the process group is
+confirmed gone; until then the executor keeps it and passes `reconcile
+--holding <attempt>`, and the slot stays held.
+
+**Publication** happens at checkpoints after the process has ended (a human
+wait, a stop or interruption, completion) and after a result decision
+(`server/publish.ts`). Work completion and publication are shown
+separately. A failed push is retried without repeating the work (the
+journaled commits are pushed).
+
+- *A run with its own copy (p9)* saves to its run branches only
+  (`publishRun`). Everything uncommitted in the copy is the run's work. Each
+  repository the copy owns commits on its run branch and pushes exactly
+  that branch, submodules before the root. The branch is recorded in the
+  checkpoint's step before anything is written, so a retry publishes to the
+  same place even if the agent checked out something else meanwhile. A
+  repository with another branch checked out is not committed there and
+  needs attention. The root is not pushed while a submodule's run branch is
+  not. Commits happen under the run's record lock, so no record operation
+  lands between staging and committing. Publications of one run take turns.
+  A checkpoint waits only for that run's own attempt. Nothing reaches a
+  shared branch: that is integration.
+- *A run kept in the project workspace* (before p9) publishes as before: the
+  paths the attempt changed are committed on the checked-out branch and
+  pushed, submodules (devdocs first) before the root. Changes present before
+  the attempt began are left out, and a pre-existing change the run changed
+  again needs a person.
+
+**Where a run talks (history).** From p5/p6 until cluster_teamwork p5 runs were also announced in Zulip:
+a folder per project, a channel per workflow and a topic per run (progress), a request topic per request
+(questions, answers, instructions), and from p10 a detailed IO channel per run ([io.md](io.md)), all
+delivered by the notifier (`server/notify.ts`, `<area>/.local/notify/notify.sqlite`, `wfe notify`, the
+transport `agautolab.wfnotify`) from the selection `notableEvents`. That coordination is retired; its
+implementation is in Git history only and the notifier's store is not read by WFE. People follow a run,
+answer and instruct in WFE (the run and conversation views), and `wfe run events` still shows the
+selection: started; a question; answered; a node's report; under manual policy a node's completion;
+failed; held; resumed; the completed execution; a result decision; cancellation; ids
+`<project>/<workflow>/<run>#<seq>:<type>`.
+
+## Operations
+
+All operations are in `server/runs.ts` (files) over `shared/run.ts`
+(reducer, readiness, summary, validation). `wfe run …` and the service's
+HTTP routes call them; neither needs the other running.
+
+| Operation | `wfe run` | HTTP (`/api/workspaces/<ws>/…`) | Browser |
+| --- | --- | --- | --- |
+| Create a run (snapshot, input) | `create <workflow> --braindump <file>` / `--request <file> --entrusted-by …` | — | — (input comes through the IDE; see below) |
+| List runs | `list [<workflow>]` | `GET runs` | project view → Runs |
+| Inspect a run, its definition, ready nodes, history | `show <run> [--history] [--rev [root:]<commit>]`, `check` | `GET runs/<wf>/<run>[?rev=]` | run view |
+| The current state and pending input only (agent_session p1 ex2) | `state <run> [--since <seq>]` | — | — |
+| What the definition declares for a path | `access <run> [<path>]…` | — | — |
+| Start / resume, progress note | `start`, `progress` | `POST runs/<wf>/<run>/ops` | — |
+| Wait, complete, fail | `wait`, `complete`, `fail` | same | — |
+| Cancel a node or the run | `cancel [<node>]` | same | run view → Result and decision → Cancel run (a failed run: its focus card) |
+| Request a run (the person's words; queues autolab) | `wfe request <workflow> …` | `POST runs` | Project Editor → Request a run |
+| Stop (resumable), resume a held run | `stop`, `resume` | same (`run.stop`, `run.resume`) | run view → focus card (Stop while work runs; the resume form while held) or Execution and publication → Stop |
+| Attempts, queue, publication of one run | `wfe exec status <run>` | `GET runs/<wf>/<run>/exec` | run view → Execution and publication; the title band's executor chip |
+| Retry a publication | `wfe exec publish <checkpoint>` | `POST runs/<wf>/<run>/checkpoints/<id>/publish` | run view → Execution and publication → Retry publication (named under Needs attention) |
+| Coordination events (selection) | `events <run> [--since]` | — | — |
+| One entry of an attempt's log in full | `io <run> --attempt <id> --line <n>` | `GET runs/<wf>/<run>/io?attempt=&line=` | `#/ws/<ws>/run/<wf>/<run>/io/<attempt>/<line>` ([io.md](io.md)) |
+| Ask, take up, withdraw | `ask`, `take-up`, `withdraw` | same | — |
+| Answer | `answer <run> <q>` | same | run view → focus card → the question's form |
+| Attach an artifact | `attach <run> <path>` | same | — (reports listed and readable) |
+| Decide on the result | `decide <run> --decision …` | same | run view → Result and decision → Accept / Reject (a completed run without a decision: its focus card) |
+| Integrate the accepted result (p9) | `integrate <run> [--dry-run\|--status]` | `GET/POST runs/<wf>/<run>/integration` | run view → Execution and publication → Integration |
+| Delegations (p10, [delegation.md](delegation.md)) | `wfe delegate request\|list\|show\|take-up\|answer\|instruct\|dispose\|file\|sync` | `GET runs/<wf>/<run>/delegations` | run view → Delegations |
+| The node catalog the run was given (p7/ex1) | `nodes <run> [--show <template>]` | `GET runs/<wf>/<run>` (`catalog`) | run view → Node catalog |
+| Record work already done as a completed node (fix5, [adjustments.md](adjustments.md)) | `record-done <run> …` | `POST runs/<wf>/<run>/record-done` | the node is marked "recorded afterwards" |
+
+The browser offers the person's operations: answering, deciding on the
+result, and stopping the run. Execution records (start, complete, wait, …)
+are the executor's reports of its own work; the browser shows them and does
+not make them, so a click cannot claim work. The person can still record
+anything with `wfe run … --by <name>`. Creating a run starts from the person's
+words given in the IDE, where the conversation with the executor happens.
+Submitting an answer in the browser stores it; it does not launch or wake the
+IDE agent. The person continues the conversation in VS Code. An answer is not
+a decision on the result and does not resume a held run; those stay separate
+operations with their own preconditions (p8 keeps them apart in the view).
+
+In Simple (p8/ex1) the run view shows the focus card's forms — answers, the
+resume instruction, the decision, Stop — and the graph; the operations listed
+under a side section above (Execution and publication, Result and decision,
+Presentations, Definition, Coordination) are Detail's, reached by its toggle
+or by the focus card's links, which switch to Detail and open the section.
+
+`--expect-seq <n>` (browser: always sent) refuses an operation when the
+record's last sequence is not `n`, so an answer typed against an outdated view
+is not applied silently.
+
+## Access
+
+Repository bindings (`readonly` / `editable`) in the run's fixed definition
+are path scopes ([contract.md](contract.md)) describing what each path is
+for; `wfe run access <run> <path>` reports the declaration. Since p11 they
+restrict nothing: the executor chooses what to change, and no operation
+refuses a change under a `readonly` binding. The definition has no
+allowed-command schema.
+
+## Setup and entry point
+
+`wfe setup <area>` writes the agent guide (`templates/AGENTS.md`) and the
+person's `START.md` with the execution prompt, the run folder pattern, the
+CLI (`wfe run help`) and the browser link. It keeps the registry, the
+projects, the runs and any generated file whose stamp was removed.
+
+## Observation
+
+Monitors read [observation.md](observation.md) (`wfe observe`, `GET
+/api/observe`): a read-only snapshot of every run with its process,
+queue and wait facts. The rest of this section is about the browser views.
+
+The service watches `devdocs/runs/*/*/run.json` (in each run's own copy for
+runs that have one, p9) with the definition poll
+(default 1 s, stat-based; a file is re-read only when its size, modification
+time or inode changed) and lists each run folder's top-level files by stat,
+without reading report bodies. It sends `run` change events with the run
+reference; views re-read that run. Every (re)connection re-reads everything.
+An open definition draft is not touched by run events.
+
+No-update duration and an open browser connection say nothing about the
+executor's health. Workflow progress and process health are separate.
+
+## Future integration boundary
+
+Project, run, node and question ids, holders and evidence references are
+stable so that later adapters can link them to conversations,
+messages and individual agent execution records (Observer,
+`devpolicy/agent_records.md`). devdocs keeps durable input, plans,
+definitions and results. Authority and synchronization are specified when
+those adapters exist; there is no second state authority now.

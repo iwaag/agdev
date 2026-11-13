@@ -1,0 +1,2646 @@
+#!/usr/bin/env python3
+"""Lifecycle of one agdev installation: inspectable, resumable, scoped to it.
+
+`agdevctl --config <instance.toml> <command>` (help: `agdevctl --help`), with the Python
+standard library (3.11+), outside the replaceable runtime. On Linux it runs as root
+(sudo): it administers the Docker dependencies and the native core's systemd units, and
+runs everything else under the installation's service accounts. On macOS it runs as the
+one user whose LaunchAgents are the installation's services. Gitea is either the
+installation's own (Docker) or an existing service it attaches to ([dependencies]).
+Host facts come from the config; secrets live in <root>/config/secrets (mode 0600)
+and are never printed. See docs/install.md.
+"""
+from __future__ import annotations
+
+import argparse
+import base64
+import datetime as dt
+import grp
+import hashlib
+import json
+import os
+import plistlib
+import pwd
+import re
+import secrets
+import shlex
+import shutil
+import socket
+import ssl
+import subprocess
+import sys
+import tempfile
+import time
+import threading
+import tomllib
+import urllib.error
+import urllib.parse
+import urllib.request
+from pathlib import Path
+
+HERE = Path(__file__).resolve().parent
+CORE_PROJECT = "agdev"
+NATIVE_SERVICES = ["wfe", "executor", "observer", "watchdog"]
+WEB_SERVICE = "web"
+GITEA_SERVICES = ["gitea"]
+INFRA_SERVICES = GITEA_SERVICES
+DARWIN = sys.platform == "darwin"
+
+
+def now() -> str:
+    return dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def say(message: str) -> None:
+    print(f"[{now()}] {message}", flush=True)
+
+
+class Instance:
+    def __init__(self, config: Path):
+        self.config_path = config.resolve()   # generated units and agents name it from anywhere (seen: a relative --config, p4)
+        self.c = tomllib.loads(config.read_text())
+        self.slug = self.c["slug"]
+        self.root = Path(self.c["root"])
+        self.host = self.c["public_host"]
+        self.ports = self.c["ports"]
+        self.owner = self.c["owner"]
+        self.config = self.root / "config"
+        self.secrets = self.config / "secrets"
+        self.data = self.root / "data"
+        self.area = self.data / "area"
+        self.state = self.data / "state"
+        self.lifecycle = self.data / "lifecycle"
+        self.logs = self.root / "logs"
+        self.bundles = self.root / "bundles"
+        self.journal = self.config / "init-journal.json"
+        # Gitea: this installation's own container, or an existing service it attaches to.
+        # An attached service is never provisioned, imported into, stopped or removed by agdevctl.
+        deps = self.c.get("dependencies", {})
+        self.gitea_external = deps.get("gitea", "owned") == "external"
+        if deps.get("zulip", "none") != "none" or "zulip" in self.c:
+            # cluster_teamwork p5 retired Zulip; an archived realm is run, if ever, from its retained definitions.
+            raise SystemExit('this agdev uses no Zulip: remove [zulip] and set [dependencies] zulip = "none" (or drop it)')
+        self.gitea_cfg = self.c.get("gitea", {})
+        self.gitea_owner = self.gitea_cfg.get("owner") or self.owner["name"]
+        self.gitea_url = (self.gitea_cfg["url"].rstrip("/") if self.gitea_external else f"http://{self.host}:{self.ports['gitea']}")
+        self.infra = [] if self.gitea_external else GITEA_SERVICES
+        # The owner's alerts, independent of WFE (runtime/agdev_alert.py): route, token_file, channel.
+        self.alerts_cfg = self.c.get("alerts", {})
+        self.web_url = f"http://{self.host}:{self.ports['web']}"
+        self.project = f"agdev-{self.slug}"
+        # Where workspaces are created and obtained (WFE's <area>/placement.json); default <root>/projects.
+        self.projects_root = Path(self.c.get("projects", {}).get("root") or self.root / "projects")
+        # The service manager: systemd units (Linux, root) or the user's LaunchAgents (macOS).
+        self.manager = self.c.get("service_manager") or ("launchd" if DARWIN else "systemd")
+        self.sources = self.data / "sources"
+        accounts = self.c.get("accounts", {})
+        self.core_account = accounts.get("core", "agdev-exec")      # WFE, the executor and its agents: they share the stores
+        self.monitor_account = accounts.get("monitor", "agdev-svc")  # Observer and its watchdog
+        self.build_account = accounts.get("build", "agdev-build")    # builds and owns the releases; no Docker, no secrets
+        self.account_homes = accounts.get("home_root", "/var/lib/agdev")
+        self.tools = self.c["tools"]                                 # bin folders of the pinned node, uv and claude
+        self.wfe_port = self.ports.get("wfe", 8098)
+        self.installed = self.config / "install"
+        # Where the core's source comes from: this installation's own Gitea unless [source] names another
+        # (a candidate runtime builds from its development host's repository and holds no fork of it).
+        source = self.c.get("source", {})
+        self.source_external = bool(source.get("url"))
+        self.source_url = source.get("url") or f"{self.gitea_url}/{self.gitea_owner}/{CORE_PROJECT}.git"
+        self.source_token_file = source.get("token_file")              # a path on this host; none: anonymous read
+        self.targets = self.c.get("targets", {})                       # installations this one deploys to (agdev-remote)
+        self.remote = self.c.get("remote", {})                         # who may operate this one from another installation
+        # Updates asked by the operational parent over the agdev link (improve_multinodes p3, docs/management.md):
+        # the branch a peer request must be on, and whether peer requests are taken at all. Local policy only.
+        self.management = self.c.get("management", {})
+
+    @property
+    def id(self) -> str:
+        return (self.config / "instance-id").read_text().strip()
+
+    def secret(self, name: str) -> str:
+        return (self.secrets / name).read_text().strip()
+
+    def put_secret(self, name: str, value: str) -> None:
+        write_private(self.secrets / name, value + "\n")
+
+    def done(self, step: str) -> bool:
+        return step in read_json(self.journal, {})
+
+    def mark(self, step: str) -> None:
+        journal = read_json(self.journal, {})
+        journal[step] = now()
+        write_json(self.journal, journal)
+        say(f"step done: {step}")
+
+
+def read_json(path: Path, default=None):
+    try:
+        return json.loads(path.read_text())
+    except FileNotFoundError:
+        return default
+
+
+def write_json(path: Path, value) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(path.name + ".tmp")
+    tmp.write_text(json.dumps(value, indent=1) + "\n")
+    os.chmod(tmp, 0o644)
+    os.replace(tmp, path)
+
+
+def write_private(path: Path, text: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(path.name + ".tmp")
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w") as out:
+        out.write(text)
+    os.replace(tmp, path)
+
+
+def run(cmd: list[str], *, check=True, capture=False, env=None, cwd=None, input_text=None) -> subprocess.CompletedProcess:
+    return subprocess.run(cmd, check=check, text=True, env=env, cwd=cwd, input=input_text,
+                          stdout=subprocess.PIPE if capture else None, stderr=subprocess.PIPE if capture else None)
+
+
+def account_id(name: str) -> tuple[int, int]:
+    entry = pwd.getpwnam(name)
+    return entry.pw_uid, entry.pw_gid
+
+
+def me() -> str:
+    return pwd.getpwuid(os.getuid()).pw_name
+
+
+def unprivileged() -> bool:
+    """macOS: one user owns every service of the installation (its LaunchAgents); nothing changes owner."""
+    return os.geteuid() != 0
+
+
+def same_account(account: str, what: str) -> None:
+    if account not in (me(), "root"):
+        raise SystemExit(f"{what} needs account {account}, but agdevctl runs as {me()} without privileges; on macOS every account of [accounts] is the installing user (docs/install.md)")
+
+
+def own(path: Path, account: str, mode: int | None = None, group: str | None = None) -> None:
+    if unprivileged():
+        same_account(account, str(path))
+    else:
+        uid, gid = account_id(account)
+        os.chown(path, uid, grp.getgrnam(group).gr_gid if group else gid)
+    if mode is not None:
+        os.chmod(path, mode)
+
+
+def tool_path(i: Instance) -> str:
+    python = [i.tools["python"]] if i.tools.get("python") else []   # a Python 3.11+ first where the system one is older (macOS)
+    return ":".join([str(i.area / "bin"), *python, i.tools["node"], i.tools["uv"], i.tools["claude"], "/usr/local/sbin", "/usr/local/bin", "/usr/sbin", "/usr/bin", "/sbin", "/bin"])
+
+
+def python_bin(i: Instance) -> str:
+    return f"{i.tools['python']}/python3" if i.tools.get("python") else sys.executable
+
+
+def account_env(i: Instance, account: str, **extra) -> dict[str, str]:
+    """What any process of a service account needs, independent of any login shell."""
+    return {"HOME": pwd.getpwnam(account).pw_dir, "USER": account, "LOGNAME": account, "PATH": tool_path(i), "LANG": "en_US.UTF-8" if DARWIN else "C.UTF-8",
+            "TZ": i.c.get("execution", {}).get("timezone", "UTC"), "AGDEV_INSTANCE_ID": i.id, "GIT_CONFIG_COUNT": "1", "GIT_CONFIG_KEY_0": "safe.directory", "GIT_CONFIG_VALUE_0": "*",
+            "DISABLE_AUTOUPDATER": "1", **extra}
+
+
+def service_env(i: Instance, account: str, **extra) -> dict[str, str]:
+    """A process that acts on this installation's area. A release build never gets these: it must not find the real area."""
+    # WFE_LOCK_DIR: an installation's locks are its own, even beside another installation of the same account.
+    return account_env(i, account, WFE_REGISTRY=str(i.area / "registry.json"), WFE_PORT=str(i.wfe_port), AGDEV_LIFECYCLE=str(i.lifecycle), AGDEV_STATUS_DIR=str(i.lifecycle / "status"),
+                       AGDEV_TARGETS=str(i.config / "targets.json"), WFE_LOCK_DIR=str(i.state / "locks"), **extra)
+
+
+def run_as(i: Instance, account: str, cmd: list[str], *, check=True, capture=False, cwd=None, service=True, umask=0o002, **extra) -> subprocess.CompletedProcess:
+    env = (service_env if service else account_env)(i, account, **extra)
+    pipes = {"stdin": subprocess.DEVNULL, "stdout": subprocess.PIPE if capture else None, "stderr": subprocess.PIPE if capture else None}
+    if unprivileged():
+        same_account(account, " ".join(cmd[:2]))
+        return subprocess.run(cmd, check=check, text=True, cwd=cwd, env=env, umask=umask, **pipes)
+    uid, gid = account_id(account)
+    return subprocess.run(cmd, check=check, text=True, cwd=cwd, env=env, user=uid, group=gid, extra_groups=os.getgrouplist(account, gid), umask=umask, **pipes)
+
+
+# ---- the service manager: systemd units (Linux, root) or the user's LaunchAgents (macOS)
+
+def unit_name(i: Instance, service: str) -> str:
+    return f"agdev-{i.slug}-{service}.service"
+
+
+def lifecycle_unit(i: Instance) -> str:
+    return f"agdev-lifecycle-{i.slug}.service"
+
+
+def systemctl(*args: str, check=True, capture=False) -> subprocess.CompletedProcess:
+    return run(["systemctl", *args], check=check, capture=capture)
+
+
+def label(i: Instance, service: str) -> str:
+    """The LaunchAgent label of a native service or of the lifecycle service ("lifecycle")."""
+    return f"com.agdev.{i.slug}.{service}"
+
+
+def agents_dir() -> Path:
+    return Path(pwd.getpwuid(os.getuid()).pw_dir) / "Library" / "LaunchAgents"
+
+
+def plist_path(i: Instance, service: str) -> Path:
+    return agents_dir() / f"{label(i, service)}.plist"
+
+
+def launchctl(*args: str, check=True, capture=True) -> subprocess.CompletedProcess:
+    return run(["launchctl", *args], check=check, capture=capture)
+
+
+def gui(i: Instance, service: str | None = None) -> str:
+    return f"gui/{os.getuid()}" + (f"/{label(i, service)}" if service else "")
+
+
+def launchd_state(i: Instance, service: str) -> dict:
+    """What launchd says of one service: loaded, state, pid, runs, last exit."""
+    out = launchctl("print", gui(i, service), check=False)
+    if out.returncode != 0:
+        return {"loaded": False, "installed": plist_path(i, service).exists()}
+    facts = {"loaded": True, "installed": plist_path(i, service).exists()}
+    for line in out.stdout.splitlines():
+        key, found, value = line.strip().partition(" = ")
+        name = key.replace(" ", "_")
+        if found and key in ("state", "pid", "runs", "last exit code") and name not in facts:   # the service's own, printed first
+            facts[name] = value.strip()
+    return facts
+
+
+def service_names(i: Instance) -> list[str]:
+    return NATIVE_SERVICES + ["lifecycle"]
+
+
+def svc_installed(i: Instance) -> list[str]:
+    """This installation's generated unit or agent files."""
+    if i.manager == "launchd":
+        return [str(plist_path(i, s)) for s in service_names(i) if plist_path(i, s).exists()]
+    units = [unit_name(i, s) for s in NATIVE_SERVICES] + [lifecycle_unit(i)]
+    return [u for u in units if Path("/etc/systemd/system", u).exists()]
+
+
+# launchctl's answer while an agent is still being torn down (errno EALREADY).
+LAUNCHD_IN_PROGRESS = 37
+UNLOAD_SECONDS = 60
+
+
+def wait_unloaded(i: Instance, service: str, seconds: float = UNLOAD_SECONDS) -> bool:
+    """launchctl bootout returns before the agent is gone (improve_multinodes p1 ex1): wait until launchd no
+    longer knows it. False when it is still there after `seconds`."""
+    end = time.monotonic() + seconds
+    while launchd_state(i, service)["loaded"]:
+        if time.monotonic() > end:
+            return False
+        time.sleep(0.2)
+    return True
+
+
+def svc_start(i: Instance, service: str, restart=False) -> None:
+    """Start (and enable at boot or login) a native service or the lifecycle service."""
+    if i.manager == "launchd":
+        launchctl("enable", gui(i, service), check=False)
+        loaded_file = i.config / "agents-loaded.json"
+        loaded = read_json(loaded_file, {}) or {}
+        digest = hashlib.sha256(plist_path(i, service).read_bytes()).hexdigest()
+        if launchd_state(i, service)["loaded"] and loaded.get(service) != digest:
+            # launchd keeps the definition it loaded; a rewritten agent (new environment, paths) is loaded again.
+            launchctl("bootout", gui(i, service), check=False)
+            wait_unloaded(i, service, 10)
+        if launchd_state(i, service)["loaded"]:
+            done = launchctl("kickstart", *(["-k"] if restart else []), gui(i, service), check=False)
+            if done.returncode == LAUNCHD_IN_PROGRESS:
+                # Still being torn down by an earlier bootout (A's update 20261107T092356Z-06f5fc: Observer and
+                # watchdog stayed unloaded): wait for it to be gone, then load it again.
+                if not wait_unloaded(i, service):
+                    raise RuntimeError(f"{label(i, service)} was still being unloaded after {UNLOAD_SECONDS}s; it is not started")
+            elif done.returncode != 0:
+                raise subprocess.CalledProcessError(done.returncode, done.args, done.stdout, done.stderr)
+        if not launchd_state(i, service)["loaded"]:
+            launchctl("bootstrap", gui(i), str(plist_path(i, service)))   # RunAtLoad starts it
+        loaded[service] = digest
+        write_json(loaded_file, loaded)
+        return
+    unit = lifecycle_unit(i) if service == "lifecycle" else unit_name(i, service)
+    systemctl("enable", "-q", unit)
+    systemctl("restart" if restart else "start", unit)
+
+
+def svc_stop(i: Instance, service: str) -> subprocess.CompletedProcess:
+    if i.manager == "launchd":
+        # Unloaded until started again; its plist stays, so the next login starts it, as a boot starts an enabled unit.
+        if not launchd_state(i, service)["loaded"]:
+            return subprocess.CompletedProcess([], 0, "", "")
+        done = launchctl("bootout", gui(i, service), check=False)
+        # bootout returns before the agent is gone; a start right after it would find it "loaded" and be refused
+        # (EALREADY). A stop is done when launchd no longer knows the agent (improve_multinodes p1 ex1).
+        if done.returncode == 0 and not wait_unloaded(i, service):
+            return subprocess.CompletedProcess(done.args, 1, "", f"{label(i, service)} was still being unloaded after {UNLOAD_SECONDS}s")
+        return done
+    return systemctl("stop", lifecycle_unit(i) if service == "lifecycle" else unit_name(i, service), check=False, capture=True)
+
+
+def svc_active(i: Instance, service: str) -> bool:
+    if i.manager == "launchd":
+        return launchd_state(i, service).get("state") == "running"
+    unit = lifecycle_unit(i) if service == "lifecycle" else unit_name(i, service)
+    return systemctl("is-active", "--quiet", unit, check=False).returncode == 0
+
+
+def svc_state(i: Instance, service: str):
+    if i.manager == "launchd":
+        return launchd_state(i, service)
+    unit = lifecycle_unit(i) if service == "lifecycle" else unit_name(i, service)
+    return run(["systemctl", "show", unit, "--property=ActiveState,SubState,UnitFileState,NRestarts", "--value"], capture=True, check=False).stdout.split()
+
+
+def svc_log_file(i: Instance, service: str) -> Path:
+    return i.logs / f"{service}.log"
+
+
+def svc_logs(i: Instance, service: str, lines: int) -> str:
+    if i.manager == "launchd":
+        out = run(["tail", "-n", str(lines), str(svc_log_file(i, service))], capture=True, check=False)
+        return out.stdout + out.stderr
+    unit = lifecycle_unit(i) if service == "lifecycle" else unit_name(i, service)
+    out = run(["journalctl", "-u", unit, "-n", str(lines), "--no-pager", "-o", "short-iso"], capture=True, check=False)
+    return out.stdout + out.stderr
+
+
+def svc_remove(i: Instance) -> None:
+    """Disable and delete this installation's services; what is left of the executor's agents is killed too."""
+    if i.manager == "launchd":
+        for service in service_names(i):
+            state = launchd_state(i, service)
+            pid = state.get("pid")
+            launchctl("bootout", gui(i, service), check=False)
+            if service == "executor" and pid:
+                run(["pkill", "-KILL", "-g", pid], check=False, capture=True)
+            plist_path(i, service).unlink(missing_ok=True)
+        return
+    for unit in svc_installed(i):
+        systemctl("disable", "--now", unit, check=False)
+        # KillMode=process leaves agents behind a stopped executor; nothing of this installation survives its removal.
+        systemctl("kill", "--kill-whom=all", "--signal=SIGKILL", unit, check=False, capture=True)
+        Path("/etc/systemd/system", unit).unlink()
+    systemctl("daemon-reload")
+
+
+def host_clock_synchronized(i: Instance) -> bool:
+    if DARWIN:
+        done = run(["/usr/bin/python3", str(i.installed / "runtime" / "wait-clock.py"), "--check"], capture=True, check=False)
+        return done.returncode == 0
+    return run(["timedatectl", "show", "--property=NTPSynchronized", "--value"], capture=True, check=False).stdout.strip() == "yes"
+
+
+# ---- compose
+
+def compose_env_path(i: Instance) -> Path:
+    return i.config / "compose.env"
+
+
+def write_compose_env(i: Instance) -> None:
+    values = {
+        "AGDEV_SLUG": i.slug,
+        "AGDEV_INSTANCE_ID": i.id,
+        "AGDEV_PUBLIC_HOST": i.host,
+        "AGDEV_GITEA_URL": i.gitea_url,
+        "AGDEV_GITEA_PORT": i.ports.get("gitea", 0),
+        "AGDEV_WEB_PORT": i.ports["web"],
+        "AGDEV_BIND": i.c.get("bind", "0.0.0.0"),
+        "AGDEV_OWNER_EMAIL": i.owner["email"],
+        "AGDEV_DATA": i.data,
+        "AGDEV_TZ": i.c.get("execution", {}).get("timezone", "UTC"),
+        "AGDEV_WFE_PORT": i.wfe_port,
+    }
+    write_private(compose_env_path(i), "".join(f"{k}={v}\n" for k, v in values.items()))
+
+
+def read_env(path: Path) -> dict[str, str]:
+    if not path.exists():
+        return {}
+    return dict(line.split("=", 1) for line in path.read_text().splitlines() if "=" in line and not line.startswith("#"))
+
+
+def compose_dir(i: Instance) -> Path:
+    # The Compose file and web config of the active resources; updated on activation.
+    return i.config / "compose"
+
+
+def compose(i: Instance, *args: str, capture=False, check=True) -> subprocess.CompletedProcess:
+    cmd = ["docker", "compose", "--project-directory", str(compose_dir(i)), "-f", str(compose_dir(i) / "compose.yaml"),
+           "--env-file", str(compose_env_path(i)), "--profile", "all", *args]
+    env = {**os.environ, **read_env(compose_env_path(i))}
+    return run(cmd, capture=capture, check=check, env=env)
+
+
+def install_compose_resources(i: Instance, source: Path = HERE) -> None:
+    target = compose_dir(i)
+    (target / "web").mkdir(parents=True, exist_ok=True)
+    shutil.copy2(source / "compose.yaml", target / "compose.yaml")
+    shutil.copy2(source / "web" / "nginx.conf.template", target / "web" / "nginx.conf.template")
+
+
+def install_resources(i: Instance, source: Path = HERE) -> None:
+    """The installed lifecycle tool, clock gate and unit templates: a copy outside the releases,
+    replaced whole. A running supervisor reloads it after its update ends (cmd_supervise)."""
+    if source.resolve() == i.installed.resolve():
+        return
+    fresh = i.config / "install.new"
+    shutil.rmtree(fresh, ignore_errors=True)
+    shutil.copytree(source, fresh)
+    shutil.rmtree(i.installed, ignore_errors=True)
+    os.replace(fresh, i.installed)
+
+
+def core_exec(i: Instance, service: str) -> tuple[str, str, str]:
+    """(account, working directory, command) of a native service, on service/current."""
+    current = i.area / "service" / "current"
+    node = f"{i.tools['node']}/node"
+    origins = f"{i.web_url},http://localhost:{i.wfe_port}"
+    return {
+        "wfe": (i.core_account, str(i.area), f"{node} {current}/server/main.ts --serve-dist --port {i.wfe_port} --registry {i.area}/registry.json --bind {i.c.get('bind', '0.0.0.0')} --origins {origins}"),
+        "executor": (i.core_account, f"{current}/system/agautolab", f"{current}/system/agautolab/.venv/bin/python -m agautolab.wfexec"),
+        "observer": (i.monitor_account, f"{current}/system/agobserver", f"{current}/system/agobserver/.venv/bin/python -m agobserver.wfmonitor"),
+        "watchdog": (i.monitor_account, f"{current}/system/agobserver", f"{current}/system/agobserver/.venv/bin/python -m agobserver.watchdog"),
+    }[service]
+
+
+def alerts_file(i: Instance) -> Path:
+    return i.state / "alerts" / "alerts.json"
+
+
+def service_extra_env(i: Instance, service: str) -> dict[str, str]:
+    # The alert sender is the installed tool's (outside the releases); without alerts.json there is no route.
+    alerts = {"AGDEV_ALERT_TOOL": str(i.installed / "runtime" / "agdev_alert.py"), "AGDEV_ALERTS": str(alerts_file(i))}
+    return {"executor": {"AGHANGOUT_CLAUDE": f"{i.tools['claude']}/claude"},
+            "observer": {"AGDEV_START_DELAY": "60", "AGAG_STATUS_PATH": f"{i.state}/agobserver/agag-status.json", **alerts},
+            "watchdog": {"AGDEV_START_DELAY": "60", **alerts}}.get(service, {})
+
+
+def ensure_lock_dir(i: Instance) -> None:
+    """WFE_LOCK_DIR of the services: under state, which is root's on Linux, so it is made here, the core
+    account's and shared with the monitor through the core group (on C, p5: the first turns failed EACCES)."""
+    locks = i.state / "locks"
+    locks.mkdir(parents=True, exist_ok=True)
+    own(locks, i.core_account, 0o2770)
+    # The compile cache every `wfe` call uses (bin/wfe, lighter_services p3): Node makes a subfolder per uid,
+    # so the core group must be able to write here whoever calls first.
+    # Only within an area that exists: before init has made it, nothing here may create it as root.
+    cache = i.area / ".local" / "node-compile-cache"
+    if cache.parent.is_dir():
+        cache.mkdir(exist_ok=True)
+        own(cache, i.core_account, 0o2770)
+
+
+def write_units(i: Instance, source: Path) -> None:
+    # Every place that writes the units (init, an activation, an update's switch) also makes their lock folder.
+    ensure_lock_dir(i)
+    if i.manager == "launchd":
+        return write_agents(i)
+    write_systemd_units(i, source)
+
+
+def agent_definitions(i: Instance) -> dict[str, dict]:
+    """The LaunchAgents' definitions by service (written by write_agents, shown by render)."""
+    out = {}
+    for service in NATIVE_SERVICES:
+        account, workdir, command = core_exec(i, service)
+        env = {**service_env(i, account), "AGDEV_SERVICE": service, **service_extra_env(i, service)}
+        agent = {"Label": label(i, service), "ProgramArguments": ["/bin/sh", str(i.installed / "runtime" / "entry.sh"), *shlex.split(command)],
+                 "WorkingDirectory": workdir, "EnvironmentVariables": env, "RunAtLoad": True, "KeepAlive": True, "ThrottleInterval": 10,
+                 "Umask": 0o002, "StandardOutPath": str(svc_log_file(i, service)), "StandardErrorPath": str(svc_log_file(i, service)),
+                 "ProcessType": "Standard"}
+        if service == "executor":
+            agent.update({"AbandonProcessGroup": True, "ExitTimeOut": 60})
+        out[service] = agent
+    return out
+
+
+def systemd_units(i: Instance, source: Path) -> dict[str, str]:
+    """The unit files' text by file name (written by write_systemd_units, shown by render)."""
+    template = (source / "systemd" / "agdev-core.service.in").read_text()
+    out = {}
+    for service in NATIVE_SERVICES:
+        account, workdir, command = core_exec(i, service)
+        extra = "\n".join(f"Environment={k}={v}" for k, v in service_extra_env(i, service).items())
+        if service == "executor":
+            extra = "KillMode=process\nTimeoutStopSec=60\n" + extra
+        out[unit_name(i, service)] = (template.replace("@SLUG@", i.slug).replace("@SERVICE@", service).replace("@USER@", account).replace("@WORKDIR@", workdir)
+                                      .replace("@ENV@", str(i.config / f"service-{account}.env")).replace("@GATE@", str(i.installed / "runtime" / "entry.sh")).replace("@COMMAND@", command).replace("@EXTRA@", extra))
+    return out
+
+
+def write_agents(i: Instance) -> None:
+    """The LaunchAgents of this installation: the native services on service/current through the clock gate,
+    and the lifecycle service. The user's login starts them (RunAtLoad); KeepAlive restarts them."""
+    agents_dir().mkdir(parents=True, exist_ok=True)
+    i.logs.mkdir(parents=True, exist_ok=True)
+    for service, agent in agent_definitions(i).items():
+        # An executor restart leaves its agents running; the next executor adopts them (wfexec).
+        write_plist(plist_path(i, service), agent)
+        if not launchd_state(i, service)["loaded"]:
+            # Written is not enabled: a login before the first start must not run a service without a release.
+            launchctl("disable", gui(i, service), check=False)
+    env = {"PATH": tool_path(i), "HOME": pwd.getpwuid(os.getuid()).pw_dir, "LANG": "en_US.UTF-8"}
+    write_plist(plist_path(i, "lifecycle"), {
+        "Label": label(i, "lifecycle"), "ProgramArguments": [python_bin(i), str(i.installed / "agdevctl"), "--config", str(i.config_path), "supervise"],
+        "EnvironmentVariables": env, "RunAtLoad": True, "KeepAlive": True, "ThrottleInterval": 10,
+        # Unspecified, launchd applies light resource limits that slow the release builds it runs (p4 trial).
+        "ProcessType": "Standard",
+        "StandardOutPath": str(svc_log_file(i, "lifecycle")), "StandardErrorPath": str(svc_log_file(i, "lifecycle"))})
+    if not launchd_state(i, "lifecycle")["loaded"]:
+        launchctl("disable", gui(i, "lifecycle"), check=False)
+
+
+def write_plist(path: Path, value: dict) -> None:
+    tmp = path.with_name(path.name + ".tmp")
+    with open(tmp, "wb") as out:
+        plistlib.dump(value, out)
+    os.replace(tmp, path)
+
+
+def write_systemd_units(i: Instance, source: Path) -> None:
+    """Generate the unit files from `source`; the units run service/current through the clock gate."""
+    for name, unit in systemd_units(i, source).items():
+        Path("/etc/systemd/system", name).write_text(unit)
+    lifecycle = (source / "systemd" / "agdev-lifecycle@.service.in").read_text()
+    lifecycle = lifecycle.replace("@SLUG@", i.slug).replace("@TOOL@", str(i.installed / "agdevctl")).replace("@CONFIG@", str(i.config_path))
+    Path("/etc/systemd/system", lifecycle_unit(i)).write_text(lifecycle)
+    for account in (i.core_account, i.monitor_account):
+        env = service_env(i, account)
+        (i.config / f"service-{account}.env").write_text("".join(f"{k}={v}\n" for k, v in env.items()))
+    systemctl("daemon-reload")
+
+
+# ---- init
+
+def port_free(port: int) -> bool:
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
+        probe.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        try:
+            probe.bind(("0.0.0.0", port))
+            return True
+        except OSError:
+            return False
+
+
+def owned_containers(i: Instance) -> list[str]:
+    out = run(["docker", "ps", "-a", "--filter", f"label=com.docker.compose.project={i.project}", "--format", "{{.Names}}"], capture=True).stdout
+    return out.split()
+
+
+def ensure_account(i: Instance, name: str, home: str, shell: str, groups: list[str] = ()) -> None:
+    try:
+        pwd.getpwnam(name)
+    except KeyError:
+        Path(home).parent.mkdir(parents=True, exist_ok=True)
+        run(["useradd", "--system", "--user-group", "--home-dir", home, "--create-home", "--shell", shell, name])
+        say(f"created account {name}")
+    entry = pwd.getpwnam(name)
+    Path(entry.pw_dir).mkdir(parents=True, exist_ok=True)
+    own(Path(entry.pw_dir), name, 0o700)
+    for group in groups:
+        run(["usermod", "-aG", group, name])
+    forbidden = {"docker", "sudo", "adm"} & {g.gr_name for g in grp.getgrall() if name in g.gr_mem}
+    if forbidden:
+        raise SystemExit(f"account {name} must not be in {sorted(forbidden)}: remove it and repeat")
+
+
+def ensure_projects_root(i: Instance) -> None:
+    """The project root: created under the installation's root; elsewhere (another volume) it must already exist,
+    because creating a missing mount point would hide that the volume is absent."""
+    root = i.projects_root
+    if str(root).startswith(str(i.root) + "/"):
+        root.mkdir(parents=True, exist_ok=True)
+        own(root, i.core_account, 0o2770)
+    elif not root.is_dir():
+        raise SystemExit(f"[projects] root {root} does not exist (an unmounted volume?); create or mount it, then repeat")
+    marker = root / ".agdev-projects.json"
+    if not marker.exists():
+        write_json(marker, {"schema": "agdev.project-root.v1", "area": str(i.area), "instance": i.id if (i.config / "instance-id").exists() else None, "prepared": now()})
+
+
+def ensure_folders(i: Instance) -> None:
+    """Who may touch what. WFE, the executor and agents share the area; Observer reaches it through
+    the group; releases and the launcher belong to the build account, so a run cannot edit what runs;
+    each service's state and every secret stay with its owner."""
+    core, monitor, build = i.core_account, i.monitor_account, i.build_account
+    for folder, account, mode, group in [
+        (i.root, "root", 0o755, None), (i.config, "root", 0o755, None), (i.secrets, "root", 0o700, None), (i.logs, "root", 0o750, None),
+        (i.bundles, "root", 0o755, None), (i.data, "root", 0o755, None), (i.sources, "root", 0o755, None),
+        (i.area, core, 0o2770, None), (i.area / "service", build, 0o2755, core), (i.area / "service" / "releases", build, 0o2755, core), (i.area / "bin", build, 0o2755, core),
+        (i.state, "root", 0o755, None), (i.state / "agautolab", core, 0o700, None), (i.state / "gitea", core, 0o700, None), (i.state / "system", core, 0o700, None),
+        (i.state / "agobserver", monitor, 0o700, None),
+        (i.lifecycle, "root", 0o2750, core), (i.lifecycle / "requests", "root", 0o2770, core), (i.lifecycle / "updates", "root", 0o2750, core),
+        (i.lifecycle / "status", "root", 0o2770, core), (i.lifecycle / "backups", "root", 0o700, None),
+    ]:
+        folder.mkdir(parents=True, exist_ok=True)
+        own(folder, account, mode, group)
+
+
+def collisions(i: Instance) -> list[str]:
+    """Another installation on this host that already holds a name this one would take."""
+    found = []
+    if i.manager == "launchd":
+        for service in service_names(i):
+            path = plist_path(i, service)
+            if path.exists() and str(i.config_path) not in path.read_text(errors="replace") and str(i.root) not in path.read_text(errors="replace"):
+                found.append(f"{path} belongs to another installation (slug {i.slug!r} is taken)")
+    marker = read_json(i.projects_root / ".agdev-projects.json")
+    if marker and marker.get("area") and marker["area"] != str(i.area):
+        found.append(f"{i.projects_root} is the project root of the area {marker['area']}")
+    return found
+
+
+def cmd_init(i: Instance, args) -> None:
+    clash = collisions(i)
+    if clash:
+        raise SystemExit("refused, nothing was changed: " + "; ".join(clash))
+    run(["install", "-d", "-m", "0755", str(i.root)])
+    core, monitor, build = i.core_account, i.monitor_account, i.build_account
+    if unprivileged():
+        # macOS: the installing user is every account; its LaunchAgents are the services (docs/install.md).
+        for account in {core, monitor, build}:
+            same_account(account, f"[accounts] {account}")
+    else:
+        ensure_account(i, core, f"{i.account_homes}/executor", "/bin/bash")
+        ensure_account(i, monitor, f"{i.account_homes}/service", "/usr/sbin/nologin", [core])
+        ensure_account(i, build, f"{i.account_homes}/build", "/usr/sbin/nologin", [core])
+    ensure_folders(i)
+    if not (i.config / "instance-id").exists():
+        # Persistent for this installation's life; a move keeps it, a new experiment gets a new one.
+        (i.config / "instance-id").write_text(f"{i.slug}-{secrets.token_hex(6)}\n")
+        say(f"new instance id {i.id}")
+    ensure_projects_root(i)
+    # Commits of runs and checkpoints: no login shell or person supplies an identity here.
+    gitconfig = Path(pwd.getpwnam(core).pw_dir) / ".gitconfig"
+    if not gitconfig.exists():
+        gitconfig.write_text(f"[user]\n\tname = agdev {i.slug}\n\temail = agent@{i.host}\n")
+        own(gitconfig, core, 0o644)
+    # Secrets of the dependencies this installation owns; an attached one brings its credentials ([gitea]).
+    for name, owned in (("gitea_owner_password", not i.gitea_external),):
+        if owned and not (i.secrets / name).exists():
+            i.put_secret(name, secrets.token_urlsafe(18))
+    if not owned_containers(i):
+        used = {"web": i.ports["web"], "wfe": i.wfe_port, **({"gitea": i.ports["gitea"]} if not i.gitea_external else {})}
+        busy = [f"{name}={port}" for name, port in used.items() if not port_free(port)]
+        if busy:
+            raise SystemExit(f"ports in use on this host: {', '.join(busy)}")
+    install_compose_resources(i)
+    install_resources(i)
+    write_compose_env(i)
+    write_units(i, i.installed)
+    say(f"initialized {i.root} as instance {i.id}")
+
+
+# ---- stages
+
+def wait_http(url: str, seconds: int, what: str, insecure=False) -> None:
+    context = ssl._create_unverified_context() if insecure else None
+    deadline = time.monotonic() + seconds
+    last = ""
+    while time.monotonic() < deadline:
+        try:
+            with urllib.request.urlopen(url, timeout=10, context=context) as response:
+                if response.status < 500:
+                    return
+        except urllib.error.HTTPError as error:
+            last = f"HTTP {error.code}"
+            if error.code < 500:
+                return
+        except Exception as error:  # noqa: BLE001 - reported on timeout
+            last = str(error)
+        time.sleep(5)
+    raise SystemExit(f"{what} did not answer at {url} within {seconds}s: {last}")
+
+
+class StartFailed(RuntimeError):
+    """Some services did not start; the others did. `failed` maps each to why."""
+
+    def __init__(self, failed: dict[str, str]):
+        self.failed = failed
+        super().__init__("not started: " + "; ".join(f"{s} ({why})" for s, why in failed.items()))
+
+
+def start_native(i: Instance, services: list[str] = NATIVE_SERVICES, restart=False) -> None:
+    if not (i.area / "service" / "current").exists():
+        raise SystemExit("no release is selected yet: `activate <commit>`")
+    failed: dict[str, str] = {}
+    for service in services:
+        # Enabled, so a boot (or the user's login) restores them; the order is what the monitors expect.
+        # One that does not start does not keep the rest from starting (improve_multinodes p1 ex1).
+        try:
+            svc_start(i, service, restart=restart)
+        except (subprocess.CalledProcessError, RuntimeError) as error:
+            failed[service] = (f"{' '.join(str(a) for a in error.cmd[:3])} exited {error.returncode}" if isinstance(error, subprocess.CalledProcessError) else str(error))[-300:]
+    if failed:
+        raise StartFailed(failed)
+
+
+def stop_native(i: Instance, services: list[str] = NATIVE_SERVICES) -> None:
+    # Observer and its watchdog first, so a planned stop raises no incident; WFE last.
+    for service in ("watchdog", "observer", "executor", "wfe"):
+        if service in services:
+            done = svc_stop(i, service)
+            if done.returncode != 0:
+                raise SystemExit(f"stopping {service} failed: {(done.stderr or done.stdout)[-300:]}")
+
+
+def cmd_up(i: Instance, args) -> None:
+    infra = args.stage in ("infra", "all")
+    core = args.stage in ("core", "all")
+    if infra:
+        if i.infra:
+            compose(i, "up", "-d", "--remove-orphans" if args.stage == "all" else "--no-recreate", *i.infra)
+        else:
+            say("Gitea is an attached service: nothing to start for infra")
+    if core:
+        compose(i, "up", "-d", "--no-deps", WEB_SERVICE)
+        start_native(i)
+    say(f"up: {args.stage}")
+
+
+def cmd_stop(i: Instance, args) -> None:
+    named = args.services or NATIVE_SERVICES + [WEB_SERVICE] + i.infra
+    refuse_attached(i, named)
+    stop_native(i, [s for s in named if s in NATIVE_SERVICES])
+    containers = [s for s in named if s not in NATIVE_SERVICES]
+    if containers:
+        compose(i, "stop", *containers)
+
+
+def cmd_start(i: Instance, args) -> None:
+    named = args.services or i.infra + [WEB_SERVICE] + NATIVE_SERVICES
+    refuse_attached(i, named)
+    containers = [s for s in named if s not in NATIVE_SERVICES]
+    if containers:
+        # `up --no-deps` also creates a container that was never made (a successor started only after `adopt`).
+        compose(i, "up", "-d", "--no-deps", *containers)
+    native = [s for s in NATIVE_SERVICES if s in named]
+    if native:
+        start_native(i, native)
+
+
+def refuse_attached(i: Instance, named: list[str]) -> None:
+    attached = [s for s in named if s in INFRA_SERVICES and s not in i.infra]
+    if attached:
+        raise SystemExit(f"{', '.join(attached)}: an attached service, not this installation's; agdevctl never starts or stops it")
+
+
+def account_exists(name: str) -> bool:
+    try:
+        pwd.getpwnam(name)
+        return True
+    except KeyError:
+        return False
+
+
+def inventory(i: Instance) -> dict:
+    label = f"label=com.docker.compose.project={i.project}"
+    q = lambda *c: run(["docker", *c], capture=True, check=False).stdout.split()  # noqa: E731
+    return {
+        "containers": q("ps", "-a", "--filter", label, "--format", "{{.Names}}"),
+        "networks": q("network", "ls", "--filter", label, "--format", "{{.Name}}"),
+        "volumes": q("volume", "ls", "--filter", label, "--format", "{{.Name}}"),
+        "units": svc_installed(i),
+        "paths": [str(i.root)] + ([str(i.projects_root)] if not str(i.projects_root).startswith(str(i.root) + "/") else []),
+        "attached": {"gitea": i.gitea_url} if i.gitea_external else {},
+        # Prepared with the host and kept by a removal unless --purge-accounts asks otherwise.
+        "accounts": {a: pwd.getpwnam(a).pw_dir for a in {i.core_account, i.monitor_account, i.build_account} if account_exists(a)},
+        "tools": i.tools,
+    }
+
+
+def status_facts(i: Instance) -> dict:
+    result = {"instance": i.id if (i.config / "instance-id").exists() else None, "root": str(i.root), "urls": {"gitea": i.gitea_url, "web": i.web_url}}
+    try:
+        tool = alert_tool(i)
+        result["alerts"] = tool.status(alerts_file(i)) if tool else {"configured": False, "tool": "not installed"}
+    except Exception as error:  # noqa: BLE001 - shown, not fatal
+        result["alerts"] = {"error": str(error)[:300]}
+    out = run(["docker", "ps", "-a", "--filter", f"label=com.docker.compose.project={i.project}", "--format", "{{.Label \"com.docker.compose.service\"}}\t{{.State}}\t{{.Status}}"], capture=True, check=False).stdout
+    result["containers"] = {line.split("\t")[0]: line.split("\t")[2] for line in out.splitlines() if line}
+    result["services"] = {s: svc_state(i, s) for s in NATIVE_SERVICES}
+    result["lifecycle"] = svc_state(i, "lifecycle")
+    result["manager"] = i.manager
+    result["attached"] = {"gitea": i.gitea_url} if i.gitea_external else {}
+    result["projects"] = str(i.projects_root)
+    clock = {}
+    for path in sorted((i.lifecycle / "status").glob("clock-*.json")):
+        clock[path.stem[6:]] = read_json(path)
+    result["clock"] = clock
+    result["hostClockSynchronized"] = host_clock_synchronized(i)
+    current = i.area / "service" / "current"
+    if current.exists():
+        result["release"] = read_json(current / "RELEASE.json")
+    drain = i.area / ".local" / "exec" / "drain"
+    result["draining"] = drain.exists()
+    updates = sorted((i.lifecycle / "updates").glob("*.json"), key=lambda p: p.stat().st_mtime)
+    result["lastUpdate"] = read_json(updates[-1]) if updates else None
+    result["source"] = i.source_url
+    return result
+
+
+def cmd_status(i: Instance, args) -> None:
+    print(json.dumps(status_facts(i), indent=1, ensure_ascii=False))
+
+
+def cmd_inventory(i: Instance, args) -> None:
+    print(json.dumps(inventory(i), indent=1))
+
+
+def cmd_remove(i: Instance, args) -> None:
+    instance = i.id    # read once: the id lives in config/, which this command deletes
+    if args.confirm_instance != instance:
+        raise SystemExit(f"removal needs --confirm-instance {instance} (this installation); nothing was changed")
+    held = inventory(i)
+    evidence = Path(args.keep_evidence).expanduser() if args.keep_evidence else None
+    if evidence:
+        evidence.mkdir(parents=True, exist_ok=True)
+        write_json(evidence / f"removed-{instance}.json", {"at": now(), "instance": instance, "inventory": held})
+    svc_remove(i)
+    # Only this installation's Compose project: an attached Gitea is not part of it and stays untouched.
+    compose(i, "down", "--volumes", "--remove-orphans", "--timeout", "30")
+    # Only this installation's folders are named. Dependency images stay: they are shared and pinned.
+    for child in ("config", "data", "logs"):
+        shutil.rmtree(i.root / child, ignore_errors=False)
+    if args.purge_accounts and not unprivileged():
+        for account, home in held["accounts"].items():
+            run(["userdel", account])
+            shutil.rmtree(home, ignore_errors=True)
+    say(f"removed instance {instance}: {json.dumps(held)}; kept {i.bundles}" + ("" if args.purge_accounts else " and the accounts with their homes (model login, caches)"))
+
+
+# ---- Gitea
+
+def api(url: str, *, method="GET", token=None, basic=None, body=None, form=None, insecure=False, ok=(200, 201, 204)):
+    data = None
+    headers = {}
+    if token:
+        headers["Authorization"] = f"token {token}"
+    if basic:
+        headers["Authorization"] = "Basic " + base64.b64encode(f"{basic[0]}:{basic[1]}".encode()).decode()
+    if body is not None:
+        data = json.dumps(body).encode()
+        headers["Content-Type"] = "application/json"
+    if form is not None:
+        data = urllib.parse.urlencode(form).encode()
+    request = urllib.request.Request(url, data=data, method=method, headers=headers)
+    context = ssl._create_unverified_context() if insecure else None
+    try:
+        with urllib.request.urlopen(request, context=context, timeout=60) as response:
+            raw = response.read()
+            return json.loads(raw) if raw else {}
+    except urllib.error.HTTPError as error:
+        if error.code in ok:
+            return {}
+        raise RuntimeError(f"{method} {url}: HTTP {error.code}: {error.read().decode(errors='replace')[:400]}") from None
+
+
+def gitea_token(i: Instance) -> str:
+    return i.secret("gitea_owner_token")
+
+
+def attach_gitea(i: Instance) -> None:
+    """An existing Gitea: check that the given token acts as the given owner, and keep a copy of it. Nothing is created."""
+    token_file = Path(i.gitea_cfg.get("token_file", ""))
+    if not token_file.is_file():
+        raise SystemExit(f"[gitea] token_file {token_file} is not a file; nothing was changed")
+    token = token_file.read_text().strip()
+    wait_http(f"{i.gitea_url}/api/healthz", 60, "Gitea")
+    login = api(f"{i.gitea_url}/api/v1/user", token=token)["login"]
+    if login != i.gitea_owner:
+        raise SystemExit(f"the token in {token_file} acts as {login!r}, not the owner {i.gitea_owner!r}; nothing was changed")
+    i.put_secret("gitea_owner_token", token)
+    i.mark("gitea-attached")
+    say(f"Gitea {i.gitea_url} attached as {login}; its accounts, repositories and settings are left as they are")
+
+
+def cmd_provision_gitea(i: Instance, args) -> None:
+    if i.gitea_external:
+        return attach_gitea(i)
+    wait_http(f"{i.gitea_url}/api/healthz", 180, "Gitea")
+    name = i.owner["name"]
+    password = i.secret("gitea_owner_password")
+    if not i.done("gitea-owner"):
+        probe = compose(i, "exec", "-T", "-u", "git", "gitea", "gitea", "admin", "user", "list", capture=True).stdout
+        if name not in probe.split():
+            created = subprocess.run(["docker", "compose", "--project-directory", str(compose_dir(i)), "-f", str(compose_dir(i) / "compose.yaml"),
+                                      "--env-file", str(compose_env_path(i)), "--profile", "all", "exec", "-T", "-u", "git", "gitea", "gitea", "admin", "user", "create",
+                                      "--admin", "--username", name, "--email", i.owner["email"], "--password", password, "--must-change-password=false"],
+                                     env={**os.environ, **read_env(compose_env_path(i))}, capture_output=True, text=True)
+            if created.returncode != 0:
+                raise SystemExit("creating the Gitea owner failed: " + created.stderr.replace(password, "<password>")[-400:])
+        i.mark("gitea-owner")
+    if not (i.secrets / "gitea_owner_token").exists():
+        token = api(f"{i.gitea_url}/api/v1/users/{name}/tokens", method="POST", basic=(name, password),
+                    body={"name": f"agdev-{i.id}-{secrets.token_hex(3)}", "scopes": ["all"]})
+        i.put_secret("gitea_owner_token", token["sha1"])
+    say(f"Gitea owner {name}: {api(f'{i.gitea_url}/api/v1/user', token=gitea_token(i))['login']} verified")
+
+
+# ---- sources
+
+def manifest(i: Instance) -> list[dict]:
+    return read_json(i.bundles / "manifest.json", {"sources": []})["sources"]
+
+
+def git_auth(i: Instance) -> list[str]:
+    return ["-c", f"http.extraHeader=Authorization: token {gitea_token(i)}"]
+
+
+def cmd_import_sources(i: Instance, args) -> None:
+    """Create each manifest source on this installation's Gitea and push its bundle."""
+    owner = i.gitea_owner
+    token = gitea_token(i)
+    if i.gitea_external:
+        # An attached Gitea is someone else's: report what is there, never create or push.
+        missing = [s["repository"] for s in manifest(i) if not (s.get("project") == CORE_PROJECT and i.source_external)
+                   and not api(f"{i.gitea_url}/api/v1/repos/{owner}/{s['repository']}", token=token, ok=(200, 404))]
+        say(f"Gitea {i.gitea_url} is attached, not this installation's: nothing imported" + (f"; missing there: {', '.join(missing)}" if missing else ""))
+        return
+    for source in manifest(i):
+        name = source["repository"]
+        if source.get("project") == CORE_PROJECT and i.source_external:
+            say(f"{name}: the core's source is {i.source_url}; this Gitea holds no copy of it")
+            continue
+        url = f"{i.gitea_url}/api/v1/repos/{owner}/{name}"
+        if not api(url, token=token, ok=(200, 404)):
+            api(f"{i.gitea_url}/api/v1/user/repos", method="POST", token=token, body={"name": name, "private": False, "default_branch": "main", "description": source.get("description", "")})
+        bundle = i.bundles / source["bundle"]
+        with tempfile.TemporaryDirectory() as tmp:
+            run(["git", "clone", "-q", "--bare", str(bundle), tmp + "/r"])
+            head = run(["git", "-C", tmp + "/r", "rev-parse", "refs/heads/main"], capture=True).stdout.strip()
+            if head != source["commit"]:
+                raise SystemExit(f"{source['bundle']}: main is {head}, the manifest says {source['commit']}")
+            remote = f"{i.gitea_url}/{owner}/{name}.git"
+            existing = run(["git", *git_auth(i), "ls-remote", remote, "refs/heads/main"], capture=True).stdout.split()
+            if existing and existing[0] != head:
+                say(f"{name}: Gitea main is {existing[0][:12]}, newer than the bundle or diverged; left as it is")
+            else:
+                run(["git", *git_auth(i), "-C", tmp + "/r", "push", "-q", remote, "refs/heads/main:refs/heads/main"])
+                say(f"{name}: main at {head[:12]}")
+
+
+def cmd_export_sources(i: Instance, args) -> None:
+    """Bundle Gitea's current main of every manifest source: what a later recreation starts from."""
+    sources = manifest(i)
+    for source in sources:
+        if source.get("project") == CORE_PROJECT and i.source_external:
+            continue
+        remote = f"{i.gitea_url}/{i.gitea_owner}/{source['repository']}.git"
+        with tempfile.TemporaryDirectory() as tmp:
+            run(["git", *git_auth(i), "clone", "-q", "--bare", remote, tmp + "/r"])
+            head = run(["git", "-C", tmp + "/r", "rev-parse", "refs/heads/main"], capture=True).stdout.strip()
+            run(["git", "-C", tmp + "/r", "bundle", "create", "-q", str(i.bundles / source["bundle"]), "refs/heads/main"])
+            source["commit"] = head
+        say(f"{source['repository']}: bundled {head[:12]}")
+    write_json(i.bundles / "manifest.json", {"sources": sources})
+
+
+def source_auth(i: Instance) -> list[str]:
+    if i.source_token_file:
+        return ["-c", f"http.extraHeader=Authorization: token {Path(i.source_token_file).read_text().strip()}"]
+    return [] if i.source_external else git_auth(i)
+
+
+def source_mirror(i: Instance) -> Path:
+    """A bare mirror of every branch of the core's source, candidate branches included; fetched on each use."""
+    mirror = i.sources / "core.git"
+    if not mirror.exists():
+        mirror.parent.mkdir(parents=True, exist_ok=True)
+        run(["git", *source_auth(i), "clone", "-q", "--bare", i.source_url, str(mirror)])
+    run(["git", *source_auth(i), "-C", str(mirror), "fetch", "-q", "--prune", i.source_url, "+refs/heads/*:refs/heads/*"])
+    return mirror
+
+
+# ---- releases
+
+def exported(mirror: Path, commit: str, into: str, *paths: str) -> None:
+    archive = subprocess.Popen(["git", "-C", str(mirror), "archive", commit, *paths], stdout=subprocess.PIPE)
+    subprocess.run(["tar", "-x", "-C", into], stdin=archive.stdout, check=True)
+    if archive.wait() != 0:
+        raise RuntimeError(f"cannot read {paths} at {commit}")
+
+
+def runtime_facts(i: Instance) -> str:
+    """The tools a release is built and run with, recorded in RELEASE.json."""
+    def version(*cmd: str) -> str:
+        return run(list(cmd), capture=True, check=False).stdout.strip().splitlines()[0:1] or ["unknown"]
+    facts = {"node": version(f"{i.tools['node']}/node", "--version")[0], "uv": version(f"{i.tools['uv']}/uv", "--version")[0], "claude": version(f"{i.tools['claude']}/claude", "--version")[0],
+             "python": version("python3", "--version")[0], "git": version("git", "--version")[0]}
+    return " ".join(f"{k}={v.replace(' ', '_')}" for k, v in facts.items())
+
+
+def safe_source(url: str) -> str:
+    """The source URL as a person's browser may see it: http(s) without credentials, else nothing."""
+    from urllib.parse import urlsplit
+    p = urlsplit(url)
+    return url if p.scheme in ("http", "https") and not p.username and not p.password else ""
+
+
+def release_tool(i: Instance, mirror: Path, *args: str, script: Path) -> None:
+    """Run the commit's own release script under the build account, at low priority: monitoring comes first."""
+    run_as(i, i.build_account, ["nice", "-n", "10", "sh", str(script), *args], cwd=str(i.area), service=False, umask=0o022, WFE_RELEASE_REPO=str(mirror), WFE_RELEASE_STATE=str(i.state), AGDEV_RUNTIME=runtime_facts(i), AGDEV_SOURCE=safe_source(i.source_url),
+           AGDEV_CLOCK_GATE="0", WFE_SERVICE_URL=f"http://127.0.0.1:{i.wfe_port}")
+
+
+def release_script(i: Instance, mirror: Path, sha: str) -> Path:
+    script = i.lifecycle / "release-script.sh"
+    script.write_text(run(["git", "-C", str(mirror), "show", f"{sha}:scripts/wfe-release.sh"], capture=True).stdout)
+    os.chmod(script, 0o644)
+    return script
+
+
+def build_release(i: Instance, commit: str) -> tuple[str, Path]:
+    mirror = source_mirror(i)
+    sha = run(["git", "-C", str(mirror), "rev-parse", "--verify", f"{commit}^{{commit}}"], capture=True).stdout.strip()
+    release_tool(i, mirror, "build", str(i.area), sha, script=release_script(i, mirror, sha))
+    return sha, mirror
+
+
+def cmd_release_build(i: Instance, args) -> None:
+    sha, _ = build_release(i, args.commit)
+    say(f"built release {sha}")
+
+
+def select_release(i: Instance, sha: str, mirror: Path) -> None:
+    release_tool(i, mirror, "switch", str(i.area), sha, script=release_script(i, mirror, sha))
+    with tempfile.TemporaryDirectory() as tmp:
+        exported(mirror, sha, tmp, "install")
+        install_compose_resources(i, Path(tmp) / "install")
+        # The lifecycle tool and units are copies outside the replaceable runtime.
+        install_resources(i, Path(tmp) / "install")
+    write_compose_env(i)
+    write_units(i, i.installed)
+
+
+def cmd_activate(i: Instance, args) -> None:
+    """First activation, or one by hand: no attempt may be open (an update goes through `supervise`)."""
+    busy = open_attempts(i)
+    if busy:
+        raise SystemExit(f"open attempts: {busy}; use a lifecycle request, which waits for them")
+    sha, mirror = build_release(i, args.commit)
+    stop_native(i)
+    select_release(i, sha, mirror)
+    if getattr(args, "no_start", False):
+        # A successor that adopts an existing installation's state starts only after `adopt` (docs/migration.md).
+        say(f"selected {sha}; nothing started")
+        return
+    start_native(i, restart=True)
+    compose(i, "up", "-d", "--no-deps", "--force-recreate", WEB_SERVICE)
+    say(f"activated {sha}: {json.dumps(check_health(i, sha, 300))}")
+
+
+def sqlite_rows(db: Path, query: str) -> list[str]:
+    if not db.exists():
+        return []
+    code = "import sqlite3,sys\nc=sqlite3.connect(f'file:{sys.argv[1]}?mode=ro',uri=True,timeout=10)\nprint('\\n'.join(str(r[0]) for r in c.execute(sys.argv[2])))"
+    done = run([sys.executable, "-c", code, str(db), query], capture=True, check=False)
+    if done.returncode != 0:
+        raise RuntimeError(f"cannot read {db}: {done.stderr[-300:]}")
+    return [line for line in done.stdout.splitlines() if line]
+
+
+def open_attempts(i: Instance) -> list[str]:
+    return sqlite_rows(i.area / ".local" / "exec" / "exec.sqlite",
+                       "SELECT id || ' (' || workspace || ' ' || workflow || '/' || run || ')' FROM attempts WHERE state != 'ended'")
+
+
+def check_health(i: Instance, sha: str, seconds: int) -> dict:
+    """The actual API, CLI, executor heartbeat and Observer's own health, all on `sha`."""
+    deadline = time.monotonic() + seconds
+    facts: dict = {}
+    while time.monotonic() < deadline:
+        facts = {}
+        try:
+            with urllib.request.urlopen(f"http://127.0.0.1:{i.ports['web']}/wfe/api/version", timeout=10) as response:
+                version = json.load(response)
+            facts["api"] = version.get("release", {}).get("agdevworld")
+            facts["instance"] = version.get("instance")
+        except Exception as error:  # noqa: BLE001 - a fact of this look
+            facts["api"] = f"unavailable: {error}"
+        cli = run_as(i, i.core_account, [str(i.area / "bin" / "wfe"), "version", "--json"], capture=True, check=False)
+        try:
+            facts["cli"] = json.loads(cli.stdout).get("release", {}).get("agdevworld")
+        except ValueError:
+            facts["cli"] = f"unavailable: {cli.stderr[-200:]}"
+        # As Observer itself reads it: its account, through the group.
+        observed = run_as(i, i.monitor_account, [str(i.area / "bin" / "wfe"), "observe", "--json"], capture=True, check=False)
+        try:
+            age = json.loads(observed.stdout)["executor"]["ageSeconds"]
+            facts["heartbeatAge"] = age
+        except (ValueError, KeyError):
+            facts["heartbeatAge"] = None
+        health = read_json(i.state / "agobserver" / "workflow-health.json", {}) or {}
+        facts["observer"] = {"source": (health.get("source") or {}).get("state"), "release": (health.get("source") or {}).get("release"), "age": round(time.time() - health.get("written_at", 0), 1)}
+        runs = {name: svc_active(i, name) for name in NATIVE_SERVICES}
+        runs[WEB_SERVICE] = compose(i, "ps", "--status", "running", "-q", WEB_SERVICE, capture=True, check=False).stdout.strip() != ""
+        facts["running"] = runs
+        if facts["api"] == sha and facts["cli"] == sha and facts["instance"] == i.id and all(runs.values()) \
+                and facts["heartbeatAge"] is not None and facts["heartbeatAge"] < 120 \
+                and facts["observer"]["release"] == sha and facts["observer"]["age"] < 120:
+            facts["healthy"] = True
+            return facts
+        time.sleep(5)
+    facts["healthy"] = False
+    return facts
+
+
+
+# ---- the operating area
+
+def write_if_absent(path: Path, value) -> None:
+    if not path.exists():
+        write_json(path, value)
+
+
+def browser_url(where: str, value) -> str:
+    """A destination for a person's browser, checked as WFE checks it (workflow_editor/server/site.ts)."""
+    parts = urllib.parse.urlsplit(value) if isinstance(value, str) else None
+    if not parts or parts.scheme not in ("http", "https") or not parts.hostname or parts.username or parts.password:
+        raise SystemExit(f"[display] {where}: an http(s) URL without credentials is required, got {value!r}; nothing was changed")
+    if parts.hostname in ("localhost", "0.0.0.0", "::1") or parts.hostname.startswith("127."):
+        raise SystemExit(f"[display] {where}: {value!r} names the loopback, which other machines cannot follow; nothing was changed")
+    return value
+
+
+def site_settings(i: Instance) -> dict | None:
+    """area/site.json from the inputs' [display]; None when the inputs have no such section."""
+    display = i.c.get("display")
+    if display is None:
+        return None
+    name = display.get("name")
+    if not isinstance(name, str) or not name.strip() or len(name.strip()) > 64:
+        raise SystemExit("[display] name: text of at most 64 characters is required; nothing was changed")
+    site = {"name": name.strip()}
+    parent = display.get("parent")
+    if parent is not None:
+        if not isinstance(parent.get("name"), str) or not parent["name"].strip():
+            raise SystemExit("[display.parent] name is required; nothing was changed")
+        site["parent"] = {"name": parent["name"].strip(), "url": browser_url("parent.url", parent.get("url"))}
+    links = display.get("boast_links")
+    if links:
+        site["boastLinks"] = {project: {key: browser_url(f"boast_links.{project}.{key}", url) for key, url in keys.items()} for project, keys in links.items()}
+    return site
+
+
+def write_site(i: Instance) -> bool:
+    site = site_settings(i)
+    if site is None:
+        return False
+    write_json(i.area / "site.json", site)
+    own(i.area / "site.json", i.core_account)
+    return True
+
+
+def write_placement(i: Instance) -> None:
+    """WFE's <area>/placement.json (workflow_editor/docs/placement.md): where workspaces are created and obtained."""
+    write_json(i.area / "placement.json", {"projectRoot": str(i.projects_root)})
+    own(i.area / "placement.json", i.core_account)
+
+
+def cmd_placement(i: Instance, args) -> None:
+    """Apply [projects] root: new and obtained workspaces go there. Existing ones stay until relocated."""
+    ensure_projects_root(i)
+    write_placement(i)
+    say(f"project root {i.projects_root}; move existing workspaces with `wfe workspace relocate --all` (preview first)")
+
+
+def cmd_display(i: Instance, args) -> None:
+    """Apply the inputs' [display] to the running installation; WFE reads it on each request."""
+    if not write_site(i):
+        raise SystemExit(f"{i.config_path} has no [display] section: nothing to apply (docs/install.md)")
+    say(f"{i.area / 'site.json'} written for {i.id}")
+
+
+def cmd_area_init(i: Instance, args) -> None:
+    """The configuration the area's services read. Generated from this installation's inputs, never copied."""
+    area = i.area
+    state = i.state
+    start = now()
+    ensure_folders(i)
+    ensure_projects_root(i)
+    write_json(area / "instance.json", {"id": i.id, "slug": i.slug, "root": str(i.root)})
+    write_placement(i)
+    write_site(i)
+    write_if_absent(area / "registry.json", {"approver": "", "workspaces": [], "repositories": [], "projects": []})
+    write_json(area / "gitea.json", {"url": i.gitea_url, "owner": i.gitea_owner, "tokenFile": str(state / "gitea" / "owner.token")})
+    write_json(area / "system.json", {"note": "Operating boundary of this agdev area; system configuration, not part of any managed project.",
+                                      "protectedPaths": [{"path": str(state), "why": "this installation's credentials and service state"},
+                                                         {"path": str(i.lifecycle), "why": "the lifecycle service's records"}],
+                                      "retiredRepositories": []})
+    worker = i.c.get("execution", {}).get("worker", "local")
+    # One attempt per lane until a plan fills the coordination role (`wfe summon apply` derives `coordination`).
+    write_if_absent(area / "workers.json", {"default": worker, "workers": {worker: {"local": True, "label": f"{i.slug}'s local execution node", "lanes": ["conversation", "coordination"]}}})
+    # Which workspace a project's delegations and submissions go to when it has several here (WFE docs/delegation.md).
+    write_if_absent(area / "workspaces.json", {"projects": {}})
+    # Presentation ports are this installation's range ([ports] present), so two installations on one host do not meet.
+    write_if_absent(area / "present.json", {"bind": "0.0.0.0", "publicBase": f"http://{i.host}", "ports": list(i.ports.get("present", [8300, 8399])), "answerBase": f"{i.web_url}/wfe/"})
+    # agshare: a local folder, this host's exported folder, or a parent's NFS export ([shares.agshare], docs/storage.md).
+    # A share must not overlap the area (docs/shares.md), and its marker says it is really there.
+    apply_share(i, ready=False)
+    write_if_absent(area / "attachments.json", {"share": "agshare", "prefix": "conversations"})
+    # Conversations: who the person is. The role-owned keys (facilitator, archive, dialogue) and the participants
+    # of summoned projects come from `wfe summon apply` (workflow_editor docs/summon.md).
+    write_if_absent(area / "conversations.json", {"person": person_name(i), "projects": []})
+    (area / "hangout").mkdir(exist_ok=True)
+    write_private(state / "gitea" / "owner.token", i.secret("gitea_owner_token") + "\n")
+    own(state / "gitea" / "owner.token", i.core_account)
+    # Executor and Observer settings, submitters and alerts: one function, also `services-config`.
+    write_service_settings(i)
+    # Everything directly under the area belongs to its core account, whoever wrote it just now.
+    (area / ".local").mkdir(exist_ok=True)
+    for path in [*area.glob("*.json"), area / "hangout"]:
+        own(path, i.core_account)
+    own(area / ".local", i.core_account, 0o2770)
+    say(f"area configured for {i.id}")
+
+
+
+def wfe(i: Instance, *args: str, check=True) -> str:
+    done = run_as(i, i.core_account, [str(i.area / "bin" / "wfe"), *args], capture=True, check=False, cwd=str(i.area))
+    if check and done.returncode != 0:
+        raise SystemExit(f"wfe {' '.join(args)} failed ({done.returncode}): {(done.stderr or done.stdout)[-800:]}")
+    return done.stdout
+
+
+# ---- shared storage: [shares.agshare] (improve_multinodes p6, docs/storage.md)
+#
+# local   <root>/data/share/agshare (the default, a standalone installation)
+# export  a folder of this host that it exports over NFS; `root` is the folder, server/export what clients mount
+# nfs     the NFS export another installation advertised; mounted at `mount` by the host's desired state
+#
+# shares.json's agshare entry is derived from it (other shares are kept). An installation that has
+# `export` or `nfs` passes the same server, export and storage identity to the children it sets up.
+
+SHARE = "agshare"
+SHARE_SOURCES = ("local", "export", "nfs")
+SHARE_MARKER = ".wfe-share.json"
+SHARE_KEYS = ("source", "storage", "root", "server", "export", "mount", "options", "inherited_from")
+DEFAULT_CHILD_MOUNT = "/mnt/agshare"
+
+
+def share_storage(i: Instance) -> dict:
+    section = (i.c.get("shares") or {}).get(SHARE)
+    s = dict(section or {})
+    source = s.get("source", "local")
+    if source not in SHARE_SOURCES:
+        raise SystemExit(f"[shares.{SHARE}] source must be one of {', '.join(SHARE_SOURCES)}, not {source!r}")
+    unknown = sorted(set(s) - set(SHARE_KEYS))
+    if unknown:
+        raise SystemExit(f"[shares.{SHARE}] has unknown keys {unknown}; known: {', '.join(SHARE_KEYS)}")
+    need = {"local": [], "export": ["root", "storage", "server", "export"], "nfs": ["storage", "server", "export", "mount"]}[source]
+    missing = [k for k in need if not s.get(k)]
+    if missing:
+        raise SystemExit(f"[shares.{SHARE}] source = {source!r} needs {', '.join(missing)} (docs/storage.md)")
+    for k in ("root", "export", "mount"):
+        if s.get(k) and (not str(s[k]).startswith("/") or str(s[k]).rstrip("/") == ""):
+            raise SystemExit(f"[shares.{SHARE}] {k} must be an absolute path, not {s[k]!r}")
+    root = {"local": s.get("root") or str(i.data / "share" / SHARE), "export": s.get("root"), "nfs": s.get("mount")}[source]
+    return {"share": SHARE, "declared": section is not None, "source": source, "root": str(root).rstrip("/"),
+            "storage": s.get("storage"), "server": s.get("server"), "export": s.get("export"),
+            "mount": s.get("mount"), "options": list(s.get("options") or []), "inherited_from": s.get("inherited_from")}
+
+
+def child_storage(i: Instance) -> dict | None:
+    """What a child of this installation mounts by default: the original source, never a re-export."""
+    st = share_storage(i)
+    if st["source"] == "local":
+        return None
+    return {"source": "nfs", "storage": st["storage"], "server": st["server"], "export": st["export"],
+            "mount": st["mount"] or DEFAULT_CHILD_MOUNT, "options": st["options"], "inherited_from": i.id}
+
+
+def read_bounded(path: Path, seconds: int = 20) -> str | None:
+    """A file on a possibly hard-mounted NFS path: read by a child process we stop waiting for."""
+    proc = subprocess.Popen(["cat", str(path)], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True)
+    try:
+        out, _ = proc.communicate(timeout=seconds)
+    except subprocess.TimeoutExpired:
+        proc.kill()   # a process in uninterruptible sleep stays; we do not wait for it
+        return None
+    return out if proc.returncode == 0 else None
+
+
+def mount_type(path: str) -> str | None:
+    """The filesystem type mounted exactly at `path` (the last one: an automount's autofs lies under its NFS)."""
+    found = None
+    if Path("/proc/self/mountinfo").exists():
+        for line in Path("/proc/self/mountinfo").read_text().splitlines():
+            left, _, right = line.partition(" - ")
+            fields = left.split()
+            if len(fields) > 4 and fields[4].replace("\\040", " ") == path:
+                found = right.split()[0]
+    else:
+        for line in run(["mount"], capture=True, check=False).stdout.splitlines():
+            m = re.match(r"^(.+) on (.+) \(([a-z0-9]+)", line)
+            if m and m.group(2) == path:
+                found = m.group(3)
+    return found
+
+
+def share_readiness(st: dict) -> dict:
+    """Is the configured root the expected storage? Reads the marker (triggering an automount), bounded."""
+    root = Path(st["root"])
+    text = read_bounded(root / SHARE_MARKER)
+    marker = None
+    if text is not None:
+        try:
+            marker = json.loads(text)
+        except ValueError:
+            marker = {"unreadable": True}
+    fstype = mount_type(st["root"]) if st["source"] == "nfs" else None
+    problems = []
+    if text is None:
+        problems.append(f"{root / SHARE_MARKER} is not readable (not mounted, missing, or the server did not answer within 20 s)")
+    elif (marker or {}).get("share") != SHARE:
+        problems.append(f"the marker at {root} names {(marker or {}).get('share')!r}, not {SHARE!r}")
+    elif st.get("storage") and marker.get("storage") != st["storage"]:
+        problems.append(f"the marker at {root} names storage {marker.get('storage')!r}, expected {st['storage']!r}")
+    if st["source"] == "nfs" and fstype not in ("nfs", "nfs4"):
+        problems.append(f"{root} is not an NFS mount here (found {fstype or 'nothing'})")
+    return {"ready": not problems, "marker": marker, "mounted": fstype, "problems": problems}
+
+
+def write_share_mapping(i: Instance, st: dict) -> dict:
+    """shares.json: the agshare entry from the inputs; marker/publicBase and other shares are kept."""
+    path = i.area / "shares.json"
+    current = read_json(path, None) or {"shares": {}}
+    shares = dict(current.get("shares") or {})
+    entry = {k: v for k, v in (shares.get(SHARE) or {}).items() if k in ("marker", "publicBase")}
+    entry["root"] = st["root"]
+    if st.get("storage"):
+        entry["storage"] = st["storage"]
+    shares[SHARE] = entry
+    value = {**current, "shares": shares}
+    if value != current or not path.exists():
+        if path.exists():
+            backup = path.with_name("shares.json.before-storage")
+            if not backup.exists():
+                shutil.copy2(path, backup)
+        write_json(path, value)
+        own(path, i.core_account)
+    return value
+
+
+def apply_share(i: Instance, ready: bool = True) -> dict:
+    st = share_storage(i)
+    if not st["declared"]:
+        # Unchanged behaviour without [shares.agshare]: a local share, its mapping written once.
+        share = Path(st["root"])
+        write_if_absent(i.area / "shares.json", {"shares": {SHARE: {"root": str(share)}}})
+        share.mkdir(parents=True, exist_ok=True)
+        own(share.parent, i.core_account, 0o2770)
+        own(share, i.core_account, 0o2770)
+        write_json(share / SHARE_MARKER, {"share": SHARE})
+        own(share / SHARE_MARKER, i.core_account)
+        return {"source": "local", "root": str(share), "declared": False}
+    root = Path(st["root"])
+    if st["source"] == "local":
+        root.mkdir(parents=True, exist_ok=True)
+        own(root, i.core_account, 0o2770)
+    if st["source"] in ("local", "export"):
+        # This host holds the bytes: the marker names the share and, for an export, its identity.
+        if not root.is_dir():
+            raise SystemExit(f"[shares.{SHARE}] root {root} is not a folder on this host")
+        marker = read_json(root / SHARE_MARKER, None)
+        if marker and marker.get("share") != SHARE:
+            raise SystemExit(f"{root / SHARE_MARKER} names share {marker.get('share')!r}: refused, nothing changed")
+        if marker and st.get("storage") and marker.get("storage") not in (None, st["storage"]):
+            raise SystemExit(f"{root / SHARE_MARKER} names storage {marker.get('storage')!r}, the inputs {st['storage']!r}: refused")
+        wanted = {**(marker or {}), "share": SHARE, **({"storage": st["storage"]} if st.get("storage") else {})}
+        if marker != wanted:
+            write_json(root / SHARE_MARKER, wanted)
+    # nfs: nothing is created under the mount point; an absent mount shows no marker and stays `unmounted`.
+    readiness = share_readiness(st)
+    if ready and not readiness["ready"]:
+        raise SystemExit(f"agshare is not ready at {root}: {'; '.join(readiness['problems'])}. shares.json unchanged")
+    mapping = write_share_mapping(i, st)
+    return {**st, "readiness": readiness, "mapping": mapping["shares"][SHARE]}
+
+
+def toml_value(v) -> str:
+    if isinstance(v, list):
+        return "[" + ", ".join(toml_value(x) for x in v) + "]"
+    if isinstance(v, bool):
+        return "true" if v else "false"
+    return json.dumps(str(v))
+
+
+def declare_share(i: Instance, setting: dict) -> bool:
+    """Rewrite the [shares.agshare] table of instance.toml (only that table). True when it changed."""
+    bad = sorted(set(setting) - set(SHARE_KEYS))
+    if bad:
+        raise SystemExit(f"unknown storage keys {bad}; known: {', '.join(SHARE_KEYS)}")
+    before = i.config_path.read_text()
+    out, skipping = [], False
+    for line in before.splitlines():
+        header = re.match(r"^\s*\[([^\]]+)\]\s*(#.*)?$", line)
+        if header:
+            skipping = header.group(1).strip() == f"shares.{SHARE}"
+            if skipping:
+                continue
+        if not skipping:
+            out.append(line)
+    while out and not out[-1].strip():
+        out.pop()
+    block = [f"[shares.{SHARE}]", "# Shared storage (docs/storage.md), written by `agdevctl storage declare`."]
+    block += [f"{k} = {toml_value(setting[k])}" for k in SHARE_KEYS if setting.get(k) not in (None, "", [])]
+    text = "\n".join(out + [""] + block) + "\n"
+    if text == before:
+        return False
+    trial = tomllib.loads(text)   # never write a file that would not parse
+    backup = i.config_path.with_name(i.config_path.name + ".before-storage")
+    if not backup.exists():
+        shutil.copy2(i.config_path, backup)
+    tmp = i.config_path.with_name(i.config_path.name + ".tmp")
+    tmp.write_text(text)
+    os.chmod(tmp, os.stat(i.config_path).st_mode & 0o777)
+    os.replace(tmp, i.config_path)
+    i.c = trial
+    return True
+
+
+def cmd_storage(i: Instance, args) -> None:
+    """Shared storage of this installation: what it uses, what its children inherit, and applying it."""
+    if args.action == "declare":
+        changed = declare_share(i, json.loads(args.json))
+        print(json.dumps({"declared": changed, "storage": share_storage(i)}, indent=1))
+        return
+    if args.action == "child-default":
+        child = child_storage(i)
+        if child is None:
+            print(json.dumps({"child": None, "problem": f"{i.id} has no shared storage to pass on ([shares.{SHARE}] source is local): "
+                              "declare its export or NFS source, or give the child an explicit storage or local-only choice"}, indent=1))
+            raise SystemExit(3)
+        print(json.dumps({"child": child}, indent=1))
+        return
+    if args.action == "apply":
+        print(json.dumps(apply_share(i, ready=not args.allow_unready), indent=1, default=str))
+        return
+    st = share_storage(i)
+    mapping = ((read_json(i.area / "shares.json", {}) or {}).get("shares") or {}).get(SHARE)
+    print(json.dumps({"instance": i.id, "storage": st, "mapping": mapping,
+                      "mapping_matches": bool(mapping) and mapping.get("root") == st["root"] and mapping.get("storage") == st.get("storage"),
+                      "readiness": share_readiness(st), "child_default": child_storage(i)}, indent=1))
+
+
+def cmd_bootstrap_projects(i: Instance, args) -> None:
+    """Summon this installation's projects from a summonplan (workflow_editor docs/summon.md). With --plan <file>:
+    the mind repository is created or attached (`wfe mind init`), the plan is written there as
+    summonplans/<name>.yaml and named in mind.json; without it, the plan the mind repository already names is
+    applied. Then `wfe summon apply` (shown as a dry run first), and the Observer's settings follow roles.json."""
+    author = person_name(i)
+    name = None
+    if args.plan:
+        text = Path(args.plan).read_text()
+        m = re.search(r"(?m)^name:\s*[\"']?([a-z0-9][a-z0-9_.-]*)", text)
+        if not m:
+            raise SystemExit(f"{args.plan} has no summonplan name (name: <name>)")
+        name = m.group(1)
+    if not (i.area / "mind.json").exists():
+        say(wfe(i, "mind", "init", "--author", author, *(["--plan", name] if name else [])).strip())
+    if args.plan:
+        copy = i.area / ".local" / f"summonplan-{name}.yaml"
+        copy.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(args.plan, copy)
+        own(copy, i.core_account)
+        say(wfe(i, "mind", "plan", "put", str(copy), "--author", author, "--message", f"Summonplan {name} for {i.id} (agdevctl bootstrap-projects)").strip())
+        say(wfe(i, "mind", "plan", "use", name).strip())
+    print(wfe(i, "summon", "apply", "--dry-run", check=False))
+    if args.dry_run:
+        return
+    done = run_as(i, i.core_account, [str(i.area / "bin" / "wfe"), "summon", "apply", "--yes"], capture=True, check=False, cwd=str(i.area))
+    print(done.stdout or "", end="")
+    if done.stderr:
+        print(done.stderr, end="", file=sys.stderr)
+    # The Observer's [recovery] is rendered from roles.json; it reads it at start.
+    write_service_settings(i)
+    start_native(i, ["observer"], restart=True)
+    say("observer settings follow roles.json; observer restarted")
+    if done.returncode != 0:
+        raise SystemExit(f"wfe summon apply did not finish cleanly ({done.returncode}); repeat bootstrap-projects to continue it")
+
+
+def person_name(i: Instance) -> str:
+    """The person's name as conversations and records show it ([owner] person, else name)."""
+    return i.owner.get("person") or i.owner["name"]
+
+
+# ---- updates: the lifecycle service
+
+TERMINAL = ("succeeded", "failed", "refused")
+DRAIN_SECONDS = 6 * 3600
+# A request made from an attempt waits for that attempt and its run to end before anything is built.
+REQUESTER_SECONDS = 6 * 3600
+RESOLVE_SECONDS = 300  # a commit the run just made may take a moment to reach the mirror after the run completes
+
+
+def update_path(i: Instance, identity: str) -> Path:
+    return i.lifecycle / "updates" / f"{identity}.json"
+
+
+def advance(i: Instance, update: dict, state: str, **facts) -> None:
+    update["state"] = state
+    update.setdefault("history", []).append({"state": state, "at": now(), **facts})
+    update.update(facts)
+    write_json(update_path(i, update["id"]), update)
+    say(f"update {update['id']}: {state} {json.dumps(facts)[:300] if facts else ''}")
+
+
+def drain_file(i: Instance) -> Path:
+    return i.area / ".local" / "exec" / "drain"
+
+
+def alert_tool(i: Instance):
+    """The installed alert sender (runtime/agdev_alert.py beside this tool), or None."""
+    path = HERE / "runtime" / "agdev_alert.py"
+    if not path.is_file():
+        return None
+    import importlib.util
+    spec = importlib.util.spec_from_file_location("agdev_alert", path)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def tell_owner(i: Instance, text: str, *, severity: str = "info", event: str = "lifecycle", key: str | None = None, evidence: str | None = None) -> None:
+    # Directly, through the alert sender (independent of WFE): the outcome must arrive even when the replaced
+    # services did not come back. Without an alert route the lifecycle record is the only place it is said.
+    try:
+        tool = alert_tool(i)
+        if tool is None or not tool.configured(alerts_file(i)):
+            say("no alert route ([alerts]): the outcome is only in the lifecycle record")
+            return
+        done = tool.send(alerts_file(i), severity=severity, event=event, key=key or hashlib.sha256(text.encode()).hexdigest()[:12], text=text, evidence=evidence)
+        say(f"told the owner by alert {done.get('id')} ({'sent' if done.get('sent') else 'queued: ' + json.dumps(done)})")
+    except Exception as error:  # noqa: BLE001 - the durable record stands regardless
+        say(f"the alert sender failed: {error}")
+
+
+def store_facts(i: Instance, update: dict, previous: str | None, sha: str, mirror: Path) -> dict:
+    """What a person needs if the data does not fit the new code: a copy, and whether the schema text moved."""
+    db = i.area / ".local" / "exec" / "exec.sqlite"
+    keep = i.lifecycle / "backups" / update["id"]
+    keep.mkdir(parents=True, exist_ok=True)
+    facts: dict = {"backup": str(keep)}
+    if db.exists():
+        code = "import sqlite3,sys\na=sqlite3.connect(sys.argv[1]);b=sqlite3.connect(sys.argv[2]);a.backup(b);print(a.execute('PRAGMA integrity_check').fetchone()[0], a.execute('PRAGMA user_version').fetchone()[0])"
+        done = run([sys.executable, "-c", code, str(db), str(keep / "exec.sqlite")], capture=True)
+        facts["execStore"] = done.stdout.strip()
+    if previous:
+        changed = run(["git", "-C", str(mirror), "diff", "--stat", previous, sha, "--", "workflow_editor/server/exec.ts", "workflow_editor/server/migrate.ts", "agobserver/src/agobserver/wfstore.py"], capture=True, check=False).stdout.strip()
+        facts["storeCodeChanged"] = changed or False
+    return facts
+
+
+def requester_attempts(i: Instance, attempt: str) -> dict[str, str]:
+    """State of every attempt of the run that `attempt` belongs to, by attempt id; empty when `attempt` is not in the store."""
+    if not re.fullmatch(r"[A-Za-z0-9_.-]+", attempt):
+        raise RuntimeError(f"the requesting attempt id {attempt!r} is not an attempt id")
+    rows = sqlite_rows(i.area / ".local" / "exec" / "exec.sqlite",
+                       "SELECT id || '|' || state FROM attempts WHERE (workspace, workflow, run) = "
+                       f"(SELECT workspace, workflow, run FROM attempts WHERE id = '{attempt}')")
+    return dict(row.split("|", 1) for row in rows)
+
+
+def wait_for_requester(i: Instance, update: dict, *, limit: int = REQUESTER_SECONDS, poll: int = 10, sleep=time.sleep, clock=None) -> None:
+    """Return once the requesting attempt has ended and its run has no other open attempt.
+
+    The bound counts from the recorded `awaitingSince`, so a restart of the service neither
+    resets nor drops it. A requester that is not in the execution store can never end: fail now."""
+    clock = clock or (lambda: dt.datetime.now(dt.timezone.utc))
+    attempt = update["attempt"]
+    since = dt.datetime.fromisoformat(update["awaitingSince"])
+    while True:
+        states = requester_attempts(i, attempt)
+        if attempt not in states:
+            raise RuntimeError(f"the requesting attempt {attempt} is not in the execution store, so it cannot be waited for")
+        open_ones = sorted(a for a, state in states.items() if state != "ended")
+        if not open_ones:
+            return
+        if (clock() - since).total_seconds() > limit:
+            raise RuntimeError(f"the requesting run still had open attempts {open_ones} after {limit}s; the request was not performed")
+        if update.get("awaitingFor") != open_ones:
+            update["awaitingFor"] = open_ones
+            write_json(update_path(i, update["id"]), update)
+        sleep(poll)
+
+
+def resolve_commit(i: Instance, update: dict, *, limit: int = RESOLVE_SECONDS, sleep=time.sleep) -> str:
+    """The exact commit the request names, once it is in the source mirror.
+
+    A request names a full commit hash, never a moving ref: what is activated is what was asked for.
+    `onBranch` (an adoption, `agdev-update`) also requires the commit to be on that branch of the source,
+    so an installation adopts only integrated work. A request made from an attempt is retried within the
+    bound, because the run's own work reaches the source only after its attempt ends."""
+    commit = update["commit"]
+    if not re.fullmatch(r"[0-9a-f]{40}", commit):
+        raise RuntimeError(f"{commit!r} is not a full commit hash; a request names the exact revision to activate")
+    began = time.monotonic()
+    branch = update.get("onBranch") or ""
+    while True:
+        mirror = source_mirror(i)
+        present = run(["git", "-C", str(mirror), "cat-file", "-e", f"{commit}^{{commit}}"], capture=True, check=False).returncode == 0
+        if present and not branch:
+            return commit
+        if present and run(["git", "-C", str(mirror), "merge-base", "--is-ancestor", commit, f"refs/heads/{branch}"], capture=True, check=False).returncode == 0:
+            return commit
+        problem = (f"{commit} is not on {branch!r} of {i.source_url}; nothing was switched" if present
+                   else f"{commit} is not in the source {i.source_url}{' after the requester ended' if update.get('attempt') else ''}; nothing was switched")
+        if not update.get("attempt") or time.monotonic() - began > limit:
+            raise RuntimeError(problem)
+        sleep(15)
+
+
+def perform_update(i: Instance, update: dict) -> None:
+    identity = update["id"]
+    try:
+        if update["state"] == "requested":
+            if update.get("instance") != i.id:
+                advance(i, update, "refused", reason=f"the request names instance {update.get('instance')!r}; this is {i.id}")
+                return
+            if update.get("attempt"):
+                advance(i, update, "awaiting-requester", awaitingSince=now())
+            else:
+                advance(i, update, "building", resolved=resolve_commit(i, update))
+        if update["state"] == "awaiting-requester":
+            wait_for_requester(i, update)
+            advance(i, update, "building", resolved=resolve_commit(i, update))
+        if update["state"] == "building":
+            sha, mirror = build_release(i, update.get("resolved") or update["commit"])
+            advance(i, update, "draining", release=sha, runtime=runtime_facts(i), source=i.source_url)
+        mirror = source_mirror(i)
+        sha = update["release"]
+        if update["state"] == "draining":
+            if not drain_file(i).parent.exists():
+                drain_file(i).parent.mkdir(parents=True)
+                own(drain_file(i).parent, i.core_account, 0o2770)
+            drain_file(i).touch()
+            began = time.monotonic()
+            waiting: list[str] = []
+            while True:
+                waiting = open_attempts(i)
+                if not waiting:
+                    break
+                if time.monotonic() - began > DRAIN_SECONDS:
+                    raise RuntimeError(f"attempts still open after {DRAIN_SECONDS}s: {waiting}")
+                if update.get("waitingFor") != waiting:
+                    update["waitingFor"] = waiting
+                    write_json(update_path(i, identity), update)
+                time.sleep(10)
+            current = i.area / "service" / "current"
+            previous = read_json(current / "RELEASE.json", {}).get("agdevworld") if current.exists() else None
+            advance(i, update, "stopping", previous=previous, store=store_facts(i, update, previous, sha, mirror))
+        if update["state"] == "stopping":
+            stop_native(i)
+            select_release(i, sha, mirror)
+            advance(i, update, "starting")
+        if update["state"] == "starting":
+            drain_file(i).unlink(missing_ok=True)
+            # Only the core moves: Gitea and its state stay up across a core update.
+            not_started: dict[str, str] = {}
+            for group in (["wfe"], None, ["executor", "observer", "watchdog"]):
+                if group is None:
+                    compose(i, "up", "-d", "--no-deps", "--force-recreate", WEB_SERVICE)
+                    continue
+                try:
+                    start_native(i, group, restart=True)
+                except StartFailed as partial:
+                    not_started.update(partial.failed)
+            health = check_health(i, sha, 300)
+            if not_started:
+                # The release is switched and what did start serves it; say exactly that.
+                serving = "the core serves it" if health.get("healthy") else "its health check failed too"
+                why = "; ".join(f"{s}: {r}" for s, r in not_started.items())
+                advance(i, update, "failed", health=health, notStarted=not_started, reason=f"release {sha[:12]} is selected and {serving}, but {', '.join(not_started)} did not start ({why}); repair: agdevctl start")
+                tell_owner(i, f"Update {identity}: core {sha[:12]} is selected and {serving}, but {', '.join(not_started)} did not start. Repair on the host: agdevctl start. Evidence: {update_path(i, identity)}.",
+                           severity="critical", event=f"lifecycle:update:{identity}", key="partial", evidence=str(update_path(i, identity)))
+            elif health.get("healthy"):
+                advance(i, update, "succeeded", health=health)
+                origin = update.get("requestedBy") or {}
+                by = f" Requested by {origin.get('instance')} ({origin.get('run') or 'no run'})." if origin.get("instance") else ""
+                tell_owner(i, f"Update {identity} succeeded: core {sha[:12]} is active ({update.get('reason', '')}).{by}",
+                           severity="info", event=f"lifecycle:update:{identity}", key="succeeded", evidence=str(update_path(i, identity)))
+            else:
+                advance(i, update, "failed", health=health, reason="the replaced services did not report the release as healthy; it stays selected")
+                tell_owner(i, f"Update {identity} FAILED health checks on {sha[:12]}; the release stays selected. Evidence: {update_path(i, identity)} on the host.",
+                           severity="critical", event=f"lifecycle:update:{identity}", key="unhealthy", evidence=str(update_path(i, identity)))
+    except Exception as error:  # noqa: BLE001 - every failure ends as a discoverable record
+        drain_file(i).unlink(missing_ok=True)
+        reason = f"{' '.join(error.cmd[:3])}... exited {error.returncode}; output in {svc_log_file(i, 'lifecycle') if i.manager == 'launchd' else 'journalctl -u ' + lifecycle_unit(i)}" if isinstance(error, subprocess.CalledProcessError) else str(error)[-800:]
+        advance(i, update, "failed", reason=reason)
+        tell_owner(i, f"Update {identity} failed at {update['history'][-2]['state']}: {reason}",
+                   severity="critical", event=f"lifecycle:update:{identity}", key="failed", evidence=str(update_path(i, identity)))
+
+
+def cmd_supervise(i: Instance, args) -> None:
+    say(f"lifecycle service of {i.id} started")
+    loaded = hashlib.sha256(Path(__file__).read_bytes()).hexdigest()
+    # The service reads instance.toml once; a changed one ([source], [management], ...) is taken up by a restart.
+    configured = hashlib.sha256(i.config_path.read_bytes()).hexdigest()
+    if not args.once:
+        threading.Thread(target=status_writer, args=(i, threading.Event()), daemon=True, name="status").start()
+    while True:
+        # An activated core may carry a new version of this tool. Between updates (a started
+        # update continues from its record under whichever version resumes it) the service
+        # exits, and systemd restarts it from the installed copy.
+        if not args.once and hashlib.sha256((i.installed / "agdevctl").read_bytes()).hexdigest() != loaded:
+            say("the installed lifecycle tool changed; restarting into it")
+            return
+        if not args.once and hashlib.sha256(i.config_path.read_bytes()).hexdigest() != configured:
+            say(f"{i.config_path} changed; restarting to read it")
+            return
+        # Nothing is decided on a clock that cannot be trusted; waiting requests stay durable.
+        synced = host_clock_synchronized(i)
+        if not synced and not args.once:
+            time.sleep(5)
+            continue
+        for path in sorted((i.lifecycle / "updates").glob("*.json")):
+            # An update left mid-way by a restart continues from its recorded state.
+            update = read_json(path)
+            if update and update.get("state") not in TERMINAL:
+                perform_update(i, update)
+        for path in sorted((i.lifecycle / "requests").glob("*.json")):
+            update = ingest_request(i, path)
+            if update and update["state"] not in TERMINAL:
+                perform_update(i, update)
+        if args.once:
+            return
+        time.sleep(5)
+
+
+def unfinished_update(i: Instance, besides: str) -> str | None:
+    for path in sorted((i.lifecycle / "updates").glob("*.json")):
+        other = read_json(path) or {}
+        if path.stem != besides and other.get("state") not in TERMINAL:
+            return f"update {path.stem} is {other.get('state')}"
+    return None
+
+
+def ingest_request(i: Instance, path: Path) -> dict | None:
+    """One request file into its update record, at most once (improve_multinodes p3).
+
+    A request whose id already has an update record — a retry, or a crash between writing the record and
+    removing the file — is discarded: never a second update, never a new history. The record is written
+    before the file is removed. A peer request (`via: peer`, admitted by the link) gets this installation's
+    own branch policy and is refused while another update is unfinished or when peer updates are off."""
+    identity = path.stem
+    request = read_json(path)
+    if not isinstance(request, dict) or request.get("id") != identity:
+        path.rename(path.with_suffix(".rejected"))
+        say(f"request {path.name} is not a request of this id; set aside as {path.with_suffix('.rejected').name}, nothing performed")
+        return None
+    existing = read_json(update_path(i, identity))
+    if existing is not None:
+        path.unlink(missing_ok=True)
+        say(f"request {identity}: update {identity} exists ({existing.get('state')}); the request is discarded, nothing is repeated")
+        return None
+    update = {**request, "state": "requested", "history": [{"state": "requested", "at": now()}]}
+    problem = None
+    if request.get("via") == "peer":
+        policy = getattr(i, "management", {}) or {}
+        update["onBranch"] = policy.get("branch") or "main"
+        if policy.get("peer_updates", True) is False:
+            problem = "this installation's lifecycle takes no updates from peers ([management] peer_updates = false)"
+        else:
+            busy = unfinished_update(i, identity)
+            if busy:
+                problem = f"{busy}; a peer update is not queued behind another"
+    if problem:
+        update["state"] = "refused"
+        update["history"].append({"state": "refused", "at": now(), "reason": problem})
+        update["reason"] = problem
+    write_json(update_path(i, identity), update)
+    path.unlink(missing_ok=True)
+    if problem:
+        say(f"update {identity}: refused {problem}")
+    return update
+
+
+# ---- the installation's own status, for the link (improve_multinodes p3, docs/management.md)
+
+STATUS_SECONDS = 30
+
+
+def installation_status(i: Instance) -> dict:
+    """What the parent may observe: no paths, URLs or credentials. Written by the lifecycle, read by the link."""
+    current = i.area / "service" / "current"
+    active = (read_json(current / "RELEASE.json", {}) or {}).get("agdevworld") if current.exists() else None
+    serving = None
+    try:
+        with urllib.request.urlopen(f"http://127.0.0.1:{i.ports['web']}/wfe/api/version", timeout=5) as response:
+            version = json.load(response)
+        serving = {"release": (version.get("release") or {}).get("agdevworld"), "instance": version.get("instance")}
+    except Exception:  # noqa: BLE001 - not serving is the fact
+        serving = None
+    services = {}
+    for name in NATIVE_SERVICES:
+        try:
+            services[name] = "running" if svc_active(i, name) else "stopped"
+        except Exception:  # noqa: BLE001
+            services[name] = "unknown"
+    services["lifecycle"] = "running"
+    current_update = None
+    for path in sorted((i.lifecycle / "updates").glob("*.json")):
+        record = read_json(path) or {}
+        if record.get("state") not in TERMINAL:
+            current_update = {"id": path.stem, "state": record.get("state"), "since": ((record.get("history") or [{}])[-1]).get("at")}
+    tool = i.installed / "agdevctl"
+    return {"instance": i.id, "at": dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"), "release": {"active": active}, "serving": serving,
+            "services": services, "draining": drain_file(i).exists(), "update": current_update,
+            "tool": hashlib.sha256(tool.read_bytes()).hexdigest()[:12] if tool.exists() else None}
+
+
+def write_status(i: Instance) -> None:
+    write_json(i.lifecycle / "status" / "installation.json", installation_status(i))
+
+
+def status_writer(i: Instance, stop: threading.Event, seconds: float = STATUS_SECONDS) -> None:
+    """Beside the supervisor loop, so the status is current also during a build that takes most of an hour."""
+    while True:
+        try:
+            write_status(i)
+        except Exception as error:  # noqa: BLE001 - the next turn tries again; the link shows the age
+            say(f"could not write the installation status: {error}")
+        if stop.wait(seconds):
+            return
+
+
+def cmd_install_lifecycle(i: Instance, args) -> None:
+    """Install and start the lifecycle service: root, because it switches releases and restarts units."""
+    install_resources(i)
+    write_units(i, i.installed)
+    svc_start(i, "lifecycle")
+    say(f"installed and started the lifecycle service of {i.id} ({i.manager})")
+
+
+
+# ---- adopting an existing installation's state (docs/migration.md)
+
+ADOPTION_SCHEMA = "agdev.adoption.v1"
+# Area files that are this installation's own and regenerated, never taken from the predecessor.
+REGENERATED = {"instance.json", "gitea.json", "site.json", "placement.json", "system.json", "registry.json.lock"}
+# Folders of the predecessor's area that are its code or launcher, not its state.
+NOT_STATE = {"service", "bin", "authoring"}
+# Live path columns of the stores: where a service reads a file it wrote (history columns are left alone).
+PATH_COLUMNS = [("exec", "attempts", "log"), ("notify", "io_attempts", "log"), ("present", "instances", "log")]
+
+
+def adoption_file(i: Instance) -> Path:
+    return i.lifecycle / "adoption.json"
+
+
+def sqlite_backup(source: Path, target: Path) -> dict:
+    """A consistent copy through SQLite's backup API (the WAL included), and what it holds."""
+    code = ("import json,sqlite3,sys\na=sqlite3.connect(f'file:{sys.argv[1]}?mode=ro',uri=True,timeout=30);b=sqlite3.connect(sys.argv[2]);a.backup(b)\n"
+            "t=[r[0] for r in b.execute(\"SELECT name FROM sqlite_master WHERE type='table'\")]\n"
+            "src={n:a.execute(f'SELECT count(*) FROM \"{n}\"').fetchone()[0] for n in t};dst={n:b.execute(f'SELECT count(*) FROM \"{n}\"').fetchone()[0] for n in t}\n"
+            "print(json.dumps({'integrity':b.execute('PRAGMA integrity_check').fetchone()[0],'userVersion':b.execute('PRAGMA user_version').fetchone()[0],'source':src,'copy':dst}))\n"
+            "b.execute('PRAGMA journal_mode=WAL');b.close()")
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.unlink(missing_ok=True)
+    done = run([sys.executable, "-c", code, str(source), str(target)], capture=True)
+    facts = json.loads(done.stdout)
+    facts["equal"] = facts["source"] == facts["copy"]
+    return facts
+
+
+def clone_copy(source: Path, target: Path) -> None:
+    """Files as they are: clones on one APFS volume or reflinks where possible, a real copy otherwise."""
+    target.parent.mkdir(parents=True, exist_ok=True)
+    if DARWIN:
+        same = os.stat(source).st_dev == os.stat(target.parent).st_dev
+        run(["cp", *(["-c"] if same else []), "-pPR", str(source), str(target)])
+    else:
+        run(["cp", "-a", "--reflink=auto", str(source), str(target)])
+
+
+def predecessor_stores(source: Path) -> list[Path]:
+    return sorted((source / ".local").glob("*/*.sqlite")) + sorted(source.glob("slack/*.sqlite"))
+
+
+def store_counts(db: Path) -> dict:
+    """Rows per table, read-only: what a capture saw, compared again before a resume."""
+    code = ("import json,sqlite3,sys\nc=sqlite3.connect(f'file:{sys.argv[1]}?mode=ro',uri=True,timeout=30)\n"
+            "t=[r[0] for r in c.execute(\"SELECT name FROM sqlite_master WHERE type='table'\")]\n"
+            "print(json.dumps({n:c.execute(f'SELECT count(*) FROM \"{n}\"').fetchone()[0] for n in t}))")
+    return json.loads(run([sys.executable, "-c", code, str(db)], capture=True).stdout)
+
+
+def store_holders(files: list[Path]) -> list[str]:
+    """Processes that have any of these files open: a live writer of the predecessor (lsof; none where it is missing)."""
+    names = [str(f) for base in files for f in (base, Path(f"{base}-wal")) if f.exists()]
+    lsof = shutil.which("lsof") or ("/usr/sbin/lsof" if Path("/usr/sbin/lsof").exists() else None)
+    if not names or not lsof:
+        return []
+    done = run([lsof, "-F", "pc", "--", *names], capture=True, check=False)
+    held, pid = [], None
+    for line in done.stdout.splitlines():
+        if line.startswith("p"):
+            pid = line[1:]
+        elif line.startswith("c") and pid and pid != str(os.getpid()):
+            held.append(f"{pid} ({line[1:]})")
+    return sorted(set(held))
+
+
+# A predecessor whose executor wrote a heartbeat more recently than this is taken to be alive.
+LIVE_HEARTBEAT_SECONDS = 30
+
+
+def predecessor_facts(source: Path, observer_store: str | None = None) -> dict:
+    """What decides whether the predecessor can be captured now: its open work and any sign of a live writer.
+    A queued job is durable intent in the store and is carried as it is; a claimed job is a start in progress."""
+    exec_db = source / ".local" / "exec" / "exec.sqlite"
+    open_ = sqlite_rows(exec_db, "SELECT id FROM attempts WHERE state != 'ended'")
+    claimed = sqlite_rows(exec_db, "SELECT id FROM jobs WHERE state = 'claimed'")
+    queued = sqlite_rows(exec_db, "SELECT id FROM jobs WHERE state = 'queued'")
+    beat = sqlite_rows(exec_db, "SELECT max(at) FROM heartbeat") if exec_db.exists() else []
+    age = None
+    if beat and beat[0] not in ("None", ""):
+        try:
+            age = round((dt.datetime.now(dt.timezone.utc) - dt.datetime.fromisoformat(beat[0].replace("Z", "+00:00"))).total_seconds(), 1)
+        except ValueError:
+            age = None
+    watched = predecessor_stores(source) + ([Path(observer_store)] if observer_store else [])
+    reg = read_json(source / "registry.json", {})
+    return {"openAttempts": open_, "claimedJobs": claimed, "queuedJobs": queued, "heartbeat": beat[0] if beat else None,
+            "heartbeatAgeSeconds": age, "storeHolders": store_holders(watched),
+            "workspaces": len(reg.get("workspaces", [])), "instance": (read_json(source / "instance.json") or {}).get("id")}
+
+
+def adoption_problems(i: Instance, args, source: Path, old: str, facts: dict, record: dict | None) -> list[str]:
+    """Every reason not to copy now. The same checks hold for a resume: a recorded step is not
+    permission to continue against a predecessor that is alive again or changed since its capture."""
+    problems = []
+    if facts["openAttempts"] or facts["claimedJobs"]:
+        problems.append(f"the predecessor has open attempts {facts['openAttempts']} or claimed jobs {facts['claimedJobs']}: let them end or hold them first")
+    if facts["storeHolders"]:
+        problems.append(f"processes have the predecessor's stores open (a live writer): {', '.join(facts['storeHolders'])}; stop its services first")
+    if facts["heartbeatAgeSeconds"] is not None and facts["heartbeatAgeSeconds"] < LIVE_HEARTBEAT_SECONDS:
+        problems.append(f"the predecessor's executor wrote a heartbeat {facts['heartbeatAgeSeconds']}s ago: stop it and wait {LIVE_HEARTBEAT_SECONDS}s")
+    if any(svc_active(i, s) for s in NATIVE_SERVICES):
+        problems.append("this installation's core is running: stop it (agdevctl stop) before adopting")
+    if not (i.area / "service" / "current").exists():
+        problems.append("no release is selected here: `activate <commit> --no-start` first")
+    fresh = not read_json(i.area / "registry.json", {}).get("workspaces") and not (i.area / ".local" / "exec" / "exec.sqlite").exists()
+    if not fresh and not (record and record.get("source") == str(source)):
+        problems.append(f"{i.area} already holds state that no adoption from {source} made")
+    if not i.gitea_external:
+        problems.append("adoption continues on the predecessor's Gitea: it must be attached ([dependencies] gitea = \"external\")")
+    worker = i.c.get("execution", {}).get("worker", "local")
+    workers = read_json(source / "workers.json", {}) or {}
+    if workers.get("default") and workers["default"] != worker:
+        problems.append(f"[execution] worker is {worker!r}, the predecessor's local worker is {workers['default']!r}")
+    if record and args.resume and record.get("state") != "done":
+        recorded = {"source": record.get("source"), "originalArea": record.get("originalArea", record.get("source")), "instance": record.get("instance"),
+                    "isolated": bool(record.get("isolated")), "observerStore": record.get("observerStore")}
+        given = {"source": str(source), "originalArea": old, "instance": i.id, "isolated": bool(args.isolated), "observerStore": args.observer_store}
+        for key, value in given.items():
+            if recorded[key] != value:
+                problems.append(f"the recorded adoption has {key} {recorded[key]!r}, this call {value!r}: a resume continues the same inputs")
+        captured = ((record.get("steps") or {}).get("stores") or {}).get("result") or {}
+        for rel, facts_ in sorted(captured.items()):
+            db = source / rel
+            now_ = store_counts(db) if db.exists() else None
+            if now_ != facts_.get("source"):
+                problems.append(f"the predecessor's {rel} changed after it was captured ({facts_.get('source')} then, {now_} now): "
+                                "the copy no longer matches it; do not continue this adoption against changed data")
+    return problems
+
+
+def remap_area_paths(value, old: str, area: str, projects: str, folders: list[str]):
+    """Live paths of the predecessor's area, for the successor: a path inside one of its workspaces
+    follows that workspace into the project root; any other path under the area goes to the new area."""
+    for folder in folders:
+        value = remap_text(value, f"{old}/{folder}", f"{projects}/{folder}")
+    return remap_text(value, old, area)
+
+
+def workspace_folders(registry: dict, old: str) -> list[str]:
+    """Folder names of the workspaces that lived directly in the predecessor's area."""
+    return sorted({Path(w["path"]).name for w in registry.get("workspaces", []) if str(Path(w["path"]).parent) == old})
+
+
+def missing_live_paths(value, area: str, projects: str) -> list[str]:
+    """Strings in successor configuration naming a file under its area or project root that does not exist."""
+    found = []
+    if isinstance(value, str):
+        if (value.startswith(area + "/") or value.startswith(projects + "/")) and not Path(value).exists():
+            found.append(value)
+    elif isinstance(value, list):
+        for v in value:
+            found += missing_live_paths(v, area, projects)
+    elif isinstance(value, dict):
+        for v in value.values():
+            found += missing_live_paths(v, area, projects)
+    return found
+
+
+def remap_text(value, old: str, new: str):
+    if isinstance(value, str):
+        return value.replace(old, new) if value == old or value.startswith(old + "/") else value
+    if isinstance(value, list):
+        return [remap_text(v, old, new) for v in value]
+    if isinstance(value, dict):
+        return {k: remap_text(v, old, new) for k, v in value.items()}
+    return value
+
+
+def cmd_adopt(i: Instance, args) -> None:
+    """Continue an existing installation's state here: same Gitea, same identities (docs/migration.md).
+    Preview by default; --apply copies with a durable record, --resume continues it."""
+    source = Path(args.source).resolve()
+    # A snapshot keeps the paths of the area it was taken from: those are what the stores and settings name.
+    old = str(Path(args.original_area).resolve()) if args.original_area else str(source)
+    if not (source / "registry.json").exists():
+        raise SystemExit(f"{source} has no registry.json: not an operating area")
+    facts = predecessor_facts(source, args.observer_store)
+    record = read_json(adoption_file(i))
+    problems = adoption_problems(i, args, source, old, facts, record)
+    plan = {"source": str(source), "originalArea": old, "into": str(i.area), "projects": str(i.projects_root), "predecessor": facts,
+            "carried": {"queuedJobs": facts["queuedJobs"]}, "instance": i.id, "isolated": bool(args.isolated),
+            "observerStore": args.observer_store, "resume": bool(record and args.resume), "problems": problems}
+    if not args.apply:
+        print(json.dumps(plan, indent=1))
+        if problems:
+            raise SystemExit(1)
+        return
+    if record and args.resume and record.get("state") == "done":
+        raise SystemExit(f"the adoption recorded in {adoption_file(i)} is done; nothing to resume")
+    if problems:
+        raise SystemExit("adoption refused, nothing was changed:\n  " + "\n  ".join(problems))
+    if record and not args.resume and record.get("state") != "done":
+        raise SystemExit(f"an adoption is recorded in {adoption_file(i)}: continue it with --resume")
+    record = record if args.resume and record else {"schema": ADOPTION_SCHEMA, "source": str(source), "originalArea": old, "instance": i.id, "started": now(),
+                                                    "isolated": bool(args.isolated), "observerStore": args.observer_store, "steps": {}, "predecessor": facts}
+    if args.resume:
+        record.setdefault("resumes", []).append({"at": now(), "predecessor": facts})
+
+    def step(name: str, action) -> None:
+        if name in record["steps"]:
+            return
+        began = time.monotonic()
+        result = action()
+        record["steps"][name] = {"at": now(), "seconds": round(time.monotonic() - began, 1), **({"result": result} if result is not None else {})}
+        write_json(adoption_file(i), record)
+        say(f"adopt: {name} done ({record['steps'][name]['seconds']}s)")
+        if args.stop_after == name:
+            raise SystemExit(f"stopped after {name} as asked; continue with --resume")
+
+    area = i.area
+
+    def stores():
+        out = {}
+        for db in predecessor_stores(source):
+            rel = db.relative_to(source)
+            out[str(rel)] = sqlite_backup(db, area / rel)
+            if out[str(rel)]["integrity"] != "ok" or not out[str(rel)]["equal"]:
+                raise SystemExit(f"the copy of {rel} does not match: {out[str(rel)]}")
+        return out
+
+    def files():
+        copied = []
+        for item in sorted(source.iterdir()):
+            if item.name in NOT_STATE or item.name in REGENERATED or item.name.startswith(".DS_Store"):
+                continue
+            if item.name == ".local":
+                (area / ".local").mkdir(exist_ok=True)
+                for sub in sorted(item.iterdir()):
+                    target = area / ".local" / sub.name
+                    if sub.is_dir():
+                        for entry in sorted(sub.iterdir()):
+                            if entry.suffix == ".sqlite" or entry.name.endswith((".sqlite-wal", ".sqlite-shm")):
+                                continue
+                            if not (target / entry.name).exists():
+                                clone_copy(entry, target / entry.name)
+                    elif not target.exists():
+                        clone_copy(sub, target)
+                    copied.append(f".local/{sub.name}")
+                continue
+            if item.is_dir() and item.name.startswith("pj-") and any(remap_text(w["path"], old, str(source)) == str(item) for w in read_json(source / "registry.json")["workspaces"]):
+                continue   # workspaces move by relocation, into the project root
+            target = area / item.name
+            if item.is_dir() and item.name == "slack":
+                for entry in sorted(item.iterdir()):
+                    if not entry.name.endswith((".sqlite", ".sqlite-wal", ".sqlite-shm")) and not (target / entry.name).exists():
+                        clone_copy(entry, target / entry.name)
+            elif item.is_dir():
+                if target.exists() and not any(target.iterdir()):
+                    target.rmdir()
+                if not target.exists():
+                    clone_copy(item, target)
+            else:
+                shutil.copy2(item, target)
+            copied.append(item.name)
+        return copied
+
+    def remap_stores():
+        changed = {}
+        for store, table, column in PATH_COLUMNS:
+            db = area / ".local" / store / f"{store}.sqlite"
+            if not db.exists():
+                continue
+            code = ("import sqlite3,sys\nc=sqlite3.connect(sys.argv[1]);old,new=sys.argv[4],sys.argv[5]\n"
+                    "n=c.execute(f'UPDATE \"{sys.argv[2]}\" SET \"{sys.argv[3]}\" = ? || substr(\"{sys.argv[3]}\", ?) WHERE \"{sys.argv[3]}\" LIKE ?', (new + '/', len(old) + 2, old + '/%')).rowcount\n"
+                    "c.commit();print(n)")
+            changed[f"{store}.{table}.{column}"] = int(run([sys.executable, "-c", code, str(db), table, column, old, str(area)], capture=True).stdout.strip())
+        return changed
+
+    folders = workspace_folders(read_json(source / "registry.json", {}) or {}, old)
+
+    def remap(value):
+        return remap_area_paths(value, old, str(area), str(i.projects_root), folders)
+
+    def configure():
+        write_if_absent(area / "workspaces.json", remap(read_json(area / "workspaces.json", {}) or {"projects": {}}))
+        conv = read_json(area / "conversations.json")
+        if conv:
+            conv.setdefault("dialogue", {}).setdefault("env", {})["AGHANGOUT_CLAUDE"] = f"{i.tools['claude']}/claude"
+            write_json(area / "conversations.json", remap(conv))
+        present = read_json(area / "present.json")
+        if present:
+            present["answerBase"] = f"{i.web_url}/wfe/"
+            if args.isolated:
+                present["ports"] = list(i.ports.get("present", present.get("ports", [8300, 8399])))
+            write_json(area / "present.json", present)
+        for name in ("attachments.json", "run-backup.json", "shares.json", "challenges.json"):
+            value = read_json(area / name)
+            if value is None:
+                continue
+            if args.isolated and name == "run-backup.json":
+                (area / name).rename(area / f"{name}.isolated")   # no backup to another machine from a rehearsal
+                continue
+            if args.isolated and name == "attachments.json":
+                value.pop("backup", None)
+            write_json(area / name, remap(value))
+        if args.isolated:
+            w = read_json(area / "workers.json", {}) or {}
+            w["workers"] = {k: v for k, v in w.get("workers", {}).items() if v.get("local")}
+            write_json(area / "workers.json", w)
+        # Gitea: this installation's setting, with the predecessor's principals carried over.
+        old_gitea = read_json(source / "gitea.json", {}) or {}
+        principals = {}
+        for name, principal in (old_gitea.get("principals") or {}).items():
+            src_token = (source / principal["tokenFile"]).resolve() if not Path(principal["tokenFile"]).is_absolute() else Path(principal["tokenFile"])
+            dst_token = i.state / "gitea" / f"principal-{name}.token"
+            if src_token.exists():
+                write_private(dst_token, src_token.read_text())
+                principals[name] = {"tokenFile": str(dst_token)}
+        gitea = {"url": i.gitea_url, "owner": i.gitea_owner, "tokenFile": str(i.state / "gitea" / "owner.token"), **({"principals": principals} if principals else {})}
+        write_json(area / "gitea.json", gitea)
+        write_private(i.state / "gitea" / "owner.token", i.secret("gitea_owner_token") + "\n")
+        old_system = read_json(source / "system.json", {}) or {}
+        write_json(area / "system.json", {"note": "Operating boundary of this agdev area; system configuration, not part of any managed project.",
+                                          "protectedPaths": [{"path": str(i.state), "why": "this installation's credentials and service state"},
+                                                             {"path": str(i.lifecycle), "why": "the lifecycle service's records"}],
+                                          "retiredRepositories": old_system.get("retiredRepositories", [])})
+        lineage = {"from": old, "copyRead": str(source) if old != str(source) else None, "predecessorInstance": facts["instance"], "at": now(), "isolated": bool(args.isolated)}
+        write_json(area / "instance.json", {"id": i.id, "slug": i.slug, "root": str(i.root), "adoptedFrom": lineage})
+        write_placement(i)
+        write_site(i)
+        # Executor and Observer settings from this installation's inputs, carrying the predecessor's choices.
+        write_service_settings(i, isolated=bool(args.isolated))
+        if args.executor_local and Path(args.executor_local).exists():
+            write_private(i.state / "agautolab" / "agents.local.toml", Path(args.executor_local).read_text())
+        if args.observer_local and Path(args.observer_local).exists():
+            write_private(i.state / "agobserver" / "agents.local.toml", Path(args.observer_local).read_text())
+        if args.isolated:
+            drain = drain_file(i)
+            drain.parent.mkdir(parents=True, exist_ok=True)
+            drain.write_text("isolated adoption rehearsal: no attempt starts here\n")
+        return {"principals": sorted(principals), "lineage": lineage}
+
+    def observer():
+        if not args.observer_store:
+            return None
+        store = Path(args.observer_store)
+        result = {"store": sqlite_backup(store, i.state / "agobserver" / "workflow" / "observer.sqlite")}
+        for extra in ("watchdog.json",):
+            if (store.parent.parent / extra).exists():
+                shutil.copy2(store.parent.parent / extra, i.state / "agobserver" / extra)
+        return result
+
+    def registry():
+        # Workspaces are read where the source holds them (a snapshot's copies), then relocated.
+        reg = read_json(area / "registry.json")
+        moved = 0
+        for w in reg["workspaces"]:
+            path = remap_text(w["path"], old, str(source))
+            if path != w["path"]:
+                w["path"], moved = path, moved + 1
+        write_json(area / "registry.json", reg)
+        missing = [w["id"] for w in reg["workspaces"] if not Path(w["path"]).is_dir()]
+        if missing:
+            raise SystemExit(f"workspaces missing in {source}: {missing}")
+        return {"readFromCopy": moved}
+
+    def relocate():
+        wfe_ = [str(i.area / "bin" / "wfe"), "workspace", "relocate", "--all", "--to", str(i.projects_root), "--apply", "--by", f"agdevctl adopt ({i.id})", "--json"]
+        if record["steps"].get("relocate-started"):
+            wfe_ = [str(i.area / "bin" / "wfe"), "workspace", "relocate", "--resume", "--json"]
+        record["steps"]["relocate-started"] = {"at": now()}
+        write_json(adoption_file(i), record)
+        done = run_as(i, i.core_account, wfe_, capture=True, check=False, cwd=str(i.area))
+        if done.returncode != 0:
+            raise SystemExit(f"relocation failed ({done.returncode}): {(done.stderr or done.stdout)[-1500:]}\nContinue with `adopt --apply --resume`.")
+        j = json.loads(done.stdout)
+        return {"journal": j.get("id"), "workspaces": len(j.get("items", [])), "bytes": sum((it.get("count") or {}).get("bytes", 0) for it in j.get("items", []))}
+
+    def verify():
+        reg = read_json(area / "registry.json")
+        outside = [w["id"] for w in reg["workspaces"] if not str(Path(w["path"])).startswith(str(i.projects_root) + "/") or not Path(w["path"]).is_dir()]
+        leftovers, missing = {}, {}
+        for path in sorted(area.glob("*.json")):
+            text = path.read_text(errors="replace")
+            for prefix in {old, str(source)}:
+                if prefix in text:
+                    leftovers[f"{path.name}: {prefix}"] = text.count(prefix)
+            gone = missing_live_paths(read_json(path, {}), str(area), str(i.projects_root))
+            if gone:
+                missing[path.name] = gone
+        if outside:
+            raise SystemExit(f"workspaces not in the project root: {outside}")
+        return {"workspaces": len(reg["workspaces"]), "projects": len(reg.get("projects", [])), "repositories": len(reg.get("repositories", [])), "predecessorPathsLeft": leftovers, "missingLivePaths": missing}
+
+    step("stores", stores)
+    step("files", files)
+    step("remap-stores", remap_stores)
+    step("configure", configure)
+    step("observer", observer)
+    step("registry", registry)
+    step("relocate", relocate)
+    step("verify", verify)
+    record["state"] = "done"
+    record["finished"] = now()
+    write_json(adoption_file(i), record)
+    say(f"adopted {source} into {i.id}: {json.dumps(record['steps']['verify'].get('result'))}")
+
+
+def recovery_section(i: Instance, on: str) -> str:
+    """The Observer's [recovery], from the recovery and coordination roles in <area>/roles.json (summoner p2,
+    workflow_editor docs/summon.md). Without roles.json (no plan applied here) the section already in
+    workflow.toml is kept exactly; with neither, recovery is off: incidents go to the owner."""
+    doc = read_json(i.area / "roles.json", None)
+    if doc is None:
+        current = i.state / "agobserver" / "workflow.toml"
+        text = current.read_text() if current.exists() else ""
+        at = text.find("[recovery]")
+        if at >= 0:
+            kept = text[at:]
+            return kept if not isolated_off(on) else re.sub(r"(?m)^enabled\s*=.*$", "enabled = false", kept)
+        return "[recovery]\nenabled = false\n"
+    roles = doc.get("roles") or {}
+    r, c = roles.get("recovery"), roles.get("coordination")
+    if not r:
+        return "[recovery]\n# The recovery role is not filled here (roles.json): incidents go to the owner.\nenabled = false\n"
+    exempt = [f'{c["project"]}/{c["workflow"]}'] if c else []
+    return (f'[recovery]\n# From roles.json (plan {doc.get("plan")}): the recovery role.\nenabled = {on}\n'
+            f'workflow = "{r["project"]}/{r["workflow"]}"\nworkspace = "{r["workspace"]}"\nexempt = {json.dumps(exempt)}\n')
+
+
+def isolated_off(on: str) -> bool:
+    return on == "false"
+
+
+def service_files(i: Instance, isolated: bool = False) -> list[tuple[Path, str, str, int | None]]:
+    """(path, text, account, private mode or None) of the executor's and Observer's settings, `submitters.json`
+    and the alert configuration, rendered from this installation's inputs."""
+    area, state = i.area, i.state
+    worker = i.c.get("execution", {}).get("worker", "local")
+    lanes = i.c.get("execution", {}).get("lanes", ["conversation", "coordination"])
+    judge = "true" if i.c.get("execution", {}).get("observer_judge") else "false"
+    on = "false" if isolated else "true"
+    files: list[tuple[Path, str, str, int | None]] = [
+        (state / "agautolab" / "wfexec.toml",
+         f'wfe = ["{area}/bin/wfe"]\nworker = "{worker}"\nlanes = {json.dumps(lanes)}\ndrain_file = "{area}/.local/exec/drain"\n',
+         i.core_account, None),
+        (state / "agobserver" / "workflow.toml",
+         f'wfe = ["{area}/bin/wfe"]\nchannel = "agobserver-{i.slug}"\ninterval_seconds = 60\njudge = {judge}\n\n'
+         + recovery_section(i, on),
+         i.monitor_account, None),
+        (state / "agobserver" / "instance.toml", f'name = "agobserver-{i.slug}"\n', i.monitor_account, None),
+        (state / "agautolab" / "instance.toml", f'name = "autolab-{i.slug}"\n', i.core_account, None),
+    ]
+    # submitters.json (who may submit what through WFE, e.g. the Observer to the recovery workflow) is derived
+    # from the recovery role by `wfe summon apply` (workflow_editor docs/summon.md); the installer writes none.
+    a = i.alerts_cfg
+    if a:
+        if a.get("route") != "slack" or not a.get("token_file") or not a.get("channel"):
+            raise SystemExit('[alerts] needs route = "slack", token_file (the bot token on this host) and channel (a channel or member id)')
+        token = state / "alerts" / "slack.token"
+        files += [(token, Path(a["token_file"]).read_text().strip() + "\n", i.monitor_account, 0o600),
+                  (alerts_file(i), json.dumps({"version": 1, "instance": i.id, "display": i.c.get("display", {}).get("name") or i.project, "route": "slack",
+                                               "tokenFile": str(token), "channel": a["channel"]}, indent=1) + "\n", i.monitor_account, None)]
+    return files
+
+
+def write_service_settings(i: Instance, isolated: bool = False) -> None:
+    """wfexec.toml, workflow.toml, the instance names, credentials, submitters and alerts, from this installation's inputs."""
+    for path, text, account, private in service_files(i, isolated):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        if path.parent.name == "alerts":
+            own(path.parent, account, 0o2770, group=i.core_account)
+        if private is not None:
+            write_private(path, text)
+        else:
+            path.write_text(text)
+        own(path, account, private)
+
+
+def cmd_services_config(i: Instance, args) -> None:
+    """Apply the service settings to a running installation (e.g. after changing [alerts] or [execution]);
+    --restart restarts the services that read them."""
+    write_service_settings(i)
+    # The units carry the alert sender's environment; a release activated by an older lifecycle tool wrote them without it.
+    write_units(i, i.installed)
+    say(f"service settings and units written (alerts {'configured' if i.alerts_cfg else 'none'})")
+    if args.restart:
+        start_native(i, ["executor", "observer", "watchdog"], restart=True)
+        say("executor, observer and watchdog restarted")
+
+
+def cmd_alerts(i: Instance, args) -> None:
+    """The alert route: its state, or (--diagnostic) one alert labelled as a diagnostic, sent without WFE."""
+    tool = alert_tool(i)
+    if tool is None:
+        raise SystemExit("runtime/agdev_alert.py is not installed beside this agdevctl")
+    if args.diagnostic:
+        print(json.dumps(tool.send(
+            alerts_file(i), severity="info", event="diagnostic:alert-route", key=now(),
+            text=f"Diagnostic only, nothing is wrong: {i.c.get('display', {}).get('name') or i.project} ({i.id}) can alert its owner without WFE ({now()})."), indent=1))
+    elif args.flush:
+        print(json.dumps(tool.flush(alerts_file(i)), indent=1))
+    print(json.dumps(tool.status(alerts_file(i)), indent=1))
+
+
+def cmd_render(i: Instance, args) -> None:
+    """What this installation's inputs make, written under --out instead of in place (nothing live is touched):
+    the service settings, the units or LaunchAgents, and a summary of the infrastructure and alert route."""
+    out = Path(args.out)
+    out.mkdir(parents=True, exist_ok=False)
+    def put(path: Path, text: str) -> None:
+        target = out / str(path).lstrip("/")
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(text)
+    for path, text, account, private in service_files(i):
+        put(path, f"<a private copy, {len(text)} bytes, for {account}>\n" if private is not None else text)
+    if i.manager == "launchd":
+        for service, agent in agent_definitions(i).items():
+            put(plist_path(i, service), json.dumps(agent, indent=1) + "\n")
+    else:
+        for name, text in systemd_units(i, HERE).items():
+            put(Path("/etc/systemd/system") / name, text)
+    summary = {"infraServices": i.infra, "upInfra": (["docker", "compose", "up", "-d", *i.infra] if i.infra else None),
+               "alerts": {"configured": bool(i.alerts_cfg), "file": str(alerts_file(i))}, "nativeServices": {s: core_exec(i, s)[2] for s in NATIVE_SERVICES}}
+    (out / "summary.json").write_text(json.dumps(summary, indent=1) + "\n")
+    print(json.dumps(summary, indent=1))
+
+
+def cmd_area_skeleton(i: Instance, args) -> None:
+    """The folders and an empty registry a release needs before `activate --no-start`, for a successor that adopts."""
+    ensure_folders(i)
+    ensure_projects_root(i)
+    write_if_absent(i.area / "registry.json", {"approver": "", "workspaces": [], "repositories": [], "projects": []})
+    write_json(i.area / "instance.json", {"id": i.id, "slug": i.slug, "root": str(i.root)})
+    say(f"area skeleton at {i.area}; next: activate <commit> --no-start, then adopt")
+
+# ---- operation from another installation (install/agdev-remote is the other end)
+
+REMOTE_SERVICES = NATIVE_SERVICES + [WEB_SERVICE, "lifecycle"]
+REQUEST_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,63}")
+
+
+def find_update(i: Instance, identity: str) -> dict | None:
+    """A request by id, wherever it is now: still waiting in requests/, or an update in its record."""
+    return read_json(update_path(i, identity)) or read_json(i.lifecycle / "requests" / f"{identity}.json")
+
+
+def remote_answer(i: Instance, request: dict) -> dict:
+    """One operation asked by another installation. Every answer names this installation; an operation with
+    an effect needs `expect` to be this instance id and changes nothing otherwise."""
+    op = request.get("op")
+    answer: dict = {"instance": i.id, "op": op}
+    if op in ("deploy", "repair") or request.get("expect"):
+        if request.get("expect") != i.id:
+            return {**answer, "ok": False, "error": "identity-mismatch",
+                    "detail": f"the request expects instance {request.get('expect')!r}; this is {i.id}; nothing was changed"}
+    if op == "identity":
+        current = i.area / "service" / "current"
+        return {**answer, "ok": True, "name": (read_json(i.area / "site.json", {}) or {}).get("name"), "slug": i.slug,
+                "release": read_json(current / "RELEASE.json", {}).get("agdevworld") if current.exists() else None, "source": i.source_url}
+    if op == "status":
+        return {**answer, "ok": True, "status": status_facts(i)}
+    if op == "update":
+        identity = str(request.get("id", ""))
+        found = find_update(i, identity) if REQUEST_ID.fullmatch(identity) else None
+        return {**answer, "ok": found is not None, "update": found, **({} if found else {"error": "unknown-request"})}
+    if op == "deploy":
+        identity, commit = str(request.get("request", "")), str(request.get("commit", ""))
+        if not REQUEST_ID.fullmatch(identity) or not re.fullmatch(r"[0-9a-f]{40}", commit):
+            return {**answer, "ok": False, "error": "bad-request", "detail": "deploy needs a request id and a full commit hash"}
+        existing = find_update(i, identity)
+        if existing:
+            # A retry after a lost answer: the same request, never a second update.
+            same = existing.get("commit") == commit
+            return {**answer, "ok": same, "duplicate": True, "update": existing, **({} if same else {"error": "request-id-reused"})}
+        # Only an installation its owner designated as a candidate takes deploys ([remote] candidate = true): a node
+        # with durable work keeps remote access for recovery, and its releases come through its parent (p2).
+        if i.remote.get("candidate") is not True:
+            return {**answer, "ok": False, "error": "not-a-candidate",
+                    "detail": f"{i.id} is not a candidate installation ([remote] candidate = true in its instance.toml); "
+                              "status, logs, update and repair remain; nothing was changed"}
+        # No `attempt`: the requesting run belongs to the other installation, so this one's lifecycle
+        # neither waits for it nor looks it up; its own open attempts are drained as for any update.
+        record = {"id": identity, "instance": i.id, "commit": commit, "reason": str(request.get("reason", ""))[:500], "requestedAt": now(),
+                  "run": "", "attempt": "", "requestedBy": {k: str(v)[:200] for k, v in (request.get("from") or {}).items()}}
+        write_json(i.lifecycle / "requests" / f"{identity}.json", record)
+        return {**answer, "ok": True, "duplicate": False, "update": record}
+    if op == "logs":
+        service, lines = request.get("service"), max(1, min(int(request.get("lines", 200)), 2000))
+        if service not in REMOTE_SERVICES + INFRA_SERVICES:
+            return {**answer, "ok": False, "error": "bad-request", "detail": f"service must be one of {REMOTE_SERVICES + INFRA_SERVICES}"}
+        if service in NATIVE_SERVICES or service == "lifecycle":
+            log = svc_logs(i, service, lines)
+        else:
+            out = compose(i, "logs", "--no-color", "--tail", str(lines), service, capture=True, check=False)
+            log = out.stdout + out.stderr
+        return {**answer, "ok": True, "service": service, "log": log[-400000:]}
+    if op == "repair":
+        action, services = request.get("action"), list(request.get("services") or [])
+        if action not in ("start", "stop", "restart") or not services or any(s not in REMOTE_SERVICES for s in services):
+            return {**answer, "ok": False, "error": "bad-request", "detail": f"repair needs start|stop|restart and services from {REMOTE_SERVICES}"}
+        done = {}
+        for service in services:
+            if service == WEB_SERVICE:
+                result = compose(i, {"restart": "restart", "start": "start", "stop": "stop"}[action], WEB_SERVICE, capture=True, check=False)
+            elif action == "stop":
+                result = svc_stop(i, service)
+            else:
+                try:
+                    svc_start(i, service, restart=action == "restart")
+                    result = subprocess.CompletedProcess([], 0, "", "")
+                except subprocess.CalledProcessError as error:
+                    result = subprocess.CompletedProcess([], error.returncode, error.stdout or "", error.stderr or "")
+            done[service] = {"exit": result.returncode, "output": (result.stdout + result.stderr)[-2000:]}
+        return {**answer, "ok": all(d["exit"] == 0 for d in done.values()), "done": done, "status": status_facts(i)}
+    return {**answer, "ok": False, "error": "bad-request", "detail": "op is one of identity, status, update, deploy, logs, repair"}
+
+
+def cmd_remote(i: Instance, args) -> None:
+    """The forced command of the remote-operation key: one JSON request on stdin, one JSON answer on stdout.
+    Paths come from this installation's config only; nothing of the caller's environment is used."""
+    for name in [n for n in os.environ if n.startswith(("AGDEV_", "WFE_"))]:
+        del os.environ[name]
+    try:
+        request = json.loads(sys.stdin.read(65536) or "{}")
+        answer = remote_answer(i, request if isinstance(request, dict) else {})
+    except Exception as error:  # noqa: BLE001 - the caller gets the reason, not a traceback
+        answer = {"instance": i.id, "ok": False, "error": "failed", "detail": str(error)[-800:]}
+    print(json.dumps(answer, ensure_ascii=False))
+    sys.exit(0 if answer.get("ok") else 2 if answer.get("error") == "identity-mismatch" else 1)
+
+
+def remote_sudoers(account: str, command: str) -> str:
+    """The one command the remote account may run as root: the program by its absolute path, with fixed arguments."""
+    return f"# agdevctl remote-access: {account} may run only this installation's remote entry\n{account} ALL=(root) NOPASSWD: {command}\n"
+
+
+def cmd_remote_access(i: Instance, args) -> None:
+    """Let the holder of one public key operate this installation through `remote` only: a dedicated account
+    whose key runs a forced command, and a sudoers entry for exactly that command."""
+    account = i.remote.get("account", f"agdev-remote")
+    key = Path(args.key_file).read_text().strip()
+    if not re.fullmatch(r"(ssh-ed25519|ecdsa-sha2-nistp256|ssh-rsa) [A-Za-z0-9+/=]+( [^\n]*)?", key):
+        raise SystemExit(f"{args.key_file} is not one public key; nothing was changed")
+    ensure_account(i, account, f"{i.account_homes}/remote", "/bin/sh")
+    home = Path(pwd.getpwnam(account).pw_dir)
+    (home / ".ssh").mkdir(exist_ok=True)
+    own(home / ".ssh", account, 0o700)
+    command = f"{i.installed / 'agdevctl'} --config {i.config_path} remote"
+    (home / ".ssh" / "authorized_keys").write_text(f'restrict,command="sudo -n {command}" {key}\n')
+    own(home / ".ssh" / "authorized_keys", account, 0o600)
+    sudoers = Path(f"/etc/sudoers.d/agdev-remote-{i.slug}")
+    text = remote_sudoers(account, command)
+    with tempfile.NamedTemporaryFile("w", dir="/etc/sudoers.d", prefix=".agdev-", delete=False) as tmp:
+        tmp.write(text)
+    os.chmod(tmp.name, 0o440)
+    if run(["visudo", "-cf", tmp.name], capture=True, check=False).returncode != 0:
+        os.unlink(tmp.name)
+        raise SystemExit("the sudoers entry did not validate; nothing was installed")
+    os.replace(tmp.name, sudoers)
+    host_keys = sorted(run(["sh", "-c", "cat /etc/ssh/ssh_host_*_key.pub"], capture=True).stdout.split("\n"))
+    say(f"{account} may operate {i.id} with that key; give the operating installation one of these host keys:\n" + "\n".join(k for k in host_keys if k))
+
+
+def cmd_target(i: Instance, args) -> None:
+    """Prepare this installation's runs to operate the target named in [targets.<name>]: a key of the core
+    account, the target's host key as given (never learned on first contact), and config/targets.json."""
+    if args.name not in i.targets:
+        raise SystemExit(f"[targets.{args.name}] is not in {i.config_path}; nothing was changed")
+    home = Path(pwd.getpwnam(i.core_account).pw_dir)
+    folder = home / ".ssh" / "agdev-targets"
+    folder.mkdir(parents=True, exist_ok=True)
+    for path in (home / ".ssh", folder):
+        own(path, i.core_account, 0o700)
+    described = {}
+    for name, target in i.targets.items():
+        for field in ("host", "instance", "host_key"):
+            if not target.get(field):
+                raise SystemExit(f"[targets.{name}] needs {field}; nothing was changed")
+        key = folder / name
+        if not key.exists():
+            run_as(i, i.core_account, ["ssh-keygen", "-q", "-t", "ed25519", "-N", "", "-C", f"{i.id} runs -> {name}", "-f", str(key)], service=False)
+        known = folder / f"{name}.known_hosts"
+        known.write_text(f"{target['host']} {target['host_key'].strip()}\n")
+        own(known, i.core_account, 0o600)
+        role = target.get("role", "candidate")
+        if role not in ("candidate", "recovery"):
+            raise SystemExit(f"[targets.{name}] role must be candidate or recovery; nothing was changed")
+        described[name] = {"host": target["host"], "user": target.get("user", "agdev-remote"), "instance": target["instance"],
+                           "role": role, "web": target.get("web", ""), "key": str(key), "knownHosts": str(known)}
+    write_json(i.config / "targets.json", {"from": i.id, "targets": described})
+    write_units(i, i.installed)   # the services' environment names targets.json
+    say(f"target {args.name} prepared; install this public key on it with `agdevctl remote-access --key-file`:\n{(folder / (args.name + '.pub')).read_text().strip()}")
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(prog="agdevctl", description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("--config", required=True, help="the installation's instance.toml")
+    commands = parser.add_subparsers(dest="command", required=True)
+    add = lambda name, func, help: commands.add_parser(name, help=help).set_defaults(func=func) or commands.choices[name]  # noqa: E731
+    add("init", cmd_init, "create the root, instance id and secrets; safe to repeat")
+    up = add("up", cmd_up, "create and start a stage's services")
+    up.add_argument("stage", choices=["infra", "core", "all"])
+    stop = add("stop", cmd_stop, "stop services (all by default)")
+    stop.add_argument("services", nargs="*")
+    start = add("start", cmd_start, "start stopped services (all by default)")
+    start.add_argument("services", nargs="*")
+    add("status", cmd_status, "services, clock, release, drain and last update")
+    add("inventory", cmd_inventory, "the containers, networks, volumes, units, accounts and paths of this installation")
+    remove = add("remove", cmd_remove, "delete this installation's resources; bundles stay")
+    remove.add_argument("--confirm-instance", required=True)
+    remove.add_argument("--keep-evidence", help="folder outside the root that receives the removed inventory")
+    remove.add_argument("--purge-accounts", action="store_true", help="also delete the service accounts and their homes, including the model login")
+    add("provision-gitea", cmd_provision_gitea, "owner account and token")
+    add("import-sources", cmd_import_sources, "push the bundles of <root>/bundles/manifest.json to this Gitea")
+    add("export-sources", cmd_export_sources, "bundle Gitea's current main of every manifest source")
+    add("area-init", cmd_area_init, "write the operating area's configuration from this installation's inputs")
+    projects = add("bootstrap-projects", cmd_bootstrap_projects, "summon the projects of a summonplan (wfe summon apply)")
+    projects.add_argument("--plan", help="a summonplan file to put in the mind repository and apply; default: the plan mind.json names")
+    projects.add_argument("--dry-run", action="store_true", help="show what apply would change, change nothing")
+    build = add("release-build", cmd_release_build, "build and check a release of a core revision")
+    build.add_argument("commit")
+    activate = add("activate", cmd_activate, "build if needed, select and start a release (no attempt may be open)")
+    activate.add_argument("commit")
+    activate.add_argument("--no-start", action="store_true", help="select the release but start nothing (a successor before `adopt`)")
+    supervise = add("supervise", cmd_supervise, "the lifecycle service: perform persisted update requests")
+    supervise.add_argument("--once", action="store_true")
+    add("install-lifecycle", cmd_install_lifecycle, "install and start the lifecycle service")
+    add("display", cmd_display, "apply the inputs' [display] (name, parent, Boast links) to the running installation")
+    storage = add("storage", cmd_storage, "shared storage: show | child-default | declare <json> | apply (docs/storage.md)")
+    storage.add_argument("action", choices=["show", "child-default", "declare", "apply"])
+    storage.add_argument("json", nargs="?", default="{}", help="declare: the [shares.agshare] settings as JSON")
+    storage.add_argument("--allow-unready", action="store_true", help="apply: write the mapping even if the storage is not reachable yet")
+    adopt = add("adopt", cmd_adopt, "continue an existing installation's state here (docs/migration.md); preview unless --apply")
+    adopt.add_argument("source", help="the predecessor's operating area (quiesced), or a consistent snapshot of it")
+    adopt.add_argument("--apply", action="store_true")
+    adopt.add_argument("--resume", action="store_true", help="continue a recorded adoption")
+    adopt.add_argument("--isolated", action="store_true", help="a rehearsal: recovery, remote workers and backups off; executor drained")
+    adopt.add_argument("--original-area", help="for a snapshot: the area it was taken from, which its stores and settings name")
+    adopt.add_argument("--observer-store", help="the predecessor's Observer store (observer.sqlite)")
+    adopt.add_argument("--executor-local", help="the predecessor executor's agents.local.toml (harness and profile settings)")
+    adopt.add_argument("--observer-local", help="the predecessor Observer's agents.local.toml")
+    adopt.add_argument("--stop-after", help="stop after the named step (trials of interruption)")
+    sc = add("services-config", cmd_services_config, "write the executor's and Observer's settings, submitters and alerts from the inputs")
+    sc.add_argument("--restart", action="store_true", help="then restart executor, observer and watchdog")
+    al = add("alerts", cmd_alerts, "the owner alert route (independent of WFE): status, --flush, --diagnostic")
+    al.add_argument("--diagnostic", action="store_true", help="send one alert labelled as a diagnostic")
+    al.add_argument("--flush", action="store_true", help="try what is owed now")
+    rd = add("render", cmd_render, "write what the inputs make (settings, units, summary) under --out; nothing live changes")
+    rd.add_argument("--out", required=True, help="a new folder")
+    add("area-skeleton", cmd_area_skeleton, "folders and an empty registry for a successor that adopts (instead of area-init)")
+    add("placement", cmd_placement, "apply [projects] root: where new and obtained workspaces go (existing ones move with wfe workspace relocate)")
+    add("remote", cmd_remote, "the forced command of remote operation: a JSON request on stdin (install/agdev-remote is the client)")
+    access = add("remote-access", cmd_remote_access, "let one public key operate this installation through `remote` only")
+    access.add_argument("--key-file", required=True)
+    target = add("target", cmd_target, "prepare runs here to operate the installation in [targets.<name>] (key, verified host key)")
+    target.add_argument("name")
+    args = parser.parse_args()
+    i = Instance(Path(args.config))
+    if i.manager == "systemd" and os.geteuid() != 0:
+        raise SystemExit("agdevctl runs as root (sudo) here: it administers Docker, units and accounts for this installation")
+    if i.manager == "launchd" and os.geteuid() == 0:
+        raise SystemExit("on macOS agdevctl runs as the installation's user, without sudo: its services are that user's LaunchAgents")
+    args.func(i, args)
+
+
+if __name__ == "__main__":
+    main()

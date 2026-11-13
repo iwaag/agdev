@@ -1,0 +1,19 @@
+version = 1
+revision = 3
+requires-python = ">=3.11"
+
+[[package]]
+name = "agobserver"
+version = "0.1.0"
+source = { editable = "." }
+dependencies = [
+    { name = "pyagag" },
+]
+
+[package.metadata]
+requires-dist = [{ name = "pyagag", git = "https://github.com/iwaag/pyagag.git?rev=03a2a325e8f0a9392f69275b1253d95ab67a360d" }]
+
+[[package]]
+name = "pyagag"
+version = "0.1.0"
+source = { git = "https://github.com/iwaag/pyagag.git?rev=03a2a325e8f0a9392f69275b1253d95ab67a360d#03a2a325e8f0a9392f69275b1253d95ab67a360d" }

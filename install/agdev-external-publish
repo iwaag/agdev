@@ -1,0 +1,987 @@
+#!/usr/bin/env python3
+"""agdev-external-publish: external (public, e.g. GitHub) publication of a project's repositories.
+
+This is *external* publication: an edited, selected derivative of internal repositories, with its own
+public history. It is not the workflow publication of runs to Gitea, and not a mirror. The internal
+repositories stay the development authority; nothing is ever force-pushed, mirrored or deleted.
+
+  agdev-external-publish [--workspace W] [--source S] [--contract C] <command>
+
+  plan    [--rev R]                 the repository graph at R: identities, pins, destinations, problems
+  build   [--rev R] --out DIR       write every candidate of the graph to DIR/<name>/ and search them
+  stage   [--rev R] --message M     stage the graph, dependencies first, as local commits in each public
+                                    checkout: a first publication as a root commit; an update as the change
+                                    from the last published candidate to the new one, applied onto the public
+                                    head (public-side edits survive; a conflict stops and is recorded)
+  resolve --repo ID --note TEXT     accept a conflict resolved in the checkout (rechecks the resolved tree)
+  abort   --repo ID                 drop a conflicted staging; the public checkout returns to its base
+  push    [--stop-before ID]        push staged repositories, dependencies first, each only after its
+                                    dependencies' public commits are verified on their public remotes
+  status                            the journal: source/public pairs, staged and pending work
+  convert-journal                   convert a forge.publication.v1 journal to this schema (keeps a copy)
+
+Layout (workspace = the folder holding the project's `source/` checkout):
+  <source>/<contract>                 contract (default publication/github.toml), read at the pinned revision,
+                                      with publication/overlay/; each child repository has its own
+  <workspace>/published/              public checkout of a single repository, or published/<name>/ for each
+                                      repository of a graph
+  <workspace>/.agdev/publication/     github.json (journal), inputs/<sha256> (admitted workspace files), .lock
+
+Contract (TOML, schema agdev.publication.v1; forge.publication.v1 is read for old revisions):
+  destination, branch, visibility, license     the public repository
+  forbidden = [...]                            literal strings that must not occur (case-insensitive)
+  local_secrets = ["forge.env"]                optional KEY=VALUE files of the workspace whose values must not
+                                               occur (findings name the key, never the value)
+  [[allow]] file, found, why                   a reviewed exception for one finding label and file glob
+  [[tree]] public, from, [exclude]             a directory: every file under from = source:<dir> | overlay:<dir>
+                                               ("source:" = the whole repository) at the pinned revision, placed
+                                               under public ("" = the root), minus exclude globs relative to from
+                                               (a glob matching a directory drops it); never gitlinks,
+                                               .gitmodules, symbolic links or the source's publication/
+  [[file]] public, from, [sha256], [[file.edit]] old, new, [count]
+        from = source:<path> | overlay:<path> | workspace:<path> (+ sha256, kept by hash)
+        a [[file]] naming a path a [[tree]] also selects decides that path (with its edits)
+  [[submodule]] path, contract                 a submodule published with this repository (its gitlink at
+                                               the pinned revision selects the child's input commit)
+  [[exclude]] path, why                        a submodule deliberately left out of the public tree
+A submodule of the source that is neither declared nor excluded stops the build.
+
+Ownership: `stage --owner O` records who a staging belongs to (a workflow run); `push`, `resolve` and `abort`
+then need the same `--owner`, `push --operation <stage id>` refuses when the assessed staging was replaced, and
+staging over another owner's unfinished staging needs `--take-over <reason>` (recorded).
+
+Standard library only; Python >= 3.11. Exit status 1 with `agdev-external-publish [<code>]: <reason>` on any
+refusal; codes: conflict, stale-public-head, unavailable-source, child-not-public, graph, contract, check-failed,
+checkout-state, owner, busy, infrastructure, usage.
+"""
+from __future__ import annotations
+
+import argparse
+import fcntl
+import hashlib
+import json
+import os
+import subprocess
+import sys
+import tempfile
+import tomllib
+from contextlib import contextmanager
+from datetime import datetime, timezone
+from fnmatch import fnmatch
+from pathlib import Path
+from urllib.parse import urlsplit
+
+SCHEMAS = {"agdev.publication.v1", "forge.publication.v1"}
+JOURNAL_SCHEMA = "agdev.publication.v1.journal"
+DEFAULT_CONTRACT = "publication/github.toml"
+OVERLAY = "publication/overlay"
+
+
+class Refusal(SystemExit):
+    """A stop with a category (`code`) a workflow can act on: conflict, stale-public-head, unavailable-source,
+    child-not-public, graph, contract, check-failed, checkout-state, owner, busy, infrastructure, usage."""
+    code = "refused"
+
+    @classmethod
+    def coded(cls, code: str, message: str) -> "Refusal":
+        refusal = cls(message)
+        refusal.code = code
+        return refusal
+
+
+# ---------------------------------------------------------------- operation ownership
+
+UNFINISHED = ("staging", "staged", "partial", "conflict")
+
+
+def last_stage(journal: dict) -> dict | None:
+    ops = [o for o in journal.get("operations", []) if o.get("command") == "stage"]
+    return ops[-1] if ops else None
+
+
+def check_owner(journal: dict, owner: str | None, action: str, take_over: str | None = None) -> None:
+    """A staging with an owner can be pushed, resolved or aborted only by that owner (a workflow run). Stagings
+    made without one (by hand, before owners existed) stay operable without one."""
+    op = last_stage(journal)
+    held = op.get("owner") if op else None
+    if held and owner != held and take_over:
+        op.setdefault("notes", []).append(f"{now()}: {action} by {owner or 'no owner'} taking over from {held}: {take_over}")
+        return
+    if held and owner != held:
+        raise Refusal.coded("owner", f"the last staging ({op['id']}, {op['status']}) belongs to {held}; {action} with "
+                            f"--owner {held}, or stage again with --take-over <reason> once that owner has finished")
+
+
+def now() -> str:
+    return datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
+
+
+def git(cwd: Path, *args: str, data: bytes | None = None, env: dict | None = None, check: bool = True) -> bytes:
+    result = subprocess.run(["git", "-C", str(cwd), *args], input=data, capture_output=True,
+                            env={**os.environ, **(env or {})})
+    if check and result.returncode != 0:
+        raise Refusal.coded("infrastructure", f"git {' '.join(args)}: {result.stderr.decode(errors='replace').strip()}")
+    return result.stdout
+
+
+def git_ok(cwd: Path, *args: str) -> bool:
+    return subprocess.run(["git", "-C", str(cwd), *args], capture_output=True).returncode == 0
+
+
+# ---------------------------------------------------------------- identity
+
+def identity(url: str) -> str:
+    """Repository identity from an internal URL: its path without '.git' (host-independent)."""
+    path = urlsplit(url).path if "://" in url else url.split(":", 1)[-1]
+    path = path.strip("/")
+    return path[:-4] if path.endswith(".git") else path
+
+
+def resolve_url(base: str, rel: str) -> str:
+    """Git's relative submodule URL: relative to the superproject's remote URL."""
+    if not (rel.startswith("./") or rel.startswith("../")):
+        return rel
+    base = base.rstrip("/")
+    while True:
+        if rel.startswith("./"):
+            rel = rel[2:]
+        elif rel.startswith("../"):
+            rel = rel[3:]
+            base = base.rsplit("/", 1)[0]
+        else:
+            break
+    return f"{base}/{rel}"
+
+
+# ---------------------------------------------------------------- context, journal, lock
+
+class Ctx:
+    def __init__(self, workspace: Path | None, source: Path | None, contract: str):
+        self.source = (source or (workspace / "source" if workspace else Path.cwd())).resolve()
+        top = git(self.source, "rev-parse", "--show-toplevel", check=False).decode().strip()
+        if not top:
+            raise Refusal.coded("usage", f"{self.source} is not a Git checkout")
+        self.source = Path(top)
+        self.workspace = (workspace or self.source.parent).resolve()
+        self.contract = contract
+        self.state = self.workspace / ".agdev" / "publication"
+        self.journal_path = self.state / "github.json"
+
+    def read_journal(self) -> dict:
+        if not self.journal_path.is_file():
+            return {"schema": JOURNAL_SCHEMA, "repositories": {}, "operations": []}
+        data = json.loads(self.journal_path.read_text(encoding="utf-8"))
+        if data.get("schema") != JOURNAL_SCHEMA:
+            raise Refusal.coded("usage", f"{self.journal_path} is {data.get('schema')}: run convert-journal first")
+        return data
+
+    def write_journal(self, data: dict) -> None:
+        self.state.mkdir(parents=True, exist_ok=True)
+        tmp = self.journal_path.with_name(self.journal_path.name + ".tmp")
+        tmp.write_text(json.dumps(data, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+        tmp.replace(self.journal_path)
+
+    @contextmanager
+    def lock(self):
+        self.state.mkdir(parents=True, exist_ok=True)
+        with open(self.state / ".lock", "w") as handle:
+            try:
+                fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                raise Refusal.coded("busy", f"another publication operation holds {self.state / '.lock'}")
+            yield
+
+
+# ---------------------------------------------------------------- graph
+
+class Node:
+    def __init__(self, repo: Path, rev: str, url: str, contract_path: str, path: str | None):
+        self.repo, self.rev, self.url, self.contract_path, self.path = repo, rev, url, contract_path, path
+        self.id = identity(url)
+        self.name = self.id.rsplit("/", 1)[-1]
+        self.contract: dict = {}
+        self.children: list[Node] = []
+        self.excluded: list[dict] = []
+
+
+def load_contract(repo: Path, rev: str, path: str) -> dict:
+    raw = git(repo, "cat-file", "blob", f"{rev}:{path}", check=False)
+    if not raw:
+        raise Refusal.coded("contract", f"{identity_of(repo)}@{rev[:12]} has no contract {path}")
+    contract = tomllib.loads(raw.decode())
+    if contract.get("schema") not in SCHEMAS:
+        raise Refusal.coded("contract", f"{path} at {rev[:12]} is not one of {sorted(SCHEMAS)}")
+    return contract
+
+
+def identity_of(repo: Path) -> str:
+    url = git(repo, "remote", "get-url", "origin", check=False).decode().strip()
+    return identity(url) if url else str(repo)
+
+
+def gitlinks_at(repo: Path, rev: str) -> dict[str, str]:
+    links = {}
+    for line in git(repo, "ls-tree", "-r", rev).decode().splitlines():
+        meta, path = line.split("\t", 1)
+        mode, kind, sha = meta.split()
+        if mode == "160000":
+            links[path] = sha
+    return links
+
+
+def gitmodules_at(repo: Path, rev: str) -> dict[str, str]:
+    if not git_ok(repo, "cat-file", "-e", f"{rev}:.gitmodules"):
+        return {}
+    entries: dict[str, dict] = {}
+    for line in git(repo, "config", "--blob", f"{rev}:.gitmodules", "--list").decode().splitlines():
+        key, _, value = line.partition("=")
+        if not key.startswith("submodule."):
+            continue
+        name, _, attr = key[len("submodule."):].rpartition(".")
+        entries.setdefault(name, {})[attr] = value
+    return {e["path"]: e.get("url", "") for e in entries.values() if "path" in e}
+
+
+def discover(ctx: Ctx, rev: str) -> Node:
+    root_rev = git(ctx.source, "rev-parse", "--verify", f"{rev}^{{commit}}").decode().strip()
+    url = git(ctx.source, "remote", "get-url", "origin").decode().strip()
+    return traverse(Node(ctx.source, root_rev, url, ctx.contract, None), [])
+
+
+def traverse(node: Node, stack: list[str]) -> Node:
+    if node.id in stack:
+        raise Refusal.coded("graph", "submodule cycle: " + " -> ".join(stack + [node.id]))
+    node.contract = load_contract(node.repo, node.rev, node.contract_path)
+    links, modules = gitlinks_at(node.repo, node.rev), gitmodules_at(node.repo, node.rev)
+    declared = {s["path"]: s for s in node.contract.get("submodule", [])}
+    excluded = {e["path"]: e for e in node.contract.get("exclude", [])}
+    for path in links:
+        if path in excluded:
+            node.excluded.append({"path": path, "why": excluded[path].get("why", ""), "source_rev": links[path]})
+        elif path not in declared:
+            raise Refusal.coded("graph", f"{node.id}@{node.rev[:12]}: submodule {path} is neither declared ([[submodule]]) nor "
+                          "excluded ([[exclude]] with a reason): a required private dependency is never dropped silently")
+    for path, spec in declared.items():
+        if path not in links:
+            raise Refusal.coded("graph", f"{node.id}@{node.rev[:12]}: [[submodule]] {path} is not a submodule at that revision")
+        if path not in modules or not modules[path]:
+            raise Refusal.coded("graph", f"{node.id}@{node.rev[:12]}: .gitmodules has no URL for {path}")
+        child_repo = node.repo / path
+        if not (child_repo / ".git").exists():
+            raise Refusal.coded("unavailable-source", f"no local repository for {node.id}:{path} at {child_repo} (git submodule update --init)")
+        sha = links[path]
+        if not git_ok(child_repo, "cat-file", "-e", f"{sha}^{{commit}}"):
+            git(child_repo, "fetch", "-q", "origin", check=False)
+            if not git_ok(child_repo, "cat-file", "-e", f"{sha}^{{commit}}"):
+                raise Refusal.coded("unavailable-source", f"{node.id}@{node.rev[:12]} pins {path} at {sha[:12]}, which is not available "
+                              f"in {child_repo} or its origin")
+        child = Node(child_repo, sha, resolve_url(node.url, modules[path]), spec.get("contract", DEFAULT_CONTRACT), path)
+        node.children.append(traverse(child, stack + [node.id]))
+    return node
+
+
+def postorder(root: Node) -> list[Node]:
+    """Dependencies before dependents; one node per repository (same revision deduplicated)."""
+    order: list[Node] = []
+    seen: dict[str, Node] = {}
+
+    def visit(node: Node):
+        for child in node.children:
+            visit(child)
+        if node.id in seen:
+            if seen[node.id].rev != node.rev:
+                raise Refusal.coded("graph", f"unsupported: {node.id} is needed at {seen[node.id].rev[:12]} and {node.rev[:12]} in one "
+                              "graph; publish one revision first, or align the pins")
+            return
+        seen[node.id] = node
+        order.append(node)
+
+    visit(root)
+    return order
+
+
+def validate(ctx: Ctx, root: Node, journal: dict) -> list[str]:
+    problems = []
+    order = postorder(root)
+    by_destination: dict[str, str] = {}
+    for node in order:
+        dest = node.contract["destination"]
+        if dest in by_destination and by_destination[dest] != node.id:
+            problems.append(f"{node.id} and {by_destination[dest]} both publish to {dest}")
+        by_destination[dest] = node.id
+        known = journal["repositories"].get(node.id)
+        if known and known["destination"] != dest:
+            problems.append(f"{node.id} was published to {known['destination']}; its contract now says {dest} "
+                            "(a destination change is a new decision: edit the journal deliberately)")
+        publics = {f["public"] for f in node.contract.get("file", [])}
+        for child in node.children:
+            for public in publics:
+                if public == child.path or public.startswith(child.path + "/") or child.path.startswith(public + "/"):
+                    problems.append(f"{node.id}: public file {public} collides with submodule path {child.path}")
+        if node.children and any(f["public"] == ".gitmodules" for f in node.contract.get("file", [])):
+            problems.append(f"{node.id}: .gitmodules is generated from [[submodule]]; do not select it as a file")
+    return problems
+
+
+def checkout_of(ctx: Ctx, root: Node, node: Node, journal: dict) -> Path:
+    known = journal["repositories"].get(node.id, {}).get("checkout")
+    if known:
+        return ctx.workspace / known
+    return ctx.workspace / ("published" if not root.children else f"published/{node.name}")
+
+
+# ---------------------------------------------------------------- build and check
+
+def blob(repo: Path, rev: str, path: str) -> tuple[bytes, str]:
+    listing = git(repo, "ls-tree", rev, "--", path).decode().split()
+    if not listing:
+        raise Refusal.coded("contract", f"{path} is not tracked at {rev[:12]}")
+    return git(repo, "cat-file", "blob", f"{rev}:{path}"), listing[0]
+
+
+def excluded_by(rel: str, patterns: list[str]) -> bool:
+    """A glob excludes a path it matches, or every path below a directory it matches (`*` crosses '/')."""
+    return any(fnmatch(rel, p) or fnmatch(rel, p.rstrip("/") + "/*") for p in patterns)
+
+
+def tree_selection(repo: Path, rev: str, contract: dict) -> dict[str, tuple[bytes, str, str]]:
+    """Every file a [[tree]] selects: public path -> (content, mode, origin). A tree copies a directory of the
+    source (or overlay) at the pinned revision, minus `exclude` globs (relative to `from`). Gitlinks and
+    .gitmodules are never copied (submodules come from [[submodule]]), nor the source's publication/ folder."""
+    selected: dict[str, tuple[bytes, str, str]] = {}
+    for spec in contract.get("tree", []):
+        kind, _, base = spec.get("from", "").partition(":")
+        if kind not in ("source", "overlay"):
+            raise Refusal.coded("contract", f"[[tree]] from {spec.get('from')!r}: source:<dir> or overlay:<dir>")
+        base = base.strip("/")
+        root = f"{OVERLAY}/{base}".rstrip("/") if kind == "overlay" else base
+        public_root = spec.get("public", "").strip("/").removeprefix(".").strip("/")
+        excludes = list(spec.get("exclude", []))
+        listing = git(repo, "ls-tree", "-r", "-z", "--full-tree", rev, *(["--", root] if root else [])).decode()
+        found = 0
+        for record in filter(None, listing.split("\0")):
+            meta, path = record.split("\t", 1)
+            mode, kind_, sha = meta.split()
+            if kind_ != "blob" or mode == "120000":
+                continue  # gitlinks are [[submodule]]s; symbolic links are not published
+            rel = path[len(root) + 1:] if root else path
+            if kind == "source" and (path == ".gitmodules" or path == OVERLAY.split("/")[0] or
+                                     path.startswith(OVERLAY.split("/")[0] + "/")):
+                continue
+            if excluded_by(rel, excludes):
+                continue
+            public = f"{public_root}/{rel}" if public_root else rel
+            if public in selected:
+                raise Refusal.coded("contract", f"{public} is selected by two [[tree]] entries")
+            selected[public] = (git(repo, "cat-file", "blob", sha), mode, f"{spec['from']} (tree)")
+            found += 1
+        if not found:
+            raise Refusal.coded("contract", f"[[tree]] {spec.get('from')} selects nothing at {rev[:12]}")
+    return selected
+
+
+def admitted(ctx: Ctx, rel: str, digest: str) -> bytes:
+    """A workspace input with the pinned hash: the live file, or the kept copy."""
+    store = ctx.state / "inputs" / digest
+    live = ctx.workspace / rel
+    if live.is_file():
+        content = live.read_bytes()
+        if hashlib.sha256(content).hexdigest() == digest:
+            store.parent.mkdir(parents=True, exist_ok=True)
+            if not store.exists():
+                store.write_bytes(content)
+            return content
+    if store.is_file():
+        return store.read_bytes()
+    raise Refusal.coded("contract", f"workspace:{rel} does not have sha256 {digest} (and no kept copy): review it and pin its hash")
+
+
+def build(ctx: Ctx, repo: Path, rev: str, contract: dict, out: Path, links: dict[str, tuple[str, str]],
+          declared: list[str]) -> dict:
+    """Write the candidate of one repository; links: submodule path -> (public commit, public URL)."""
+    if out.exists() and any(out.iterdir()):
+        raise Refusal.coded("usage", f"{out} is not empty")
+    out.mkdir(parents=True, exist_ok=True)
+    files, inputs = [], []
+    named = {f["public"] for f in contract.get("file", [])}
+    for public, (content, mode, origin) in sorted(tree_selection(repo, rev, contract).items()):
+        if public in named:
+            continue  # a [[file]] for the same path decides (with its edits)
+        target = out / public
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(content)
+        target.chmod(0o755 if mode == "100755" else 0o644)
+        files.append({"path": public, "from": origin, "sha256": hashlib.sha256(content).hexdigest(), "edits": 0})
+    for entry in contract.get("file", []):
+        kind, _, rel = entry["from"].partition(":")
+        mode = "100644"
+        if kind == "source":
+            content, mode = blob(repo, rev, rel)
+        elif kind == "overlay":
+            content, mode = blob(repo, rev, f"{OVERLAY}/{rel}")
+        elif kind == "workspace":
+            content = admitted(ctx, rel, entry["sha256"])
+            inputs.append({"path": rel, "sha256": entry["sha256"]})
+        else:
+            raise Refusal.coded("contract", f"unknown source kind in {entry['from']!r}")
+        for edit in entry.get("edit", []):
+            text = content.decode("utf-8")
+            found = text.count(edit["old"])
+            if found != edit.get("count", 1):
+                raise Refusal.coded("contract", f"{entry['public']}: edit expects {edit.get('count', 1)} occurrence(s) of "
+                              f"{edit['old'][:60]!r}, found {found}")
+            content = text.replace(edit["old"], edit["new"]).encode("utf-8")
+        target = out / entry["public"]
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(content)
+        target.chmod(0o755 if mode == "100755" else 0o644)
+        files.append({"path": entry["public"], "from": entry["from"], "sha256": hashlib.sha256(content).hexdigest(),
+                      "edits": len(entry.get("edit", []))})
+    gitlinks = []
+    if declared:
+        text = ""
+        for path in sorted(declared):
+            if path not in links:
+                raise Refusal.coded("child-not-public", f"no public commit for submodule {path}")
+            commit, url = links[path]
+            text += f'[submodule "{path}"]\n\tpath = {path}\n\turl = {url}\n'
+            gitlinks.append((path, commit))
+        (out / ".gitmodules").write_text(text, encoding="utf-8")
+        files.append({"path": ".gitmodules", "from": "generated", "sha256": hashlib.sha256(text.encode()).hexdigest(),
+                      "edits": 0})
+    return {"files": files, "inputs": inputs, "gitlinks": gitlinks}
+
+
+def secret_values(ctx: Ctx, contract: dict, extra: list[str]) -> list[tuple[str, str]]:
+    values = []
+    for name in list(contract.get("local_secrets", [])) + extra:
+        env = ctx.workspace / name
+        if not env.is_file():
+            continue
+        for line in env.read_text(encoding="utf-8").splitlines():
+            if "=" in line and not line.strip().startswith("#"):
+                key, _, value = line.partition("=")
+                key, value = key.strip(), value.strip()
+                if len(value) >= 6:
+                    values.append((f"{env.name} {key}", value))
+                    if "://" in value:
+                        values.append((f"{env.name} {key} host",
+                                       value.split("://", 1)[1].split("/", 1)[0].split(":", 1)[0]))
+    return values
+
+
+def check(ctx: Ctx, out: Path, contract: dict, extra_secrets: list[str]) -> list[dict]:
+    allowed = contract.get("allow", [])
+    findings = []
+    secrets = secret_values(ctx, contract, extra_secrets)
+    for path in sorted(p for p in out.rglob("*") if p.is_file() and ".git" not in p.relative_to(out).parts):
+        rel = path.relative_to(out).as_posix()
+        text = path.read_bytes().decode("utf-8", errors="replace")
+        lower = text.lower()
+        found = [word for word in contract.get("forbidden", []) if word.lower() in lower]
+        found += [label for label, value in secrets if value in text]
+        for label in found:
+            if not any(fnmatch(rel, a["file"]) and a["found"] == label for a in allowed):
+                findings.append({"file": rel, "found": label})
+    return findings
+
+
+def tree_of(repo: Path, folder: Path, gitlinks) -> str:
+    """Git tree id of a candidate folder plus its gitlinks (a folder cannot hold a gitlink)."""
+    with tempfile.TemporaryDirectory() as tmp:
+        env = {"GIT_INDEX_FILE": str(Path(tmp) / "index"), "GIT_DIR": str(repo / ".git"), "GIT_WORK_TREE": str(folder)}
+        git(folder, "add", "-A", ".", env=env)
+        for path, commit in gitlinks:
+            git(folder, "update-index", "--add", "--cacheinfo", f"160000,{commit},{path}", env=env)
+        return git(folder, "write-tree", env=env).decode().strip()
+
+
+def candidate_tree(ctx: Ctx, node_repo: Path, rev: str, contract_path: str, checkout: Path,
+                   links: dict[str, tuple[str, str]], checked: bool, extra_secrets: list[str]) -> tuple[dict, str]:
+    contract = load_contract(node_repo, rev, contract_path)
+    declared = [s["path"] for s in contract.get("submodule", [])]
+    with tempfile.TemporaryDirectory() as tmp:
+        out = Path(tmp) / "candidate"
+        info = build(ctx, node_repo, rev, contract, out, links, declared)
+        if checked:
+            findings = check(ctx, out, contract, extra_secrets)
+            if findings:
+                raise Refusal.coded("check-failed", f"candidate check failed for {identity_of(node_repo)}@{rev[:12]}: " + json.dumps(findings))
+        return info, tree_of(checkout, out, info["gitlinks"])
+
+
+# ---------------------------------------------------------------- public checkouts
+
+def ensure_checkout(path: Path, destination: str, branch: str) -> Path:
+    if not (path / ".git").exists():
+        path.mkdir(parents=True, exist_ok=True)
+        git(path, "init", "-q", "-b", branch)
+        git(path, "remote", "add", "origin", destination)
+    origin = git(path, "config", "--get", "remote.origin.url", check=False).decode().strip()  # as configured
+    if origin != destination:
+        raise Refusal.coded("checkout-state", f"{path}: origin is {origin}, the contract says {destination}")
+    return path
+
+
+def remote_head(path: Path, branch: str) -> str | None:
+    result = subprocess.run(["git", "-C", str(path), "ls-remote", "origin", f"refs/heads/{branch}"], capture_output=True)
+    if result.returncode != 0:
+        err = result.stderr.decode(errors="replace").strip()
+        if "not found" in err.lower() or "does not exist" in err.lower():
+            return None
+        raise Refusal.coded("infrastructure", f"cannot read {branch} of {path}'s origin: {err}")
+    lines = result.stdout.decode().split()
+    return lines[0] if lines else None
+
+
+def repo_state(journal: dict, node: Node, checkout: Path, ctx: Ctx) -> dict:
+    return journal["repositories"].setdefault(node.id, {
+        "name": node.name, "internal_url": node.url, "destination": node.contract["destination"],
+        "branch": node.contract["branch"], "checkout": checkout.relative_to(ctx.workspace).as_posix(),
+        "contract": node.contract_path, "publications": []})
+
+
+def entries(state: dict, status: str) -> list[dict]:
+    return [p for p in state["publications"] if p.get("status") == status]
+
+
+def reconcile(state: dict, checkout: Path) -> list[str]:
+    """A staged entry already on the remote is completed (lost confirmation), never published twice."""
+    notes = []
+    for entry in entries(state, "staged"):
+        remote = remote_head(checkout, state["branch"])
+        if remote == entry["public_commit"]:
+            entry.update(status="published", published_at=now(), remote_commit=remote,
+                         notes=f"{now()} reconciled: the remote branch already held the staged commit")
+            notes.append(f"{state['name']}: staged {entry['public_commit'][:12]} found on the remote; recorded as published")
+    return notes
+
+
+def links_for(node: Node, results: dict[str, dict], journal: dict) -> dict[str, tuple[str, str]]:
+    links = {}
+    for child in node.children:
+        links[child.path] = (results[child.id]["public_commit"],
+                             public_url(journal["repositories"][child.id]["destination"], node.contract["destination"]))
+    return links
+
+
+def public_url(destination: str, parent: str) -> str:
+    """The URL a public .gitmodules gives a child: `../<name>.git` when the child is published under the same
+    host and owner as its parent (Git and agdev's acquisition resolve it against wherever the parent was cloned
+    from, so a copy of the pair keeps working), else the child's destination as written."""
+    child_dir, _, child_name = destination.rstrip("/").rpartition("/")
+    parent_dir = parent.rstrip("/").rpartition("/")[0]
+    if "://" in destination and child_dir.lower() == parent_dir.lower() and child_name:
+        return "../" + (child_name if child_name.endswith(".git") else child_name + ".git")
+    return destination
+
+
+def stage_repo(ctx: Ctx, root: Node, node: Node, journal: dict, results: dict, message: str, op: dict,
+               extra_secrets: list[str]) -> dict:
+    checkout = checkout_of(ctx, root, node, journal)
+    state = repo_state(journal, node, checkout, ctx)
+    branch = state["branch"]
+    ensure_checkout(checkout, state["destination"], branch)
+    op["notes"] += reconcile(state, checkout)
+    if entries(state, "conflict"):
+        raise Refusal.coded("conflict", f"{node.id} has a recorded conflict: inspect {checkout}, then resolve or abort")
+    links = links_for(node, results, journal)
+    gl_record = [{"path": c.path, "repository": c.id, "source_rev": c.rev, "public_commit": links[c.path][0]}
+                 for c in node.children]
+    published = entries(state, "published")
+    for entry in reversed(published):
+        if entry["source_rev"] == node.rev and entry.get("gitlinks", []) == gl_record:
+            return {"public_commit": entry["public_commit"], "action": "already published"}
+    info, tree = candidate_tree(ctx, node.repo, node.rev, node.contract_path, checkout, links, True, extra_secrets)
+    previous = published[-1] if published else None
+    staged = entries(state, "staged")
+    if previous and previous["candidate_tree"] == tree:
+        pair = {"source_rev": node.rev, "candidate_tree": tree, "public_commit": previous["public_commit"],
+                "gitlinks": gl_record, "status": "published", "reused_from": previous["source_rev"],
+                "published_at": now(), "notes": "internal-only change: the candidate equals the last published one"}
+        state["publications"] = [p for p in state["publications"] if p.get("status") != "staged"] + [pair]
+        return {"public_commit": previous["public_commit"], "action": "unchanged candidate; pair recorded"}
+    if staged and staged[-1]["candidate_tree"] == tree and staged[-1].get("gitlinks", []) == gl_record and \
+            git(checkout, "rev-parse", "HEAD").decode().strip() == staged[-1]["public_commit"]:
+        staged[-1]["source_rev"] = node.rev
+        return {"public_commit": staged[-1]["public_commit"], "action": "already staged"}
+    if git(checkout, "status", "--porcelain").strip():
+        raise Refusal.coded("checkout-state", f"{checkout} has uncommitted changes: resolve them first")
+    identity_env = {"GIT_AUTHOR_DATE": now(), "GIT_COMMITTER_DATE": now()}
+    body = f"{message}\n\nSource: {node.name} {node.rev[:12]} (internal), contract {node.contract_path}."
+    head = git(checkout, "rev-parse", "--verify", "-q", "HEAD", check=False).decode().strip()
+    entry = {"source_rev": node.rev, "candidate_tree": tree, "destination": state["destination"], "branch": branch,
+             "inputs": info["inputs"], "files": len(info["files"]), "gitlinks": gl_record,
+             "checks": {"forbidden_and_secret_values": "passed"}, "operation": op["id"], "staged_at": now()}
+    if previous is None:
+        if head and not (staged and staged[-1]["public_commit"] == head):
+            raise Refusal.coded("checkout-state", f"{checkout} has commits but the journal records no publication: inspect it first")
+        if remote_head(checkout, branch):
+            raise Refusal.coded("checkout-state", f"{state['destination']} already has {branch}: never overwritten; inspect it first")
+        commit = git(checkout, "commit-tree", tree, "-m", body, env=identity_env).decode().strip()
+        git(checkout, "update-ref", f"refs/heads/{branch}", commit)
+        git(checkout, "checkout", "-q", "-f", branch)
+        git(checkout, "reset", "-q", "--hard", branch)
+        entry.update(public_base=None, public_changes_since_base=None)
+    else:
+        base = previous["public_commit"]
+        git(checkout, "fetch", "-q", "origin", branch)
+        remote = git(checkout, "rev-parse", f"origin/{branch}").decode().strip()
+        local = head
+        if staged and staged[-1]["public_commit"] == local and local != remote:
+            git(checkout, "reset", "-q", "--hard", remote)  # replace the unpushed candidate
+            local = remote
+        if local != remote:
+            raise Refusal.coded("checkout-state", f"{checkout}: local {branch} {local[:12]} differs from origin {remote[:12]} and is not "
+                          "the staged candidate: reconcile first (unexplained edits are never restaged over)")
+        if not git_ok(checkout, "merge-base", "--is-ancestor", base, remote):
+            raise Refusal.coded("stale-public-head", f"{state['destination']} {branch} no longer contains the last publication {base[:12]}")
+        changes = git(checkout, "diff", "--stat", base, remote).decode().strip()
+        prev_links = {g["path"]: (g["public_commit"], public_url(journal["repositories"][g["repository"]]["destination"],
+                                                                  node.contract["destination"]))
+                      for g in previous.get("gitlinks", [])}
+        _, old_tree = candidate_tree(ctx, node.repo, previous["source_rev"], node.contract_path, checkout, prev_links,
+                                     False, extra_secrets)
+        old = git(checkout, "commit-tree", old_tree, "-m", "previous candidate", env=identity_env).decode().strip()
+        new = git(checkout, "commit-tree", tree, "-p", old, "-m", body, env=identity_env).decode().strip()
+        entry.update(public_base=remote, public_changes_since_base=changes or None,
+                     desired={"from_candidate": old, "to_candidate": new})
+        picked = subprocess.run(["git", "-C", str(checkout), "cherry-pick", "--allow-empty", "--empty=drop", new],
+                                capture_output=True, env={**os.environ, **identity_env})
+        if picked.returncode != 0:
+            conflicted = git(checkout, "diff", "--name-only", "--diff-filter=U").decode().split()
+            entry.update(status="conflict", conflict={"files": conflicted, "at": now(), "base": remote,
+                                                      "output": picked.stdout.decode(errors="replace")[-2000:]})
+            git(checkout, "update-ref", f"refs/agdev/desired/{new[:12]}", new)  # keep the desired delta reachable
+            state["publications"] = [p for p in state["publications"] if p.get("status") != "staged"] + [entry]
+            op["status"] = "conflict"
+            ctx.write_journal(journal)
+            raise Refusal.coded("conflict", f"{node.id}: the internal change conflicts with the public head in {conflicted}. Inspect "
+                          f"{checkout} (git status; base {remote[:12]}, desired {old[:12]}..{new[:12]}). Either resolve, "
+                          "commit, and run `resolve --repo ID --note …`, or `abort --repo ID` and record the decision "
+                          "in the contract/overlay or source, then stage again")
+        commit = git(checkout, "rev-parse", "HEAD").decode().strip()
+        if commit == remote:  # the public head already contains the change (e.g. an imported public fix)
+            entry.update(public_commit=remote, public_tree=git(checkout, "rev-parse", f"{remote}^{{tree}}").decode().strip(),
+                         status="published", published_at=now(), remote_commit=remote,
+                         notes="the public head already contains this candidate's change; nothing to push")
+            state["publications"] = [p for p in state["publications"] if p.get("status") != "staged"] + [entry]
+            return {"public_commit": remote, "action": "already contained in the public head"}
+    entry.update(public_commit=commit, public_tree=git(checkout, "rev-parse", f"{commit}^{{tree}}").decode().strip(),
+                 status="staged")
+    state["publications"] = [p for p in state["publications"] if p.get("status") != "staged"] + [entry]
+    return {"public_commit": commit, "action": "staged"}
+
+
+def cmd_stage(ctx: Ctx, rev: str, message: str, extra_secrets: list[str], owner: str | None = None,
+              take_over: str | None = None) -> dict:
+    with ctx.lock():
+        journal = ctx.read_journal()
+        previous = last_stage(journal)
+        held = previous.get("owner") if previous else None
+        if previous and previous["status"] in UNFINISHED and held and held != owner and not take_over:
+            raise Refusal.coded("owner", f"the last staging ({previous['id']}, {previous['status']}) belongs to {held} "
+                                "and is unfinished: restaging would replace its candidate. Wait for it, or pass "
+                                "--take-over <reason> once that owner has finished")
+        root = discover(ctx, rev)
+        order = postorder(root)
+        problems = validate(ctx, root, journal)
+        if problems:
+            raise Refusal.coded("graph", "graph problems: " + "; ".join(problems))
+        op = {"id": now(), "command": "stage", "root": root.id, "root_rev": root.rev,
+              "order": [n.id for n in order], "status": "staging", "notes": [], "repositories": {}}
+        if owner:
+            op["owner"] = owner
+        if previous and previous["status"] in UNFINISHED and held != owner:
+            op["took_over"] = {"operation": previous["id"], "owner": held, "status": previous["status"],
+                               "reason": take_over or "no owner recorded on it"}
+            previous["status"] = "superseded"
+            previous.setdefault("notes", []).append(f"{op['id']}: superseded by {owner or 'an unowned staging'}")
+        journal.setdefault("operations", []).append(op)
+        results: dict[str, dict] = {}
+        for node in order:
+            results[node.id] = stage_repo(ctx, root, node, journal, results, message, op, extra_secrets)
+            op["repositories"][node.id] = {"source_rev": node.rev, **results[node.id]}
+            ctx.write_journal(journal)
+        op["status"] = "staged" if any(r["action"] == "staged" for r in results.values()) else "nothing to push"
+        ctx.write_journal(journal)
+        return op
+
+
+# ---------------------------------------------------------------- resolve / abort
+
+def conflict_of(journal: dict, repo_id: str) -> tuple[dict, dict]:
+    state = journal["repositories"].get(repo_id)
+    found = entries(state, "conflict") if state else []
+    if not found:
+        raise Refusal.coded("usage", f"{repo_id} has no recorded conflict")
+    return state, found[-1]
+
+
+def cmd_resolve(ctx: Ctx, repo_id: str, note: str, extra_secrets: list[str], owner: str | None = None,
+                take_over: str | None = None) -> dict:
+    with ctx.lock():
+        journal = ctx.read_journal()
+        check_owner(journal, owner, "resolve", take_over)
+        state, entry = conflict_of(journal, repo_id)
+        checkout = ctx.workspace / state["checkout"]
+        if (checkout / ".git" / "CHERRY_PICK_HEAD").exists():
+            raise Refusal.coded("conflict", f"{checkout}: finish the cherry-pick first (git add …; git cherry-pick --continue)")
+        if git(checkout, "status", "--porcelain").strip():
+            raise Refusal.coded("checkout-state", f"{checkout} has uncommitted changes")
+        head = git(checkout, "rev-parse", "HEAD").decode().strip()
+        base = entry["conflict"]["base"]
+        if not git_ok(checkout, "merge-base", "--is-ancestor", base, head):
+            raise Refusal.coded("conflict", f"{checkout} HEAD {head[:12]} does not descend from the public base {base[:12]}")
+        contract = load_contract(source_repo_for(ctx, journal, repo_id), entry["source_rev"],
+                                 state.get("contract", DEFAULT_CONTRACT))
+        with tempfile.TemporaryDirectory() as tmp:
+            out = Path(tmp) / "resolved"
+            out.mkdir()
+            subprocess.run(f"git -C '{checkout}' archive {head} | tar -x -C '{out}'", shell=True, check=True)
+            findings = check(ctx, out, contract, extra_secrets)
+        if findings:
+            raise Refusal.coded("check-failed", "the resolved tree fails the check: " + json.dumps(findings))
+        entry.update(status="staged", public_commit=head,
+                     public_tree=git(checkout, "rev-parse", f"{head}^{{tree}}").decode().strip(),
+                     resolution={"note": note, "at": now(), "files": entry["conflict"]["files"], "commit": head})
+        for op in reversed(journal.get("operations", [])):
+            if op.get("id") == entry.get("operation"):
+                op["status"] = "staged"  # pushable again; later repositories of that graph were not staged yet
+                op["notes"].append(f"{repo_id}: conflict resolved ({head[:12]})")
+                break
+        ctx.write_journal(journal)
+        return entry
+
+
+def source_repo_for(ctx: Ctx, journal: dict, repo_id: str) -> Path:
+    """The local repository holding a graph member's objects: the root, or the submodule checkout of the last
+    operation's graph."""
+    url = git(ctx.source, "remote", "get-url", "origin").decode().strip()
+    if identity(url) == repo_id:
+        return ctx.source
+    root = discover(ctx, journal["operations"][-1]["root_rev"])
+    for node in postorder(root):
+        if node.id == repo_id:
+            return node.repo
+    raise Refusal.coded("usage", f"{repo_id} is not in the graph of the last operation")
+
+
+def cmd_abort(ctx: Ctx, repo_id: str, owner: str | None = None, take_over: str | None = None) -> dict:
+    with ctx.lock():
+        journal = ctx.read_journal()
+        check_owner(journal, owner, "abort", take_over)
+        state, entry = conflict_of(journal, repo_id)
+        checkout = ctx.workspace / state["checkout"]
+        if (checkout / ".git" / "CHERRY_PICK_HEAD").exists():
+            git(checkout, "cherry-pick", "--abort")
+        git(checkout, "reset", "-q", "--hard", entry["conflict"]["base"])
+        entry.update(status="aborted", aborted_at=now())
+        for op in reversed(journal.get("operations", [])):
+            if op.get("id") == entry.get("operation"):
+                op["status"] = "aborted"
+                break
+        ctx.write_journal(journal)
+        return entry
+
+
+# ---------------------------------------------------------------- push
+
+def verify_public(ctx: Ctx, journal: dict, link: dict) -> None:
+    """A gitlink's commit must be reachable from its public repository's branch."""
+    state = journal["repositories"][link["repository"]]
+    checkout = ctx.workspace / state["checkout"]
+    git(checkout, "fetch", "-q", "origin", state["branch"])
+    if not git_ok(checkout, "merge-base", "--is-ancestor", link["public_commit"], f"origin/{state['branch']}"):
+        raise Refusal.coded("child-not-public", f"{link['path']} -> {link['public_commit'][:12]} is not on {state['destination']} "
+                      f"{state['branch']} yet: publish {link['repository']} first")
+
+
+def push_repo(ctx: Ctx, journal: dict, repo_id: str) -> str:
+    state = journal["repositories"][repo_id]
+    entry = entries(state, "staged")[-1]
+    checkout = ctx.workspace / state["checkout"]
+    for link in entry.get("gitlinks", []):
+        verify_public(ctx, journal, link)
+    remote_before = remote_head(checkout, entry["branch"])
+    if remote_before == entry["public_commit"]:
+        entry.update(status="published", published_at=now(), remote_commit=remote_before,
+                     notes=f"{now()} reconciled: already on the remote before pushing (lost confirmation)")
+        return "reconciled (already on the remote)"
+    if remote_before != entry["public_base"]:
+        raise Refusal.coded("stale-public-head", f"{state['destination']} {entry['branch']} is {remote_before}, expected {entry['public_base']}: "
+                      "public commits arrived since staging; stage again (they are preserved)")
+    head = git(checkout, "rev-parse", "HEAD").decode().strip()
+    if head != entry["public_commit"]:
+        raise Refusal.coded("checkout-state", f"{checkout} HEAD {head[:12]} is not the staged commit (edited after staging): stage again")
+    result = subprocess.run(["git", "-C", str(checkout), "push", "origin", f"{head}:refs/heads/{entry['branch']}"],
+                            capture_output=True)
+    remote_after = remote_head(checkout, entry["branch"])  # decides, whatever push printed
+    if remote_after != head:
+        entry["notes"] = f"{now()} push exit {result.returncode}; origin is {remote_after}"
+        ctx.write_journal(journal)
+        raise Refusal.coded("infrastructure", entry["notes"] + "\n" + result.stderr.decode(errors="replace"))
+    entry.update(status="published", published_at=now(), remote_commit=remote_after)
+    return "pushed"
+
+
+def cmd_push(ctx: Ctx, stop_before: str | None, owner: str | None = None, operation: str | None = None,
+             take_over: str | None = None) -> dict:
+    with ctx.lock():
+        journal = ctx.read_journal()
+        op = last_stage(journal)
+        if not op:
+            raise Refusal.coded("usage", "nothing staged")
+        if operation and op["id"] != operation:
+            raise Refusal.coded("owner", f"the last staging is {op['id']} ({op.get('owner') or 'no owner'}), not {operation}: "
+                                "the candidate you assessed was replaced; read status and stage again")
+        check_owner(journal, owner, "push", take_over)
+        if op["status"] in ("conflict", "aborted"):
+            raise Refusal.coded("conflict", f"the last staging is {op['status']}: resolve, or stage again")
+        done = {}
+        for repo_id in op["order"]:
+            state = journal["repositories"][repo_id]
+            if not entries(state, "staged"):
+                done[repo_id] = "nothing staged"
+                continue
+            if stop_before == repo_id:
+                op["status"] = "partial"
+                op.setdefault("boundaries", []).append({"stopped_before": repo_id, "at": now()})
+                op["pushed"] = done
+                ctx.write_journal(journal)
+                return op
+            done[repo_id] = push_repo(ctx, journal, repo_id)
+            ctx.write_journal(journal)
+        op.update(status="published", pushed=done, completed_at=now())
+        ctx.write_journal(journal)
+        return op
+
+
+# ---------------------------------------------------------------- plan / build / status / convert
+
+def describe(ctx: Ctx, rev: str) -> dict:
+    journal = ctx.read_journal()
+    root = discover(ctx, rev)
+    out = {"root": root.id, "repositories": [], "problems": validate(ctx, root, journal)}
+    for node in postorder(root):
+        state = journal["repositories"].get(node.id, {})
+        last = (entries(state, "published") or [None])[-1] if state else None
+        out["repositories"].append({
+            "id": node.id, "path": node.path, "source_rev": node.rev, "internal_url": node.url,
+            "destination": node.contract["destination"], "visibility": node.contract.get("visibility"),
+            "license": node.contract.get("license"), "checkout": checkout_of(ctx, root, node, journal).as_posix(),
+            "submodules": [{"path": c.path, "repository": c.id, "source_rev": c.rev} for c in node.children],
+            "excluded": node.excluded,
+            "last_published": {"source_rev": last["source_rev"], "public_commit": last["public_commit"]} if last else None})
+    return out
+
+
+def cmd_build(ctx: Ctx, rev: str, out: Path, extra_secrets: list[str]) -> dict:
+    journal = ctx.read_journal()
+    root = discover(ctx, rev)
+    report = {"root": root.id, "problems": validate(ctx, root, journal), "repositories": []}
+    for node in postorder(root):
+        links = {}
+        for child in node.children:
+            state = journal["repositories"].get(child.id, {})
+            match = [p for p in state.get("publications", []) if p["source_rev"] == child.rev and p.get("public_commit")]
+            links[child.path] = (match[-1]["public_commit"] if match else "",
+                                 public_url(child.contract["destination"], node.contract["destination"]))
+        info = build(ctx, node.repo, node.rev, node.contract, out / node.name, links,
+                     [s["path"] for s in node.contract.get("submodule", [])])
+        findings = check(ctx, out / node.name, node.contract, extra_secrets)
+        with tempfile.TemporaryDirectory() as tmp:  # the tree id, for comparison with the journal
+            git(Path(tmp), "init", "-q")
+            tree = tree_of(Path(tmp), out / node.name, [g for g in info["gitlinks"] if g[1]])
+        info["gitlinks"] = [(path, commit or "not yet staged") for path, commit in info["gitlinks"]]
+        report["repositories"].append({"id": node.id, "source_rev": node.rev, "out": (out / node.name).as_posix(),
+                                       "candidate_tree": tree, "files": len(info["files"]), "inputs": info["inputs"],
+                                       "gitlinks": info["gitlinks"], "findings": findings})
+    return report
+
+
+def cmd_convert(ctx: Ctx) -> dict:
+    with ctx.lock():
+        if not ctx.journal_path.is_file():
+            raise Refusal.coded("usage", "no journal")
+        old = json.loads(ctx.journal_path.read_text(encoding="utf-8"))
+        if old.get("schema") == JOURNAL_SCHEMA:
+            raise Refusal.coded("usage", "already converted")
+        if old.get("schema") != "forge.publication.v1.journal":
+            raise Refusal.coded("usage", f"unknown journal schema {old.get('schema')}")
+        url = git(ctx.source, "remote", "get-url", "origin").decode().strip()
+        pubs = old["publications"]
+        first = pubs[0]
+        keep = ctx.journal_path.with_name("github.forge-v1.json")
+        if not keep.exists():
+            keep.write_bytes(ctx.journal_path.read_bytes())
+        converted = {"schema": JOURNAL_SCHEMA, "converted_from": {"schema": old["schema"], "copy": keep.name, "at": now()},
+                     "repositories": {identity(url): {
+                         "name": identity(url).rsplit("/", 1)[-1], "internal_url": url,
+                         "destination": first["destination"], "branch": first["branch"], "checkout": "published",
+                         "contract": ctx.contract,
+                         "publications": [{**p, "gitlinks": p.get("gitlinks", [])} for p in pubs]}},
+                     "operations": []}
+        ctx.write_journal(converted)
+        return converted
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("--workspace", type=Path, help="project workspace (default: the source checkout's parent)")
+    parser.add_argument("--source", type=Path, help="root source checkout (default: <workspace>/source, or the cwd)")
+    parser.add_argument("--contract", default=DEFAULT_CONTRACT, help="root contract path inside the source repository")
+    parser.add_argument("--secrets", action="append", default=[], help="extra workspace KEY=VALUE file to search for")
+    commands = parser.add_subparsers(dest="command", required=True)
+    for name in ("plan", "build", "stage"):
+        sub = commands.add_parser(name)
+        sub.add_argument("--rev", default="HEAD")
+        if name == "build":
+            sub.add_argument("--out", type=Path, required=True)
+        if name == "stage":
+            sub.add_argument("--message", required=True)
+            sub.add_argument("--owner", help="the run (or person) this staging belongs to, e.g. publisher/publish/run-003")
+            sub.add_argument("--take-over", metavar="REASON", help="replace another owner's unfinished staging (why)")
+    r = commands.add_parser("resolve")
+    r.add_argument("--repo", required=True)
+    r.add_argument("--note", required=True)
+    a = commands.add_parser("abort")
+    a.add_argument("--repo", required=True)
+    p = commands.add_parser("push")
+    p.add_argument("--stop-before", help="repository id: stop at this boundary (resume with push)")
+    p.add_argument("--operation", help="the stage operation id you assessed; refused if it is no longer the last one")
+    for sub in (r, a, p):
+        sub.add_argument("--owner", help="the owner the last staging was made with")
+        sub.add_argument("--take-over", metavar="REASON", help="act on another owner's staging (why)")
+    commands.add_parser("status")
+    commands.add_parser("convert-journal")
+    args = parser.parse_args()
+    try:
+        workspace = args.workspace.resolve() if args.workspace else None
+        ctx = Ctx(workspace, args.source, args.contract)
+        if args.command == "plan":
+            result = describe(ctx, args.rev)
+        elif args.command == "build":
+            result = cmd_build(ctx, args.rev, args.out, args.secrets)
+        elif args.command == "stage":
+            result = cmd_stage(ctx, args.rev, args.message, args.secrets, args.owner, args.take_over)
+        elif args.command == "resolve":
+            result = cmd_resolve(ctx, args.repo, args.note, args.secrets, args.owner, args.take_over)
+        elif args.command == "abort":
+            result = cmd_abort(ctx, args.repo, args.owner, args.take_over)
+        elif args.command == "push":
+            result = cmd_push(ctx, args.stop_before, args.owner, args.operation, args.take_over)
+        elif args.command == "convert-journal":
+            result = cmd_convert(ctx)
+        else:
+            result = ctx.read_journal()
+        print(json.dumps(result, indent=2, ensure_ascii=False))
+        if args.command == "build" and any(r["findings"] for r in result["repositories"]):
+            sys.exit(1)
+    except Refusal as refusal:
+        print(f"agdev-external-publish [{refusal.code}]: {refusal}", file=sys.stderr)
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()

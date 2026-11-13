@@ -1,0 +1,31 @@
+# agobserver's agent configuration (ag.agent-config.v2). The one role is the
+# judgment of an uncertain attempt. Per-machine backend choice belongs in the
+# ignored `.local/agents.local.toml` overlay, and the ollama base URL always does.
+schema = "ag.agent-config.v2"
+project = "agobserver"
+
+[models."ollama/qwen3.8:27b-mxfp8"]
+max_tokens = 8192
+
+[models."anthropic/claude-sonnet-5"]
+
+[profiles.local]
+harness = "agcode"
+model = "ollama/qwen3.8:27b-mxfp8"
+
+[profiles.sonnet]
+harness = "claude_code"
+model = "anthropic/claude-sonnet-5"
+
+[profiles.stub]
+harness = "fake"
+model = "ollama/qwen3.8:27b-mxfp8"
+
+# One judgment of one uncertain workflow attempt (observer p3 step 3): alive,
+# silent, not inside a command with a declared timeout — a long quiet task or
+# a hung harness? Code decides everything the facts decide; this is asked only
+# for what is left, on the local model, and it writes one result file.
+[roles.wftriage]
+profile = "local"
+requires = []
+allowed_tools = "Read,Write"

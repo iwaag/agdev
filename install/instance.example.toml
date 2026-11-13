@@ -1,0 +1,72 @@
+# Inputs of one installation. Copy outside the source, fill in, and pass to
+# `agdevctl --config`. Nothing here is a secret; agdevctl generates those into
+# <root>/config/secrets (mode 0600) and never prints them.
+
+slug = "experiment"                 # scopes the Compose project, units or LaunchAgents, networks, volumes and locks
+root = "/srv/agdev-experiment"      # installation root (config, data, logs, bundles); on macOS e.g. "~/agdev/main"
+# service_manager = "launchd"       # default: launchd on macOS (the user's LaunchAgents), systemd elsewhere (root)
+public_host = "host.example.local"  # the name browsers, the host and containers all use
+bind = "0.0.0.0"
+
+[ports]
+gitea = 8080
+web = 8082
+wfe = 8098                          # the native WFE, behind the web origin
+# present = [8300, 8399]            # presentation servers' range; distinct per installation on one host
+
+[owner]
+name = "owner"                      # Gitea account that owns the managed repositories
+full_name = "Owner"
+email = "owner@example.local"
+
+[projects]                          # where workspaces are created and obtained (WFE's <area>/placement.json)
+# root = "/Volumes/projects/agdev-experiment"   # default <root>/projects; another volume must already exist (never created)
+
+[accounts]                          # created by init when absent; never in docker or sudo. On macOS: all three are the installing user
+core = "agdev-exec"                 # WFE, the executor and its agents
+monitor = "agdev-svc"               # Observer and its watchdog
+build = "agdev-build"               # builds and owns the releases
+home_root = "/var/lib/agdev"
+
+[tools]                             # bin folders from install/prepare-host
+node = "/opt/agdev-tools/node-v24.22.2/bin"
+uv = "/opt/agdev-tools/uv-0.11.21"
+claude = "/opt/agdev-tools/claude-2.1.302/bin"
+# python = "/Library/Frameworks/Python.framework/Versions/3.14/bin"   # a Python 3.11+ first in PATH where the system one is older (macOS)
+
+[execution]
+worker = "local"                    # the local execution node's logical id
+timezone = "UTC"
+
+[display]                           # what a person sees; not the generated instance id
+name = "agdev-example"
+# [display.parent]                  # another agdev this one was made from; omit when there is none
+# name = "agdev-parent"
+# url = "http://parent.example.local:8082/wfe/"
+# [display.boast_links.<project>]   # destinations a project's Boast page reaches by name (workflow_editor/docs/boast.md)
+# workflow-editor = "http://child.example.local:8082/wfe/"
+
+# [source]                          # where the core is built from; omit to use <owner>/agdev on this installation's Gitea
+# url = "http://dev-host.example.local:8080/owner/agdev.git"   # a candidate builds from its development host's repository
+# token_file = "/srv/agdev-experiment/config/secrets/source_token"  # only when that repository needs a credential to read
+
+# [targets.c]                       # an installation this one's runs operate with agdev-remote (`agdevctl target c`)
+# host = "candidate.example.local"
+# instance = "experiment-0123456789ab"   # its instance id: every request names it, and it refuses anything else
+# host_key = "ssh-ed25519 AAAA..."        # as `agdevctl remote-access` printed it there; never learned on first contact
+# user = "agdev-remote"
+# web = "http://candidate.example.local:8082/wfe/"
+
+# [remote]                          # this installation operated from another one (`agdevctl remote-access`)
+# account = "agdev-remote"
+
+# [dependencies]                    # default: this installation's own Gitea in Docker ("owned")
+# gitea = "external"                # attach to an existing Gitea: validated, never provisioned, imported into, stopped or removed
+# [alerts]                          # the owner's alerts, independent of WFE (install/runtime/agdev_alert.py)
+# route = "slack"
+# token_file = "/path/to/slack-bot.token"   # chat:write; copied for the monitor account by services-config
+# channel = "D0123456789"           # the owner's DM channel (or member id)
+# [gitea]                           # with gitea = "external"
+# url = "http://gitea.example.local:3000"
+# owner = "developer"               # the account that owns the managed repositories (default [owner] name)
+# token_file = "/path/to/owner.token"   # copied into config/secrets; must act as `owner`

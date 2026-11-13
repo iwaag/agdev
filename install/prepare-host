@@ -1,0 +1,45 @@
+#!/bin/bash
+# Prepares a Linux x86-64 host for an agdev installation: system packages, Docker and the
+# pinned tools at explicit, versioned, root-owned paths. Run once as root, repeat freely.
+# Accounts, data and units come from `agdevctl init`. docs/install.md.
+set -euo pipefail
+NODE=24.22.2 UV=0.11.21 CLAUDE=2.1.302
+TOOLS=${1:-/opt/agdev-tools}
+export DEBIAN_FRONTEND=noninteractive
+PACKAGES="ca-certificates curl git jq lsof make openssh-client procps python3 python3-venv ripgrep rsync sqlite3 tar unzip xz-utils"
+# A Docker that already works (for instance Docker's own docker-ce with containerd.io) is kept: installing
+# docker.io beside it would make apt replace it under everything else that uses it.
+if command -v docker >/dev/null && docker compose version >/dev/null 2>&1; then
+  echo "prepare-host: keeping the installed Docker ($(docker --version))"
+else
+  PACKAGES="$PACKAGES docker.io docker-compose-v2"
+fi
+# Only what is missing: packages already installed are not upgraded as a side effect.
+MISSING=$(for p in $PACKAGES; do dpkg-query -W -f='${Status}' "$p" 2>/dev/null | grep -q "install ok installed" || echo "$p"; done)
+if [ -n "$MISSING" ]; then
+  # A host may carry an unrelated package dpkg cannot configure (seen: a kernel whose DKMS module fails to
+  # build); apt then exits non-zero after installing ours. What counts is that ours are installed.
+  apt-get install -y --no-upgrade $MISSING || echo "prepare-host: apt-get reported an error; checking the packages it was asked for" >&2
+  for p in $MISSING; do
+    dpkg-query -W -f='${Status}' "$p" 2>/dev/null | grep -q "install ok installed" || { echo "prepare-host: $p is not installed" >&2; exit 1; }
+  done
+else
+  echo "prepare-host: system packages present"
+fi
+systemctl enable --now docker
+install -d -m 0755 "$TOOLS"
+work=$(mktemp -d); trap 'rm -rf "$work"' EXIT
+if [ ! -x "$TOOLS/node-v$NODE/bin/node" ]; then
+  curl -fsSL -o "$work/node-v$NODE-linux-x64.tar.xz" "https://nodejs.org/dist/v$NODE/node-v$NODE-linux-x64.tar.xz"
+  curl -fsSL -o "$work/SHASUMS256.txt" "https://nodejs.org/dist/v$NODE/SHASUMS256.txt"
+  (cd "$work" && grep "  node-v$NODE-linux-x64.tar.xz\$" SHASUMS256.txt | sha256sum -c -)
+  mkdir -p "$TOOLS/node-v$NODE" && tar -xJf "$work/node-v$NODE-linux-x64.tar.xz" --strip-components=1 --no-same-owner -C "$TOOLS/node-v$NODE"
+fi
+if [ ! -x "$TOOLS/uv-$UV/uv" ]; then
+  curl -fsSL -o "$work/uv.tar.gz" "https://github.com/astral-sh/uv/releases/download/$UV/uv-x86_64-unknown-linux-gnu.tar.gz"
+  mkdir -p "$TOOLS/uv-$UV" && tar -xzf "$work/uv.tar.gz" --strip-components=1 --no-same-owner -C "$TOOLS/uv-$UV" uv-x86_64-unknown-linux-gnu/uv uv-x86_64-unknown-linux-gnu/uvx
+fi
+if [ ! -e "$TOOLS/claude-$CLAUDE/bin/claude" ]; then
+  PATH="$TOOLS/node-v$NODE/bin:$PATH" npm install -g --prefix "$TOOLS/claude-$CLAUDE" --no-audit --no-fund --allow-scripts=@anthropic-ai/claude-code "@anthropic-ai/claude-code@$CLAUDE"
+fi
+"$TOOLS/node-v$NODE/bin/node" --version; "$TOOLS/uv-$UV/uv" --version; "$TOOLS/claude-$CLAUDE/bin/claude" --version; docker --version; docker compose version

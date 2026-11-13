@@ -1,0 +1,54 @@
+# agdev
+
+The core of agdev: a system where agents develop projects through workflow runs, on machines
+you own. This repository holds the core; the projects an installation develops, and the reasons it
+has them, live elsewhere.
+
+- **WFE** (`workflow_editor/`): the service, CLI (`wfe`) and browser UI: projects, workflows, runs,
+  conversations, the execution queue and coordination.
+  [README](workflow_editor/README.md); contracts in [its docs](workflow_editor/docs/).
+- **Executor** (`agautolab/`): claims queued work and launches the agent a workflow names in the run's
+  own working copy. People and other installations reach work through WFE (conversations, run views,
+  direct delegation, HTTP peers).
+- **Observer and watchdog** (`agobserver/`): watch every run, open durable incidents, ask a recovery
+  workflow to recover, verify recovery, and tell the owners what recovery cannot reach.
+  [Contract](agobserver/docs/workflow.md).
+- **Installation** (`install/`, `scripts/wfe-release.sh`): an input-driven installation with a native
+  core under systemd (Linux) or the user's LaunchAgents (macOS), a Gitea of its own in Docker or an
+  existing one, a lifecycle service for updates, remote operation of a candidate installation
+  (`agdev-remote`) and owner alerts independent of WFE.
+- **External publication** (`install/agdev-external-publish`): an edited public derivative of a
+  project's repositories, with its own history. [Guide](docs/external-publication.md).
+
+## Getting started
+
+1. Clone this repository and build a release: `scripts/wfe-release.sh build <area> HEAD`, where
+   `<area>` is a folder with a `registry.json` (`{"approver":"","workspaces":[]}` is enough for a
+   first build). It builds `workflow_editor/` and the system code and fetches no managed project;
+   Node.js with npm is needed, and `pyagag` comes from GitHub ([PROVENANCE.md](PROVENANCE.md)).
+   A build from a clean checkout of this tree was run once by the publisher (about 10 s on a warm
+   npm cache).
+2. Install it from your own inputs: copy `install/instance.example.toml` and follow
+   [docs/install.md](docs/install.md). [Transfer to a new owner](docs/transfer.md) and
+   [adopting an existing installation's state](docs/migration.md) are separate guides.
+3. Summon projects from a summonplan, typically from a mind repository such as
+   [iwaag/agdev-mind](https://github.com/iwaag/agdev-mind) (its `catalog.yaml` lists warden,
+   ponderer and aghangout, public at `iwaag/pj-warden`, `iwaag/pj-ponderer`, `iwaag/pj-aghangout`):
+   `agdevctl bootstrap-projects --plan <summonplan>`
+   ([workflow_editor/docs/summon.md](workflow_editor/docs/summon.md),
+   [workflow_editor/docs/mind.md](workflow_editor/docs/mind.md)).
+
+## What has been tried
+
+On one Linux VM (Ubuntu 24.04, x86-64, 4 vCPU, 8 GiB RAM) the whole stack ran; a laptop (Ubuntu)
+ran a candidate; a Mac (macOS 26, Apple silicon) ran two installations side by side and rehearsed
+adopting a large installation's state. These are single runs by the author, not independent
+reproductions. Measurements and what is not covered: [docs/install.md](docs/install.md#what-has-been-tried).
+
+## Notes for a reader
+
+- Some documents cite development episode labels (for example `cluster_teamwork p5`); that
+  development history is not published.
+- `agent/` holds the guides the core's own agents use; they describe a development setup of one
+  main installation with children, which is one way to run it.
+- Provenance and what was left out: [PROVENANCE.md](PROVENANCE.md). Licence: CC0 1.0 ([LICENSE](LICENSE)).

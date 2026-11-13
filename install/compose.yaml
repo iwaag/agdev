@@ -1,0 +1,58 @@
+# The Docker dependencies of one agdev installation: Gitea and the web origin. The core (WFE, executor, Observer, watchdog)
+# runs natively under systemd and has no service here, so no profile can start a
+# second copy of it. Every value that differs between installations comes from the
+# generated <root>/config/compose.env; `agdevctl` is the only intended caller. The
+# project name (agdev-<slug>) scopes containers, networks and volumes.
+#
+# Restart policy: `unless-stopped` everywhere, so one coherent mechanism covers a
+# crash and a boot. Gitea only stores time, so it needs no clock gate.
+
+name: agdev-${AGDEV_SLUG:?}
+
+services:
+  gitea:
+    profiles: [infra, all]
+    image: gitea/gitea:1.27.1
+    restart: unless-stopped
+    environment:
+      GITEA__database__DB_TYPE: sqlite3
+      GITEA__security__INSTALL_LOCK: "true"
+      GITEA__server__ROOT_URL: ${AGDEV_GITEA_URL:?}/
+      GITEA__server__DISABLE_SSH: "true"
+      GITEA__service__DISABLE_REGISTRATION: "true"
+      GITEA__repository__DEFAULT_PRIVATE: public
+      TZ: ${AGDEV_TZ:-UTC}
+    volumes:
+      - gitea:/data
+    ports:
+      - "${AGDEV_BIND:-0.0.0.0}:${AGDEV_GITEA_PORT:?}:3000"
+    labels:
+      agdev.instance: ${AGDEV_INSTANCE_ID}
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:3000/api/healthz"]
+      interval: 15s
+      timeout: 5s
+      retries: 20
+      start_period: 20s
+
+  web:
+    profiles: [web, all]
+    image: nginx:1.29-alpine
+    restart: unless-stopped
+    environment:
+      TZ: ${AGDEV_TZ:-UTC}
+      AGDEV_WFE_PORT: ${AGDEV_WFE_PORT:?}
+    extra_hosts:
+      # The native WFE, from inside this container.
+      - "agdev-core:host-gateway"
+    ports:
+      - "${AGDEV_BIND:-0.0.0.0}:${AGDEV_WEB_PORT:?}:8080"
+    volumes:
+      - ./web/nginx.conf.template:/etc/nginx/templates/default.conf.template:ro
+      - ${AGDEV_DATA:?}/area/hangout:/agdev/hangout:ro
+    labels:
+      agdev.instance: ${AGDEV_INSTANCE_ID}
+
+
+volumes:
+  gitea:

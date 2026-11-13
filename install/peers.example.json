@@ -1,0 +1,19 @@
+{
+  "version": 1,
+  "self": "<this installation's instance id, config/instance-id>",
+  "viewBase": "http://<this host>:<web port>/wfe/",
+  "peers": [
+    {
+      "instance": "<the other installation's instance id>",
+      "label": "<a display name>",
+      "parentage": "parent | child | none",
+      "accept": [
+        "<project>/<workflow> this installation runs for it"
+      ],
+      "request": [
+        "<project>/<workflow> this installation may ask of it"
+      ],
+      "endpoint": "http://<the other installation's host>:<wfe port>/wfe/api"
+    }
+  ]
+}

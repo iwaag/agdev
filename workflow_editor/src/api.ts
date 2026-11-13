@@ -1,0 +1,256 @@
+// Thin client for the local service. Errors carry the service's message.
+import type {
+  AddSubmoduleResponse, AgdevResult, ManageResponse, CreateProjectResult, DashboardResponse, ProjectResponse, RegisterResponse, RunOpResponse, RunResponse, RunSummary, SaveResponse,
+  WorkflowResponse, WorkspacesResponse, PublishedResponse, PublishedSourceView, SyncResultView, DefinitionDescriptor,
+} from '../shared/api.ts'
+import type { ApplyResult, CompareResponse, DraftMeta, DraftResponse, LocalEditsView } from '../shared/drafts.ts'
+import type { RoundView } from '../shared/humanReview.ts'
+import type { BudgetBoard, Period, SourceState, UsageResponse } from '../shared/usage.ts'
+import type { ApprovalKind, Documentation, Project, Workflow } from '../shared/model.ts'
+import type { Catalog, NodeTemplate, TemplateContent } from '../shared/catalog.ts'
+import type { ContextBundle, ContextChange, AttemptContext, BlockKind, BlockRevision, BlockState, EvidenceRef, ScopeTarget } from '../shared/context.ts'
+
+// What a project's knowledge areas hold (improve_workflow p2, docs/knowledge.md).
+export interface KnowledgeView {
+  gitea?: string
+  findings: { qid: string; id: string; title: string; summary: string; categories: string[]; tags: string[]; status?: string; collection: string; kind: string; repository: string; commit: string; path: string; unpublished: boolean; references: { role: string; ref: string; by?: string; note?: string }[] }[]
+  collections: { id: string; kind: string; state: string; problem?: string; unstructured: string[]; problems: { path: string; message: string }[]; revision?: { repository: string; commit: string; resolvedBy: string } }[]
+}
+
+// improve_workflow p3: types of server/knowledge.ts, as the routes answer them.
+export type KnowledgeCandidate = import('../server/knowledge.ts').KnowledgeList['findings'][number]
+export type KnowledgeListing = import('../server/knowledge.ts').KnowledgeList
+export type KnowledgeDetail = import('../server/knowledge.ts').FindingDetail
+export type KnowledgeDecision = import('../server/knowledge.ts').DecisionView
+export type KnowledgeDecisions = import('../server/knowledge.ts').DecisionsResult
+
+// The run's working copy as a storage fact (improve_wfrun p2, server/retention.ts storageView).
+export interface RunStorageView {
+  ref: string; managed: boolean; state: string; retained: string; action: 'retire' | 'restore' | null; eligible: boolean; reasons: string[]; problem: string | null; generation: number
+  hosts: Record<string, { state: string; at: string; detail?: string; archive?: { bytes: number } | null; files?: number; treeBytes?: number | null }>
+  lifecycle: { requestedBy: string; requestedAt: string; phase: string; failure: { at: string; step: string; message: string } | null; archive?: { bytes: number; files: number; verified: string; discarded: number; published: number } | null; sizes?: { treeBytes: number | null; integrationBytes: number | null }; repositories?: { path: string; head: string | null; branch: string | null }[]; history: { at: string; op: string; by: string; result: string }[] } | null
+}
+
+// One run's execution on this host (server/exec.ts runView).
+export interface RunExecView {
+  attempts: { id: string; state: string; began: string; ended: string | null; exit_code: number | null; signal: string | null; outcome: string | null; backend: string | null; pid: number | null; alive: boolean | null; stop_requested: string | null; log: string | null; worker?: string | null; host?: string
+    activity?: { unit: 'turn' | null; count: number | null; last: string | null; bytes: number; problem?: string } | null }[] // p8/ex2: observed on the host that has the log
+  jobs: { id: number; kind: string; state: string; reason: string; created: string; note: string | null; worker?: string | null; decision?: 'start' | 'defer' | null; decision_id?: number | null; defer_until?: string | null }[]
+  // improve_wfrun p4: whether this host admits ordinary work by warden's decisions.
+  coordinated?: boolean
+  // improve_wfrun p4: warden's decisions about this run, latest last.
+  decisions?: { id: number; at: string; by: string; action: string; worker: string | null; scope: string; reason: string; state: string; detail: string | null; attempt: string | null; reconsider: string | null }[]
+  checkpoints: { id: number; kind: string; state: string; created: string; updated: string; error: string | null; steps: { repo: string; include: string[]; excluded: string[]; conflicts: string[]; commit?: string; pushed?: boolean; branch?: string; error?: string }[] }[]
+  // p9: the integration journal of the run's accepted results (server/integrate.ts)
+  integrations?: IntegrationView[]
+  executor: { state: string; detail?: string; at?: string }
+  // project_migration p7: every execution node, as the coordinator last heard from it.
+  workers?: WorkerView[]
+}
+export interface WorkerView { id: string; label: string; local: boolean; default: boolean; state: 'available' | 'unavailable' | 'unknown'; at: string | null; ageSeconds: number | null; detail: string
+  slots?: { attempt: string; workspace: string; workflow: string; run: string; state: string; lane: string; decision?: number | null }[]
+  busy: { attempt: string; workspace: string; workflow: string; run: string; state: string; stopRequested: string | null } | null
+  queued: { id: number; workspace: string; workflow: string; run: string; kind: string; note: string | null; decision?: string | null; deferUntil?: string | null }[]; profiles: string[] | null; facts: { label?: string; host?: Record<string, string> } | null
+  coordination?: boolean; load?: { at: string; cpus?: number; load1?: number; load5?: number; memTotalMB?: number; memFreeMB?: number } | null }
+export interface IntegrationStepView { repo: string; target: string; branch: string; state: string; method?: string; observed?: string; candidate?: string; result?: string; pushed?: boolean; files?: string[]; error?: string }
+export interface IntegrationView { id: number; decision: number; state: string; created: string; updated: string; error: string | null; requested_by: string; steps: IntegrationStepView[] }
+
+// What each presentation's record says and what this host observes (p7,
+// server/present.ts view).
+export interface PresentationView {
+  id: string; title: string; node: string; revision: string; state: string; instance: string | null
+  url: string | null; local: boolean; live: boolean; files: number
+  observed: { alive: boolean; identity: boolean; detail: string; instance: string; port: number; pid: number | null; state: string } | null
+}
+
+// The result of inspecting or applying an adjustment (p7, server/runs.ts adjustRun).
+export interface AdjustView {
+  ok: boolean; dryRun: boolean; parent: string; revision?: string
+  authored: { added: string[]; removed: string[]; changed: { id: string; fields: string[] }[]; restyled: string[] }
+  graph: { added: string[]; removed: string[]; changed: string[]; edgesAdded: [string, string][]; edgesRemoved: [string, string][] }
+  problems: { code: string; message: string }[]
+  notes?: string[] // p8/ex2: an added node nothing leads to, an unknown node field
+}
+
+// The person's node catalog (p7/ex1, server/catalog.ts readCatalog).
+export type CatalogView = ({ state: 'ok'; file: string; catalog: Catalog; initializedNow?: boolean } | { state: 'unavailable'; file: string; problem: string }) & { examples: (TemplateContent & { id: string })[] }
+type TemplateBody = TemplateContent & { by: string }
+
+export class ApiError extends Error {
+  status: number
+  detail?: unknown
+  constructor(status: number, message: string, detail?: unknown) { super(message); this.status = status; this.detail = detail }
+}
+
+async function call<T>(method: string, path: string, body?: unknown, okStatuses: number[] = [], signal?: AbortSignal): Promise<T> {
+  let res: Response
+  try {
+    res = await fetch(path, {
+      method,
+      headers: body === undefined ? {} : { 'content-type': 'application/json' },
+      body: body === undefined ? undefined : JSON.stringify(body),
+      signal,
+    })
+  } catch (e) {
+    throw new ApiError(0, `The editor service is not reachable (${(e as Error).message}).`)
+  }
+  const data = await res.json().catch(() => ({ error: `HTTP ${res.status}` }))
+  if (!res.ok && !okStatuses.includes(res.status)) throw new ApiError(res.status, (data as { error?: string }).error ?? `HTTP ${res.status}`, (data as { detail?: unknown }).detail)
+  return data as T
+}
+
+// Paths are relative to the page, so the UI works at the service's root and
+// under agdev's same-origin prefix (/wfe/) alike.
+const ws = (id: string) => `api/workspaces/${encodeURIComponent(id)}`
+const wf = (id: string, file: string) => `${ws(id)}/workflows/${encodeURIComponent(file)}`
+const drafts = (id: string) => `${ws(id)}/drafts`
+
+// The mind repository (summoner p1, docs/mind.md): types of server/mind.ts.
+export type MindViewResponse = Awaited<ReturnType<typeof import('../server/mind.ts').mindView>>
+export type SummonStatusResponse = Awaited<ReturnType<typeof import('../server/summon.ts').status>>
+export type MindView = import('../server/mind.ts').MindView
+export type MindWhy = Awaited<ReturnType<typeof import('../server/mind.ts').why>>
+export type MindBraindump = Awaited<ReturnType<typeof import('../server/mind.ts').braindump>>
+type MindChange = { ok: boolean; message: string; commit: string; changed: boolean }
+
+export const api = {
+  mind: (refresh = false) => call<MindViewResponse>('GET', `api/mind${refresh ? '?refresh=1' : ''}`),
+  summon: () => call<SummonStatusResponse>('GET', 'api/summon'),
+  mindWhy: (project: string) => call<MindWhy>('GET', `api/mind/why/${encodeURIComponent(project)}`),
+  mindBraindump: (slug: string) => call<MindBraindump>('GET', `api/mind/braindumps/${encodeURIComponent(slug)}`),
+  mindAdd: (slug: string, text: string, author: string) => call<MindChange>('POST', 'api/mind/braindumps', { slug, text, author }),
+  mindEdit: (slug: string, text: string, author: string, base?: string) => call<MindChange>('PUT', `api/mind/braindumps/${encodeURIComponent(slug)}`, { text, author, base }),
+  mindRemove: (slug: string, author: string, force = false) => call<MindChange>('DELETE', `api/mind/braindumps/${encodeURIComponent(slug)}`, { author, force }),
+  workspaces: () => call<WorkspacesResponse>('GET', 'api/workspaces'),
+  // What a shared:// reference is on this host (p12, server/boast.ts resolveShared).
+  shareRef: (ref: string) => call<{ ref: string; state: string; detail: string; url: string | null; download: string | null; host: string; path: string | null; folder: boolean }>('GET', `api/share-ref?ref=${encodeURIComponent(ref)}`),
+  dashboard: () => call<DashboardResponse>('GET', 'api/agdev'),
+  // The management relationships this installation knows (improve_multinodes p4, docs/management.md).
+  manage: (signal?: AbortSignal) => call<ManageResponse>('GET', 'api/manage', undefined, [], signal),
+  // Conversations (challenge p2, docs/conversations.md): the recent ordinary ones for
+  // Home's entrance, with the counts of every view (argue p4 ex2).
+  discussions: (signal?: AbortSignal) => call<{ disabled: string | null; counts: Record<'conversation' | 'check', { open: number; closed: number }> | null; conversations: { id: string; title: string; displayTitle: string | null; updated: string; state: 'open' | 'closed'; count: number; members: string[]; open: number; mode: 'direct' | 'group' | 'facilitated'; conductor?: string | null; activity?: { kind: string; state: string; node: string; run: string; asked: string[] } | null; status: { working: number; owed: number; awaiting: { you: boolean }[] }; archive: { state: string; commit: string | null; through: number | null; url: string | null } }[] }>('GET', 'api/conversations?category=conversation&limit=6', undefined, [], signal),
+  // Usage (retire_old_ui p1): the executions' own figures, and the subscription windows apart (a cold read asks the vendors).
+  // Every execution node as the coordinator last heard from it (docs/workers.md).
+  workers: (signal?: AbortSignal) => call<{ workers: (WorkerView & { slots?: { attempt: string; workspace: string; workflow: string; run: string; state: string; lane: string }[] })[] }>('GET', 'api/workers', undefined, [], signal),
+  usage: (period: Period, signal?: AbortSignal) => call<UsageResponse>('GET', `api/usage?period=${period}`, undefined, [], signal),
+  usageBudget: (signal?: AbortSignal) => call<SourceState<BudgetBoard>>('GET', 'api/usage/budget', undefined, [], signal),
+  createGiteaProject: (input: { id: string; name: string; intent: string; goals: string[]; devdocs: 'directory' | 'submodule'; resume?: boolean; reuse?: boolean }) =>
+    call<CreateProjectResult>('POST', 'api/agdev/projects', input, [422]),
+  registerGiteaProject: (owner: string, name: string) => call<AgdevResult>('POST', 'api/agdev/projects/register', { owner, name }),
+  obtainWorkspace: (project: string) => call<AgdevResult>('POST', `api/agdev/projects/${encodeURIComponent(project)}/workspaces`),
+  registerRepository: (owner: string, name: string, category: string) => call<AgdevResult>('POST', 'api/agdev/repositories', { owner, name, category }),
+  createRepository: (name: string, category: string, description: string) => call<AgdevResult>('POST', 'api/agdev/repositories', { create: true, name, category, description }),
+  addShared: (id: string, repository: string, path: string) => call<AddSubmoduleResponse & { url?: string }>('POST', `${ws(id)}/shared`, { repository, path }, [422]),
+  createProject: (input: { id: string; name: string; intent: string; goals: string[]; dir?: string; devdocsSource?: string; resume?: boolean }) =>
+    call<CreateProjectResult>('POST', 'api/projects', input, [422]),
+  register: (path: string, id?: string) => call<RegisterResponse>('POST', 'api/workspaces', { path, id }, [422]),
+  project: (id: string, refresh = false) => call<ProjectResponse>('GET', `${ws(id)}/project${refresh ? '?refresh=1' : ''}`),
+  saveProject: (id: string, project: Project, base?: string | null) => call<SaveResponse>('PUT', `${ws(id)}/project`, { project, ...(base ? { base } : {}) }),
+  addSubmodule: (id: string, path: string, url: string) => call<AddSubmoduleResponse>('POST', `${ws(id)}/submodules`, { path, url }, [422]),
+  addNewRepository: (id: string, path: string) => call<AddSubmoduleResponse>('POST', `${ws(id)}/submodules`, { path, create: true }, [422]),
+  workflowTemplates: (id: string) => call<{ id: string; name: string; description: string; documentation: Documentation }[]>('GET', `${ws(id)}/workflow-templates`),
+  workflow: (id: string, file: string, refresh = false) => call<WorkflowResponse>('GET', `${wf(id, file)}${refresh ? '?refresh=1' : ''}`),
+  runs: (id: string) => call<RunSummary[]>('GET', `${ws(id)}/runs`),
+  knowledge: (project: string) => call<KnowledgeView>('GET', `api/knowledge?project=${encodeURIComponent(project)}`),
+  // improve_workflow p3: candidates with their bodies, for limits beside the choice; a shared collection at this project's pin.
+  knowledgeCandidates: (current?: string) => call<KnowledgeListing>('GET', `api/knowledge?body=1${current ? `&current=${encodeURIComponent(current)}` : ''}`),
+  knowledgeFinding: (id: string, o: { rev?: string; current?: string } = {}) => call<KnowledgeDetail>('GET', `api/knowledge/finding?id=${encodeURIComponent(id)}${o.rev ? `&rev=${encodeURIComponent(o.rev)}` : ''}${o.current ? `&current=${encodeURIComponent(o.current)}` : ''}`),
+  knowledgeDecisions: (project: string, run: string) => call<KnowledgeDecisions>('GET', `api/knowledge/decisions?project=${encodeURIComponent(project)}&run=${encodeURIComponent(run)}`),
+  run: (id: string, workflow: string, run: string, rev?: string, signal?: AbortSignal) =>
+    call<RunResponse>('GET', `${ws(id)}/runs/${encodeURIComponent(workflow)}/${encodeURIComponent(run)}${rev ? `?rev=${encodeURIComponent(rev)}` : ''}`, undefined, [], signal),
+  runFile: (id: string, workflow: string, run: string, path: string, rev?: string, signal?: AbortSignal) =>
+    call<{ path: string; text: string }>('GET', `${ws(id)}/runs/${encodeURIComponent(workflow)}/${encodeURIComponent(run)}/file?path=${encodeURIComponent(path)}${rev ? `&rev=${encodeURIComponent(rev)}` : ''}`, undefined, [], signal),
+  // One run operation (docs/runs.md); `by` is the declared actor, `expectSeq` the sequence the view showed.
+  runOp: (id: string, workflow: string, run: string, op: Record<string, unknown> & { op: string; by: string; expectSeq?: number; yes?: boolean }) =>
+    call<RunOpResponse>('POST', `${ws(id)}/runs/${encodeURIComponent(workflow)}/${encodeURIComponent(run)}/ops`, op),
+  runStorage: (id: string, workflow: string, run: string, signal?: AbortSignal) => call<RunStorageView>('GET', `${ws(id)}/runs/${encodeURIComponent(workflow)}/${encodeURIComponent(run)}/storage`, undefined, [], signal),
+  storageAction: (id: string, workflow: string, run: string, action: 'retire' | 'restore', by: string) => call<{ ok: boolean; started: string }>('POST', `${ws(id)}/runs/${encodeURIComponent(workflow)}/${encodeURIComponent(run)}/storage/${action}`, { by }),
+  runExec: (id: string, workflow: string, run: string, signal?: AbortSignal) => call<RunExecView>('GET', `${ws(id)}/runs/${encodeURIComponent(workflow)}/${encodeURIComponent(run)}/exec`, undefined, [], signal),
+  runDelegations: (id: string, workflow: string, run: string, signal?: AbortSignal) => call<DelegationsView>('GET', `${ws(id)}/runs/${encodeURIComponent(workflow)}/${encodeURIComponent(run)}/delegations`, undefined, [], signal),
+  runIo: (id: string, workflow: string, run: string, attempt: string, line: number) => call<IoEntryView>('GET', `${ws(id)}/runs/${encodeURIComponent(workflow)}/${encodeURIComponent(run)}/io?attempt=${encodeURIComponent(attempt)}&line=${line}`),
+  runPresentations: (id: string, workflow: string, run: string, signal?: AbortSignal) => call<{ presentations: PresentationView[] }>('GET', `${ws(id)}/runs/${encodeURIComponent(workflow)}/${encodeURIComponent(run)}/presentations`, undefined, [], signal),
+  // p17 (docs/reviews.md): human review rounds of a run, and the person's operations on one.
+  runReviews: (id: string, workflow: string, run: string, signal?: AbortSignal) => call<{ reviews: RoundView[] }>('GET', `${ws(id)}/runs/${encodeURIComponent(workflow)}/${encodeURIComponent(run)}/reviews`, undefined, [], signal),
+  review: (id: string, workflow: string, run: string, rv: string, signal?: AbortSignal) => call<{ review: RoundView; run: { project: string; workflow: string; run: string; seq: number } }>('GET', `${ws(id)}/runs/${encodeURIComponent(workflow)}/${encodeURIComponent(run)}/reviews/${encodeURIComponent(rv)}`, undefined, [], signal),
+  reviewAct: (id: string, workflow: string, run: string, rv: string, action: 'start' | 'decide' | 'cleanup', body: { by: string; outcome?: 'approved' | 'changes'; feedback?: string; revisions?: string[]; receipt?: string }) => call<{ ok: boolean; review: RoundView }>('POST', `${ws(id)}/runs/${encodeURIComponent(workflow)}/${encodeURIComponent(run)}/reviews/${encodeURIComponent(rv)}/${action}`, body),
+  presentation: (id: string, workflow: string, run: string, p: string, action: 'start' | 'stop', by: string) => call<{ ok: boolean }>('POST', `${ws(id)}/runs/${encodeURIComponent(workflow)}/${encodeURIComponent(run)}/presentations/${encodeURIComponent(p)}/${action}`, { by }),
+  // A full check of an input set's or output's bytes (project_migration p6).
+  verifyShared: (id: string, workflow: string, run: string, setId: string, by: string) => call<{ ok: boolean; status: string; detail: string }>('POST', `${ws(id)}/runs/${encodeURIComponent(workflow)}/${encodeURIComponent(run)}/verify`, { id: setId, by }),
+  adjustRun: (id: string, workflow: string, run: string, body: { text: string; reason: string; by: string; dryRun: boolean; expectRevision?: string; expectSeq?: number }) => call<AdjustView>('POST', `${ws(id)}/runs/${encodeURIComponent(workflow)}/${encodeURIComponent(run)}/adjust`, body, [422]),
+  integrate: (id: string, workflow: string, run: string, by: string, dryRun: boolean) => call<{ ok: true; state: string; steps: IntegrationStepView[]; error?: string }>('POST', `${ws(id)}/runs/${encodeURIComponent(workflow)}/${encodeURIComponent(run)}/integration`, { by, dryRun }),
+  retryCheckpoint: (id: string, workflow: string, run: string, checkpoint: number) => call<unknown>('POST', `${ws(id)}/runs/${encodeURIComponent(workflow)}/${encodeURIComponent(run)}/checkpoints/${checkpoint}/publish`),
+  // improve_wfrun p1: the published workflows with the workspace's relation, one published definition, and the optional fast-forward.
+  published: (id: string, refresh = false) => call<PublishedResponse>('GET', `${ws(id)}/published${refresh ? '?refresh=1' : ''}`),
+  publishedHead: (id: string) => call<{ source: PublishedSourceView }>('GET', `${ws(id)}/published-head`),
+  publishedWorkflow: (id: string, file: string, refresh = false) => call<WorkflowResponse & { source: PublishedSourceView; descriptor: DefinitionDescriptor }>('GET', `${ws(id)}/published/${encodeURIComponent(file)}${refresh ? '?refresh=1' : ''}`),
+  // Drafts (p20, docs/drafts.md): saved editing state, published only by applying.
+  drafts: (id: string, file?: string) => call<{ drafts: DraftMeta[] }>('GET', `${drafts(id)}${file ? `?file=${encodeURIComponent(file)}` : ''}`),
+  draft: (id: string, draft: string) => call<DraftResponse>('GET', `${drafts(id)}/${draft}`),
+  startDraft: (id: string, file: string, by: string, another = false) => call<{ draft: DraftMeta }>('POST', drafts(id), { file, by, another }),
+  newWorkflowDraft: (id: string, n: { id: string; name: string; template: string; documentation?: string | Documentation }, by: string) => call<{ draft: DraftMeta }>('POST', drafts(id), { new: n, by }),
+  importEdit: (id: string, file: string, sha256: string, by: string) => call<{ draft: DraftMeta }>('POST', drafts(id), { import: { file, sha256 }, by }),
+  localEdits: (id: string) => call<LocalEditsView>('GET', `${drafts(id)}/local-edits`),
+  saveDraft: (id: string, draft: string, input: { revision: number; by: string; workflow?: Workflow; text?: string }) => call<DraftResponse>('PUT', `${drafts(id)}/${draft}`, input),
+  discardDraft: (id: string, draft: string, revision: number, by: string) => call<{ draft: DraftMeta }>('DELETE', `${drafts(id)}/${draft}`, { revision, by }),
+  compareDraft: (id: string, draft: string) => call<CompareResponse>('POST', `${drafts(id)}/${draft}/compare`, {}),
+  approveDraft: (id: string, draft: string, revision: number, kind: ApprovalKind, approver: string) => call<DraftResponse>('POST', `${drafts(id)}/${draft}/approve`, { revision, kind, approver }),
+  resolveDraft: (id: string, draft: string, input: { revision: number; by: string; latest: string | null; text?: string; recreate?: boolean; retarget?: string }) => call<DraftResponse>('POST', `${drafts(id)}/${draft}/resolve`, input),
+  // Conflicts, invalid results and unknown outcomes come back as an outcome, with the draft intact.
+  applyDraft: (id: string, draft: string, input: { revision: number; by: string; key: string }) => call<ApplyResult>('POST', `${drafts(id)}/${draft}/apply`, input, [409, 422, 502]),
+  tryDraft: (id: string, draft: string, input: { revision: number; text: string; author: string; receipt: string; by: string }) => call<{ ok: true; ref: { workflow: string; run: string }; job: { id: number; state: string }; duplicate: boolean }>('POST', `${drafts(id)}/${draft}/try`, input),
+  syncWorkspace: (id: string, dryRun = false) => call<SyncResultView>('POST', `${ws(id)}/sync`, { dryRun }, [409]),
+  requestRun: (id: string, input: { workflow: string; text: string; author: string; receipt: string }) =>
+    call<{ ok: true; duplicate: boolean; ref: { workflow: string; run: string }; job: { id: number; state: string } }>('POST', `${ws(id)}/runs`, input),
+  catalog: () => call<CatalogView>('GET', 'api/nodes'),
+  createTemplate: (body: TemplateBody & { id: string }) => call<{ template: NodeTemplate }>('POST', 'api/nodes', body),
+  updateTemplate: (id: string, body: TemplateBody & { expectRevision: number }) => call<{ template: NodeTemplate; changed: boolean }>('PUT', `api/nodes/${encodeURIComponent(id)}`, body),
+  deleteTemplate: (id: string, revision: number, by: string) => call<{ ok: true }>('DELETE', `api/nodes/${encodeURIComponent(id)}?revision=${revision}&by=${encodeURIComponent(by)}`),
+  addExample: (example: string, by: string) => call<{ template: NodeTemplate }>('POST', `api/nodes/examples/${encodeURIComponent(example)}`, { by }),
+  // Scoped context (p13, docs/context.md).
+  context: (id: string, workflow?: string | null) => call<ContextMatrixView>('GET', `api/context?workspace=${encodeURIComponent(id)}${workflow ? `&workflow=${encodeURIComponent(workflow)}` : ''}`),
+  // Local context blocks (p14).
+  blocks: (t: ScopeTarget) => call<{ blocks: BlockState[] }>('GET', `api/context/blocks?${scopeQuery(t)}`),
+  block: (t: ScopeTarget, id: string) => call<{ state: BlockState; revisions: BlockRevision[] }>('GET', `api/context/block?${scopeQuery(t)}&block=${encodeURIComponent(id)}`),
+  putBlock: (body: BlockWrite) => call<{ ok: true; changed: boolean; state: BlockState; revisions: BlockRevision[]; written: string }>('PUT', 'api/context/block', { ...body, via: 'browser' }),
+  detailUrl: (ref: string) => `api/context/detail?ref=${encodeURIComponent(ref)}&raw=1`,
+  runContext: (id: string, workflow: string, run: string) => call<RunContextView>('GET', `${ws(id)}/runs/${encodeURIComponent(workflow)}/${encodeURIComponent(run)}/context`),
+  eventsUrl: (id?: string) => (id ? `${ws(id)}/events` : 'api/events'),
+}
+
+// A run's delegations (p10, server/delegate.ts delegationsView).
+export interface DelegationView {
+  id: string; uid: string; node: string; state: string; target: { project: string; workflow: string; workspace: string; instance?: string }
+  requester: string; onBehalfOf: string | null; accepts: string; dispatched: { at: string; by: string }; predecessor?: string
+  request: { path: string; sha256: string }; original?: { path: string; sha256: string }
+  child: { uid: string; workspace: string; project: string; workflow: string; run: string; instance?: string; url?: string } | null
+  // improve_multinodes p1: a delegation to another installation, as the link knows it.
+  link?: { request: string; peer: string; delivery: string; acceptance: string; remoteRun: string | null; remoteUrl: string | null; problem: string | null; operations?: { id: string; kind: string; delivery: string; outcome: string }[]; observed?: { execution: string; seq: number; cancelled: boolean; attempt: boolean; questions: string[]; at: string | null } | null; freshness?: string; waiting?: string[]; kept?: string[]; capabilities?: string[] }
+  events: { n: number; type: string; at: string; wakes: boolean; text: string; question?: string; confirms?: boolean; plan?: boolean; document?: { path: string; sha256: string }; subject?: { path: string; sha256: string; bytes: number }[]; manifest?: { digest: string; execution: string; outcome: string; report: { path: string; sha256: string; bytes: number } | null; artifacts: { path: string; sha256: string; bytes: number; commit: string | null }[]; decision: { decision: string; by: string } | null; remote?: { instance: string; url: string | null; repository: string | null; commit: string | null; published: boolean | null; integrated: boolean } }; takenUp: { at: string; by: string } | null }[]
+  answers: { n: number; question: string; text: string; from: string; by: string; at: string }[]
+  instructions: { n: number; text: string; from: string; at: string }[]
+  revisions?: { n: number; event: number; manifest: string | null; instruction: string; reason: string; from: string; by: string; at: string }[] // fix6: results returned for correction
+  assessment?: import('../shared/assessment.ts').Assessment | null // fix6: the latest result's assessment
+  disposition: { kind: string; note: string; manifest: string | null; at: string; by: string } | null
+  closed: { reason: string; at: string } | null
+  pending: number[]
+  childNow: { situation: string; execution: string; seq: number; waiting: { node: string; holder: string }[]; decisions: number; hold?: string | null; status?: import('../shared/status.ts').RunStatus } | null
+}
+export interface DelegationsView { ref: string; delegations: DelegationView[]; parent: null | { delegation: string; parent: { project: string; workflow: string; run: string; node: string }; accepts: string; workspace: string | null } }
+export interface IoEntryView { attempt: string; line: number; entries: { line: number; kind: string; head: string; body?: string }[] }
+
+// Scoped context (p13, p14; server/contextView.ts).
+const scopeQuery = (t: ScopeTarget) => `scope=${t.scope}${t.project ? `&project=${encodeURIComponent(t.project)}` : ''}${t.workflow ? `&workflow=${encodeURIComponent(t.workflow)}` : ''}`
+export interface BlockWrite extends ScopeTarget { op: 'set' | 'check' | 'refresh' | 'remove'; block: string; base: number; by: string; title?: string; kind?: BlockKind; manager?: string; body?: string; evidence?: EvidenceRef[]; note?: string }
+export interface ContextMatrixView {
+  project: string; workflow: string | null; workflows: { id: string; name: string }[]
+  blocks: { system: BlockState[]; project: BlockState[]; workflow: BlockState[] | null }
+  authoring: ContextBundle; execution: ContextBundle | null
+  rendered: { authoring: string; execution: string | null }
+}
+export interface RunContextView {
+  run: string
+  attempts: { attempt: string; began: string; reason: string; recorded: AttemptContext | null; legacy?: { path: string; sha256: string }[]; delivery: { event: string; at: string; detail?: string } | null; snapshot: (ContextBundle & { rendered: string }) | null; unavailable?: string }[]
+  next: ContextBundle; nextRendered: string; changes: ContextChange[]
+  session: { policy: string; current: string | null; next: string }
+}

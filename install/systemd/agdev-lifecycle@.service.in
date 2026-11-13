@@ -1,0 +1,15 @@
+# The lifecycle service of installation @SLUG@: performs the updates its managed runs
+# request (agdevctl supervise). It is the one process of the installation that
+# administers Docker and the core's units; it runs outside the replaceable runtime.
+[Unit]
+Description=agdev lifecycle service (@SLUG@)
+After=network-online.target docker.service
+Wants=network-online.target docker.service
+
+[Service]
+ExecStart=/usr/bin/python3 @TOOL@ --config @CONFIG@ supervise
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target

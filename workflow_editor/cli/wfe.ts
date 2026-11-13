@@ -1,0 +1,2690 @@
+#!/usr/bin/env node
+// wfe — the workflow editor's command-line surface. A thin client of the same
+// modules the service uses (server/*, shared/*); it never goes through the
+// service, so no command needs it running. `wfe help` is the index.
+import { spawn, spawnSync } from 'node:child_process'
+import { realpathSync } from 'node:fs'
+import { readFile, writeFile } from 'node:fs/promises'
+import { dirname, isAbsolute, join, relative, resolve, sep } from 'node:path'
+import { fileURLToPath } from 'node:url'
+import type { Diagnostic, RepositoryStatus, WorkflowSummary } from '../shared/api.ts'
+import { autoArrange } from '../shared/layout.ts'
+import { APPROVAL_KINDS, DOC_STEPS, type ApprovalKind, type Documentation, type Issue } from '../shared/model.ts'
+import { addNewRepository, createProject } from '../server/create.ts'
+import { workspaceDir } from '../server/placement.ts'
+import { addSharedRepository, createSharedRepository, dashboard, obtainWorkspace, registerGiteaProject, registerSharedRepository, type AgdevContext } from '../server/agdev.ts'
+import { Gitea, GiteaError, loadGiteaSetting } from '../server/gitea.ts'
+import { REPO_CATEGORIES, type RepoCategory } from '../server/registry.ts'
+import { existsSync, readFileSync, writeFileSync } from 'node:fs'
+import { ExecStore } from '../server/exec.ts'
+import { StoreError } from '../server/sqlite.ts'
+import { loadRegistry, observe, registerWorkspace, RegistryError, unregisterProject, workspaceAt, type Registration } from '../server/registry.ts'
+import { RequestError, Workspace } from '../server/workspace.ts'
+import { listRuns, readRun } from '../server/runs.ts'
+import { setupArea } from './setup.ts'
+import { runCommand, runIndex } from './run.ts'
+import { NODES_HELP, nodesCommand } from './nodes.ts'
+import { PROJECTS_HELP, projectsCommand } from './projects.ts'
+import { KNOWLEDGE_HELP, knowledgeCommand } from './knowledge.ts'
+import { MIND_HELP, mindCommand } from './mind.ts'
+import { SUMMON_HELP, summonCommand } from './summon.ts'
+import { CONTEXT_HELP, contextCommand } from './context.ts'
+import { CHALLENGE_HELP, challengeCommand } from './challenge.ts'
+import { CONVERSATION_HELP, conversationCommand } from './conversation.ts'
+import { DIALOGUE_HELP, dialogueCommand } from './dialogue.ts'
+import { COORDINATE_HELP, coordinateCommand } from './coordinate.ts'
+import { codeVersion, instanceMismatch, areaInstance } from '../server/version.ts'
+import { assertNotRetired, assertWorkspaceAllowed, loadBoundary, retiredByUrl } from '../server/boundary.ts'
+import { discussionTurn, quietly } from './evidence.ts'
+
+const here = dirname(fileURLToPath(import.meta.url))
+// The editor package (agdev/workflow_editor, or an installed release of it).
+export const PACKAGE = resolve(here, '..')
+export const CONTRACT = join(PACKAGE, 'docs', 'contract.md')
+export const RUN_CONTRACT = join(PACKAGE, 'docs', 'runs.md')
+
+let remoteLocal = false
+class UsageError extends Error {}
+class Refused extends Error { detail?: unknown; constructor(m: string, detail?: unknown) { super(m); this.detail = detail } }
+
+// ---- arguments ---------------------------------------------------------------
+
+interface Parsed { positional: string[]; opts: Map<string, string[]>; flags: Set<string> }
+const FLAGS = new Set(['yaml', 'no-expect', 'example', 'no-example', 'preview', 'json', 'help', 'resume', 'h', 'new', 'history', 'no-gitea', 'reuse', 'lost', 'uncertain', 'found', 'complete', 'not-posted', 'refreeze', 'ok', 'about-plan', 'all', 'dry-run', 'commit', 'push', 'status', 'rebuild', 'allow-live-executor', 'terminal', 'missing', 'retire', 'upstream', 'published', 'regex', 'ignore-case', 'refresh', 'quick', 'verify-all', 'rendered', 'delivered', 'undelivered', 'partial', 'person', 'integration', 'conclude', 'close', 'no-title', 'if-untitled', 'queue', 'yes', 'no-default', 'none', 'no-change', 'synthetic', 'apply', 'replace', 'current', 'reopen', 'check-bytes', 'editing', 'no-failure-cases', 'another', 'remove', 'force', 'replace-link', 'interrupt-after-push', 'register']) // p7: present stop --all, run adjust --dry-run
+function parse(argv: string[]): Parsed {
+  const p: Parsed = { positional: [], opts: new Map(), flags: new Set() }
+  for (let i = 0; i < argv.length; i++) {
+    const a = argv[i]
+    if (a === '--') { p.positional.push(...argv.slice(i + 1)); break }
+    if (a.startsWith('--') || a === '-h' || a === '-w') {
+      const [k, inline] = a === '-h' ? ['help'] : a === '-w' ? ['workspace'] : a.slice(2).split(/=(.*)/s, 2)
+      if (FLAGS.has(k)) { p.flags.add(k); continue }
+      const v = inline ?? argv[++i]
+      if (v === undefined) throw new UsageError(`--${k} needs a value`)
+      p.opts.set(k, [...(p.opts.get(k) ?? []), v])
+    } else p.positional.push(a)
+  }
+  return p
+}
+const opt = (p: Parsed, k: string) => p.opts.get(k)?.at(-1)
+
+// ---- context -----------------------------------------------------------------
+
+const devdocsMode = (p: Parsed) => {
+  const m = opt(p, 'devdocs') ?? 'directory'
+  if (m !== 'directory' && m !== 'submodule') throw new UsageError('--devdocs is directory or submodule')
+  return m
+}
+// The registry is always chosen explicitly (an area's launcher sets
+// WFE_REGISTRY): a default relative to the code would open a different, empty
+// catalog whenever the code moves.
+const registryFile = (p: Parsed) => {
+  const file = opt(p, 'registry') ?? process.env.WFE_REGISTRY
+  if (!file) throw new UsageError('no registry chosen: pass --registry <file> or set WFE_REGISTRY (an area\'s wfe launcher sets it)')
+  return resolve(file)
+}
+const areaDir = (p: Parsed) => resolve(opt(p, 'area') ?? process.env.WFE_AREA ?? dirname(registryFile(p)))
+const giteaFile = (p: Parsed) => resolve(opt(p, 'gitea') ?? process.env.WFE_GITEA ?? join(dirname(registryFile(p)), 'gitea.json'))
+// The Gitea of this registry: its setting beside the registry (or --gitea /
+// WFE_GITEA). Absent means local-only operation.
+async function giteaOf(p: Parsed): Promise<Gitea | undefined> {
+  const file = giteaFile(p)
+  if (!existsSync(file)) return undefined
+  try { return new Gitea(await loadGiteaSetting(file)) } catch (e) { throw new Refused((e as Error).message) }
+}
+async function agdevCtx(p: Parsed): Promise<AgdevContext> {
+  const gitea = await giteaOf(p)
+  // The execution host's state from this area's store, as the service reads
+  // it, so `wfe dashboard` and the browser say the same; no store, no executor.
+  const store = join(areaDir(p), '.local', 'exec', 'exec.sqlite')
+  const executor = existsSync(store) ? async () => { const x = new ExecStore({ registryFile: registryFile(p), area: areaDir(p) }); try { return x.executorState() } finally { x.close() } } : undefined
+  return { registryFile: registryFile(p), area: areaDir(p), gitea, giteaProblem: gitea ? undefined : `no Gitea setting at ${giteaFile(p)}`, executor }
+}
+const ownerName = (text: string | undefined, what: string) => {
+  const m = /^([^/\s]+)\/([^/\s]+)$/.exec(text ?? '')
+  if (!m) throw new UsageError(`${what} must be <owner>/<name>`)
+  return { owner: m[1], name: m[2].replace(/\.git$/, '') }
+}
+const port = (p: Parsed) => Number(opt(p, 'port') ?? process.env.WFE_PORT ?? 8095)
+
+async function workspace(p: Parsed): Promise<Workspace> { return workspaceNamed(p, opt(p, 'workspace')) }
+async function workspaceNamed(p: Parsed, id: string | undefined): Promise<Workspace> {
+  const reg = await loadRegistry(registryFile(p))
+  let w: Registration | undefined
+  if (id) {
+    w = reg.workspaces.find(x => x.id === id)
+    if (!w) throw new Refused(`workspace "${id}" is not registered in ${registryFile(p)} (see: wfe list)`)
+  } else {
+    w = await workspaceAt(reg, process.cwd())
+    if (!w) throw new Refused(`the current directory is not inside a registered workspace; pass --workspace <id> (see: wfe list), or register it (wfe register)`)
+  }
+  await assertWorkspaceAllowed(await loadBoundary(registryFile(p), areaDir(p)), w, 'Opening')
+  const o = await observe(w)
+  if (!o.available) throw new Refused(`workspace "${w.id}" is registered but not available: ${o.reason}`)
+  const ws = new Workspace(w)
+  // Delegate targets in the other registered projects (p10).
+  ws.peers = async () => { const g = await giteaOf(p); return (await import('../server/peers.ts')).registryPeers(registryFile(p), areaDir(p), w!.project, g ? { registryFile: registryFile(p), area: areaDir(p), gitea: g } : undefined) }
+  return ws
+}
+
+async function workflowFile(ws: Workspace, name: string): Promise<string> {
+  const { list } = await ws.workflowSummaries()
+  const hit = list.find(s => s.file === name) ?? list.find(s => s.file === `${name}.yaml` || s.file === `${name}.yml`) ?? list.find(s => s.id === name)
+  if (!hit) throw new Refused(`no workflow "${name}" in ${ws.root}/devdocs/workflows (by file name or id); see: wfe status`)
+  return hit.file
+}
+
+async function serviceState(p: Parsed): Promise<{ url: string; running: boolean; sameRegistry?: boolean; registry?: string }> {
+  const url = `http://127.0.0.1:${port(p)}`
+  try {
+    const r = await fetch(`${url}/api/workspaces`, { signal: AbortSignal.timeout(800) })
+    const body = await r.json() as { registry?: { path?: string } }
+    return { url, running: true, sameRegistry: body.registry?.path === registryFile(p), registry: body.registry?.path }
+  } catch { return { url, running: false } }
+}
+
+// ---- output ------------------------------------------------------------------
+
+let json = false
+const out = (human: string, data: unknown) => { console.log(json ? JSON.stringify(data, null, 2) : human) }
+const short = (h?: string | null) => (h ? h.slice(0, 7) : '—')
+const diag = (d: Diagnostic) => `  ${d.severity === 'error' ? 'error  ' : 'warning'} ${d.message}${d.fix ? `\n           fix: ${d.fix}` : ''}`
+const issueLine = (i: Issue) => `  ${i.severity === 'error' ? 'error  ' : 'warning'} ${i.code.padEnd(26)} ${i.message}`
+function repoLine(r: RepositoryStatus) {
+  const parts = [r.path.padEnd(22), r.category.padEnd(8)]
+  if (r.kind === 'directory') return `  ${[...parts, r.path === 'devdocs' ? 'folder of the project root' : 'local area (folder of the project root)', ...(r.path !== 'devdocs' && !r.initialized && !r.error ? ['folder missing'] : []), ...(r.dirty ? [`${r.dirty} uncommitted`] : []), ...(r.error ? [`error: ${r.error}`] : [])].join('  ')}`
+  if (!r.initialized) parts.push('not initialized')
+  else parts.push(`${r.branch ?? 'detached'} @ ${short(r.head)}`)
+  if (r.kind === 'submodule' && r.recorded) parts.push(`recorded ${short(r.recorded)}${r.staged ? `, staged ${short(r.staged)}` : ''}${r.matchesRecorded === false ? ' (HEAD differs)' : ''}`)
+  if (r.dirty) parts.push(`${r.dirty} uncommitted`)
+  if (r.publication?.ahead) parts.push(`${r.publication.ahead} unpublished`)
+  if (r.error) parts.push(`error: ${r.error}`)
+  return `  ${parts.join('  ')}`
+}
+function workflowLine(w: WorkflowSummary) {
+  if (w.problem) return `  ${w.file.padEnd(24)} cannot be read: ${w.problem.kind}: ${w.problem.message}`
+  const ap = w.approvals ? `intent ${w.approvals.intent}, definition ${w.approvals.definition}` : ''
+  return `  ${w.file.padEnd(24)} id ${w.id}  "${w.name}"  ${w.errors} error${w.errors === 1 ? '' : 's'}, ${w.warnings} warning${w.warnings === 1 ? '' : 's'}  ${ap}`
+}
+
+// ---- help --------------------------------------------------------------------
+
+const HELP: Record<string, string> = {
+  boast: `wfe boast [status] <project> [--source worktree] [--workspace <id>] [--refresh]
+wfe boast reference
+
+boast/index.html is the page displayed in the Project Editor's Boast area.
+It can freely introduce the project's capabilities and outputs using HTML,
+CSS and JavaScript. Related files can live in the same directory.
+
+status     whether the page is published on the project's main (or, with
+           --source worktree, in a workspace's working tree), the commit,
+           and the addresses where the Project Editor and the page open
+reference  the optional technical reference (docs/boast.md): paths,
+           publication sources, media, browser capabilities, messages`,
+  nodes: NODES_HELP,
+  context: CONTEXT_HELP,
+  challenge: CHALLENGE_HELP,
+  conversation: CONVERSATION_HELP,
+  discussion: CONVERSATION_HELP,
+  dialogue: DIALOGUE_HELP,
+  coordinate: COORDINATE_HELP,
+  projects: PROJECTS_HELP,
+  knowledge: KNOWLEDGE_HELP,
+  mind: MIND_HELP,
+  summon: SUMMON_HELP,
+  create: `wfe create <dir> --name <name> [--id <id>] [--intent <text>] [--goal <text>]... [--devdocs directory|submodule] [--devdocs-source <path|url>] [--resume]
+
+Creates a new project and registers it as a workspace. With a Gitea setting
+(gitea.json beside the registry, --gitea or WFE_GITEA) the repositories are
+created on Gitea, the initial commits are pushed (devdocs first), and the
+project and its repositories are registered too; --no-gitea, or no setting,
+makes a local project that is pushed nowhere.
+  Writes  <dir>/ as a new workspace (docs/storage.md): <dir>/source/ is the
+          new Git repository with project.yaml (ag.project.v2) and devdocs/:
+          a directory of the root repository (--devdocs directory, the
+          default) or a submodule (--devdocs submodule; fixed for the
+          project); <dir>/.agdev/ is agdev's state. No .local/ is made: the
+          whole workspace is local.
+  Source  devdocs comes from a new local repository <area>/sources/<id>-devdocs.git
+          (or --sources <dir>), or from --devdocs-source. A local source is
+          recorded as a URL relative to <dir>/source, so the area can move as a whole.
+  Commits two commits with your Git identity (user.name/user.email): the new
+          devdocs source's initial commit (README.md, workflows/) and the
+          project root's initial commit. Nothing is pushed. If the identity is
+          missing, nothing is created.
+  Refuses a <dir> that exists and is not empty; it never overwrites.
+  --id    stable project id (default: <dir>'s name without "pj-")
+  --resume continues a creation that stopped partway (it left
+          <dir>/.agdev/create.json); finished steps are kept, nothing is deleted.
+Result: the steps done or kept, the commits, the workspace id, and any
+structure diagnostics. Exit 0 created; 1 refused or stopped (the message says
+what exists and how to continue).`,
+  register: `wfe register [<dir>] [--id <id>] [--label <text>]
+
+Records the workspace <dir> names or is inside (default: the current
+directory) in the registry, so the editor and the other commands can use it.
+A workspace is a folder whose source/ is the project's Git checkout
+(docs/storage.md); an old-layout checkout (the folder itself is the Git root)
+is refused with the way to convert it (wfe workspace migrate).
+  Changes only the registry file; other entries are kept. Registering the same
+          root again changes nothing and reports the existing id.
+  --id    workspace id (default: the project id from project.yaml)
+Result: registered / already-registered / refused, plus diagnostics for what
+the project structure lacks (project.yaml, devdocs submodule …),
+each with its fix. Exit 0 registered or already registered; 1 refused.`,
+  observe: `wfe observe [--json] [--workspace <id>] [--run [<workspace>:]<workflow>/<run>]... [--terminal]
+
+A read-only snapshot of every run this host knows (observer p3,
+docs/observation.md, schema ag.wfe-observation.v1): each run's identity
+(uid = <project>/<workflow>/<run>#<creation>), where its live record is and
+whether it read consistently, its situation, hold (human or not), attempts,
+the attempt's process (alive, process group CPU, log: last write, turns,
+session, an open tool call with its declared timeout, background tasks the
+harness stopped), its queue position and the work ahead of it, open questions
+and answers not taken up, what it waits for and whose move it is, the agent's
+last report, recoveries, and publication or integration problems; and the
+executor (heartbeat age, the slot, queued jobs).
+  Reads   the registry, each run through its own copy, the executor store
+          (one read transaction per run), attempt logs and one ps call.
+  Changes nothing: no reconcile, no queueing, no copy, no record, no post.
+  --run         only these runs (repeatable); listed even when settled
+  --terminal    also completed or cancelled runs with nothing outstanding
+                (by default they are left out; absence never means finished)
+Exit 0 with the document; 1 when the registry cannot be read.`,
+  runs: `wfe runs index [--rebuild] [--workspace <id>]
+wfe runs migrate [--dry-run] [--workspace <id>] --by <name> [--allow-live-executor]
+wfe runs relocate [--dry-run] [--workspace <id>] --by <name> [--allow-live-executor]
+wfe runs storage [--workspace <id>]
+wfe runs retire --selection <file.json> --by <name> [--dry-run]
+
+migrate (p9): moves runs recorded in a project workspace before p9 into
+working copies of their own, without changing what they mean. --dry-run
+prints the inventory and changes nothing: each run's state, hold, open
+attempt, queued jobs, unpublished checkpoints and open presentations, the
+action, each repository's head and the uncommitted files. Otherwise the
+recovery copies are taken first (<area>/.local/backups/p9-migrate-…), then
+each non-terminal run the execution host performs gets its copy under its own
+id, its folder as it is now, and run.relocate. Nothing is queued, resumed or
+announced; checkpoints keep their mode; completed, cancelled and IDE runs
+stay where they are; uncommitted files outside run folders are reported, not
+moved. Refused while the executor reports (stop it first). Running it again
+continues an interrupted migration (journal <area>/.local/migrations/p9.json)
+and changes nothing that is done.
+
+relocate (improve_wfrun p2): moves existing runs' folders from their trees into
+durable storage beside them, and links the documented path there. --dry-run
+changes nothing. Stop the executor and the service first; recovery copies come
+first, and running it again continues (journal <area>/.local/migrations/p2-records.json).
+
+storage: which runs of this workspace could have their working copy retired, and
+why the others keep theirs. retire: retires an inspected selection, checking each
+run again (wfe run retire is one run). docs/storage.md *Retirement*.
+
+index:
+
+The runs of this workspace that have their own working copy (p9): each one's
+state (ready, creating, damaged, rebuilt) and branch. Reads only, unless
+--rebuild: a copy whose manifest (copy.json) is missing is given one
+reconstructed from the copy itself — the run branch it has checked out and
+the storage its run.json records. Nothing is cloned, checked out, restarted or
+deleted; a copy whose repository is gone stays reported (its saved work is on
+its branch). Exit 0 when every copy is usable; 1 when one is damaged.`,
+  'rename-project': `wfe rename-project <from> <to> --repository <name> [--preview] --by <name> [--allow-live-executor] [--sessions <dir>]
+
+Renames a managed project on this host (rename/warden): workspace folder, registry,
+run copies, run records, stores, settings, context folder, presentation configs and
+session folders. --preview changes nothing. Rename the Gitea repository first, by its
+id; stop the executor, the service, Observer and
+its watchdog. Refused on any open attempt. Running it again continues from its journal
+(<area>/.local/migrations/rename-<from>-<to>.json) and changes nothing that is done.
+docs/storage.md *Renaming a project*.`,
+  list: `wfe list
+
+Lists the registered workspaces and what is observed now: available or not
+(and why), project id and name, branch and HEAD. Reads only.`,
+  status: `wfe status [--workspace <id>]
+
+Shows one workspace: project id, name, intent and goals; structure diagnostics;
+every repository with Git state (branch or detached HEAD, recorded/staged
+gitlink, uncommitted entries, not initialized); every workflow with its id,
+validation counts and approval states; every run with its execution state and
+what waits for whom; and whether the editor service is running. Reads only. The workspace is the one containing the current
+directory unless --workspace is given.`,
+  validate: `wfe validate [<workflow>] [--workspace <id>]
+
+Validates one workflow (file name or id) or all of them with the same rules as
+the editor (docs/contract.md, "Validation"). Reads only.
+Result: each issue as severity, code and message. Exit 0 when there are no
+errors (warnings allowed); 1 when a workflow has errors or cannot be read.
+Validation checks structure and references; it is not an approval.`,
+  approve: `wfe approve <workflow> <intent|definition> --approver <name>
+
+Records an approval of the saved file, exactly as the editor's Approve buttons
+do: the digest of the current intent (or definition), the declared approver
+and the time are written into the workflow's approvals.
+  Refuses a definition with validation errors, an empty intent, or a file that
+          cannot be read.
+  --approver is required: the name of the person who approves. The approver
+          is declared, not authenticated; passing validation is not an approval.
+Exit 0 recorded; 1 refused.`,
+  arrange: `wfe arrange <workflow>
+
+Auto-arrange: replaces layout.nodes with positions computed by rank, the same
+algorithm as the editor's Auto-arrange button, and saves the file. Every
+stored position is replaced, including cards someone placed by hand; to place
+one new card only, write its layout.nodes entry (or leave it out: nodes
+without a position are laid out automatically). Only layout changes;
+approvals are unaffected. Refuses a file that cannot be read.`,
+  'add-repo': `wfe add-repo <path> <location> [--workspace <id>]
+wfe add-repo <path> --new [--workspace <id>]
+
+Adds a Git submodule at <path> (for example study/evals or wedo/runtime), the
+same operation as the project view's "Add submodule": git submodule add.
+  <location>  an existing repository. A relative location resolves against the
+          project's origin, or against the project root when it has no remote.
+  --new   creates a new local repository first:
+          <area>/sources/<project id>-<path with / as ->.git with a README and
+          an initial commit (your Git identity), recorded as a URL relative to
+          the project root.
+Local file transport is enabled for this command only. The submodule is
+staged in the project root, not committed.
+Exit 0 added; 1 failed (what Git left behind is reported; nothing is reset).`,
+  draft: `wfe draft list [<file>] [--workspace <id>]
+wfe draft show <id> [--workspace <id>]
+wfe draft start <file> --by <name> [--another] [--workspace <id>]
+wfe draft save <id> --file <yaml|-> --revision <n> --by <name> [--workspace <id>]
+wfe draft compare <id> [--workspace <id>]
+wfe draft try <id> --revision <n> --braindump <file|-> --author <person> [--receipt <id>] [--workspace <id>]
+wfe draft apply <id> --revision <n> --by <name> [--key <id>] [--workspace <id>]
+wfe draft discard <id> --revision <n> --by <name> [--workspace <id>]
+wfe draft edits [--workspace <id>]
+wfe draft import <file> --sha256 <hash> --by <name> [--workspace <id>]
+
+Drafts of a project's workflow definitions, as the editor makes them
+(docs/drafts.md). They live in the service's storage, not in a checkout, and
+need no Git operation. Saving changes nothing a run reads.
+
+start    a draft of the published definition, fetched now; refused when one
+         exists unless --another
+save     names the revision it was made from; another's newer save refuses it
+compare  what applying would do now, publishing nothing
+try      a trial of that exact saved revision, on the published code; project
+         code that is not published is not part of it
+apply    publishes the revision: merges with upstream changes, validates, commits
+         only the definition (and a submodule's pin) and reads it back through
+         the resolver ordinary runs use. Exit 0 applied; 1 conflict, invalid,
+         failed or uncertain, with the draft intact. Applying again is safe.
+edits    workflow edits only this checkout holds; a checkout merely behind has none
+import   makes one of them a draft, with its real base; the checkout is unchanged`,
+  workflow: `wfe workflow new <id> [--name <name>] [--policy default|manual|custom [--steps plan,reports,final]] [--template <id>] [--workspace <id>]
+wfe workflow show <workflow> [--workspace <id>]
+wfe workflow save <workflow> --file <yaml|-> --base <rev> [--workspace <id>]
+
+These operate on this workspace's checkout, for whoever deliberately works
+there. Runs do not read it: the effect reaches them only when the file reaches
+the project's default branch (a person's draft goes there by wfe draft apply).
+
+show prints the definition file as it is on disk and its revision (the
+content hash the checkout view shows). save writes the checkout's file only,
+never a commit, and is not a draft save — after checking that the
+file is still at --base: a file someone changed since (on disk) is not overwritten; the refusal names its current revision (exit 1,
+code definition-conflict), so read it again and reapply the change. The new
+text must parse as a workflow (ag.workflow.v2); the file's own comments and
+key order are kept where the model did not change. Validation issues are
+reported, never a reason to refuse (wfe validate); approvals are records
+(wfe approve).
+
+wfe workflow basics [--dry-run] [--commit [--push]] [--workspace <id> | --all]
+
+Adds the basic workflows (today: freework — talk then workflow__talk; the run adds the work
+agreed in the conversation) to a project that lacks them. Its bindings and
+execution are resolved from the project's valid workflows (the most
+permissive access one of them already grants each path; the agent, profile
+and guides all of them agree on); a project without any gets its root
+editable and the rest readonly. A workflow with the id, or a file with the
+name, is never replaced: present, conflict (exit 1), unplaceable. --all
+goes through every registered workspace, once per project (and per shared
+devdocs repository): the others are reported as covered. --dry-run lists
+what would be added with the resolved settings. --commit commits only the
+added file (and the root's gitlink in submodule mode); --push pushes it when
+the branch has an upstream.
+
+Creates devdocs/workflows/<id>.yaml from a template (--template, default
+"empty": schema, id, name, empty intent, no nodes; documentation policy
+--policy, default the template's), in this checkout (the project view's "Create
+workflow" starts a draft instead). --policy custom takes --steps: the generated documents to keep, any of
+plan, reports, final, comma-separated ("none" for none).
+\`wfe workflow templates\` lists the templates. Under the default
+policy a run plans, reports each node and reports the whole (docs/contract.md,
+"Documentation policy"); manual leaves documents to explicit instructions.
+Refuses an id already used by another workflow file. Writing the file by hand
+is equally valid; see docs/contract.md.`,
+  request: `wfe request <workflow> --braindump <file|-> --author <person> [--predecessor <run>] [--node <worker>] [--receipt <id>] [--editing] [--workspace <id>]
+wfe request <workflow> --request <file|-> [--requester <agent>] [--entrusted-by <ref>] [--on-behalf-of <person>] [--original <file>] [--predecessor <run>] [--node <worker>] [--receipt <id>] [--workspace <id>]
+Both take [--challenge <id>[@<commit>]]…: a challenge the work is about (wfe challenge help), given to
+the run as it is at that revision (its file in the run folder, input.attachments in run.json).
+
+--request is an agent's request (the run's request.md): what the agent wrote,
+not a person's words. From an executing attempt the requester is that run's
+agent, it is entrusted by that run, and the receipt is derived from the
+attempt and the text, so the same command retried finds the same run instead
+of creating a second. --on-behalf-of names the person served; --original
+keeps the words the request was derived from (the run's original-input.md),
+so a rewritten request never replaces what was actually said. Use a
+delegate node instead (wfe run adjust, docs/delegation.md) when your own work
+waits for the result and judges it.
+
+A person's request to the executor (autolab): creates the run, in its own
+working copy, with their words as braindump.md and queues its start. The same
+receipt twice queues once. Other runs of the project — held, waiting or
+working — never refuse it (p9). --predecessor names an earlier run this one
+follows (reusing its plan, repairing or reversing it): the record keeps the
+link and the agent is told where that run's records and saved branch are.
+--node chooses the execution node (worker) that performs the run, over the
+workflow's execution.node, the project's and the area's default
+(<area>/workers.json; docs/workers.md). The run keeps it for every attempt.
+
+Which definition runs (improve_wfrun p1): the workflow as published on the
+project's default branch on Gitea, fetched now, and the run's code at the same
+commit — never this workspace's files, whether it is behind, edited or on
+another branch. run.json definition.source names the commit.
+--editing runs a trial of this checkout's file of <workflow> instead (a
+person's unapplied changes are tried with wfe draft try): its
+exact bytes (definition.source kind trial, with their sha256) on the published
+code; the workspace's uncommitted project code is not part of it.`,
+  workspace: `wfe workspace status [--workspace <id>] [--refresh]
+wfe workspace sync [--workspace <id>] [--dry-run]
+wfe workspace relocate <id>...|--all [--to <folder>] [--apply] [--verify content] [--by <name>]
+wfe workspace relocate --resume
+wfe workspace migrate <id>...|--all [--apply] [--by <name>] [--sessions <folder>]
+
+How this workspace relates to the project's published source (its default
+branch on Gitea), and bringing it forward (improve_wfrun p1). Runs never need
+it: ordinary execution reads the published source whatever the workspace is.
+
+status   the root and every submodule the published revision pins: head,
+         branch, published commit, relation (same, behind, ahead, diverged,
+         unknown) with counts, uncommitted changes counted apart, and what
+         can be done next. --refresh fetches the published side now.
+sync     fast-forwards the root (on the published branch, clean, only
+         behind) and each submodule whose pin moved (clean, at its old pin;
+         a branch is fast-forwarded, a detached checkout moved to the pin).
+         Anything else is refused with the reason and nothing is changed;
+         nothing is stashed, reset, merged or rebased. Each repository's step
+         is reported; after a partial update, fix the named repository and
+         run sync again. --dry-run says what would move.
+relocate moves workspaces to another folder, by default the project root
+         (wfe placement): a verified copy, then the registry and the area's
+         live references (presentation instances, model session folders)
+         switch to the copy. Without --apply
+         it only previews: destinations, same or another volume, collisions,
+         open work, worktrees and alternates. The source is never changed or
+         removed; it stays as the retained copy. One volume clones files where
+         the filesystem can; another volume gets a real copy. --verify content
+         also compares every file's bytes (default: type, mode, link, size,
+         time), and Git must read refs, status and submodules the same in both.
+         A missing destination folder (an unmounted volume) is refused, never
+         created. Progress is journaled in <area>/.local/migrations/relocations/;
+         an interrupted relocation continues with --resume. Runs live inside
+         their workspace and move with it; run records are not rewritten.
+migrate  converts old-layout workspaces (the folder itself was the Git
+         checkout, agdev state in .local/wfe/) into envelopes: the checkout
+         moves to source/, runs to .agdev/runs/<wf>/<run>/source/, retention
+         and the dialogue archive to .agdev/, top-level files of .local/ to
+         the workspace root; project-owned folders stay in source/.local/.
+         Everything is renamed in place: nothing is copied or deleted, and
+         uncommitted work, refs and submodules stay. Linked worktrees,
+         absolute submodule settings, model session folders (the old name
+         links to the new) and presentation configs are repaired. Without
+         --apply it only previews. Stop the services first; open attempts or
+         queued jobs refuse. Journal: <area>/.local/migrations/layout/<id>.json;
+         the same command continues an interrupted conversion.`,
+  placement: `wfe placement [show]
+wfe placement set <absolute folder>
+
+Where this area puts the workspaces it creates or obtains (the editor's New
+project and Obtain, wfe create --id, wfe project obtain): the project root in
+<area>/placement.json, else the area itself. set prepares a folder that exists
+(a marker file .agdev-projects.json) and names it; an installation's agdevctl
+does this from [projects] root. A configured root without its marker (an
+unmounted volume) refuses creation instead of using another folder. Changing
+the root does not move existing workspaces: wfe workspace relocate does.
+show exits 1 when the root is not available.`,
+  branches: `wfe branches inventory [--workspace <id>]
+wfe branches preview [--workspace <id>] [--run <wf>/<run>]... [--selection-out <file>]
+wfe branches delete --selection <file.json> --by <name> [--dry-run]
+wfe branches recreate <wf>/<run> --workspace <id> --by <name> [--dry-run]
+
+Run branches on the configured Gitea (improve_wfrun p3, docs/storage.md *Run
+branch cleanup*). Explicit only: no age, name prefix or reachability from main
+decides anything, and nothing runs by itself.
+  inventory exact repository/ref/object tuples and which run owns each, nested and
+            shared repositories included; run branches nobody owns here are unknown.
+  preview   read-only: what could go, with reasons for what stays, the expected ref
+            change, and what is known about storage. A branch may go only when its
+            run is finished, retired and settled on every worker, and its exact tip is
+            in retained storage and in a verified backup of the run's current generation.
+  delete    consumes a selection (--selection-out writes one), rechecks all of it under
+            the run's lifecycle lock and deletes only the object it saw: a branch
+            that moved is left and reported. Retention refs, tags, main and other
+            branches are never in a selection. Run again to continue a partial one.
+  recreate  puts a deleted branch back at its recorded object from retained storage;
+            one that exists elsewhere is reported, never overwritten.
+Branch absence is not run absence: records, receipts and run numbers do not change,
+and a correction of a restored run publishes its branch again.
+Exit 1 when anything was refused, left or failed.`,
+  backup: `wfe backup create --by <name>
+wfe backup status [--json]
+wfe backup list [--json]
+wfe backup verify [--generation <id>]
+wfe backup restore --into <empty folder> [--generation <id>] [--from <path>]
+wfe backup rehearse --into <restored folder> --by <name> [--run <ws>:<wf>/<run>]... [--no-failure-cases]
+wfe backup reinstate --by <name> [--generation <id>] [--workspace <id>] [--dry-run]
+
+Backup of retired runs on another machine (improve_wfrun p3, docs/storage.md
+*Backup and recovery*). The destination is <area>/run-backup.json. It covers
+retired runs in full (record, manifest, archives, worker archives, retention
+repositories, published outputs), and records of every other run for its identity
+only. It is not disaster recovery for the service: Gitea and workspaces are outside.
+  create    captures, verifies every file and retained ref at the destination, then
+            publishes. A failed, interrupted or inconsistent one leaves the last
+            generation in place. Exit 1 when nothing was published.
+  status    the last verified generation, its age, coverage and failures; retired
+            runs it does not hold now.
+  verify    reads every file's hash and every retained ref at the destination;
+            names the runs a failure affects. Exit 1 on any failure.
+  restore   brings a generation here, verifies it, and makes an isolated recovery
+            area: paths remapped, no Gitea, Slack, worker or presentation
+            settings. --from <path> reads a backup folder on this host, with no registry.
+  rehearse  on that area: reads records, reports and evidence, compares output
+            bytes, replays receipts, checks run numbers, shows failures are reported
+            by run, restores every selected run, verifies worker archives. Writes
+            <folder>/rehearsal.json. Exit 1 when a check fails.
+  reinstate puts missing or damaged pieces back into this live area. What exists and
+            is intact is never overwritten; newer events and refs are reported.`,
+  share: `wfe share <subcommand> …   (shared areas on this host; docs/shares.md)
+
+A share is where people put materials for agents and pick results up. They
+name what they put there in their own words — "/agshare/folks/ponderer",
+"agshare/folks/ponderer", "folks/ponderer", another PC's mount path — not
+as a reference; resolve, ls and find read such words against the shares
+this host has configured, never outside their roots, and print the
+reference (shared://<share>/<path>, a trailing / for a folder) that records
+and other hosts use.
+
+list                       the shares this host has configured (<area>/shares.json) and
+                           whether each is mounted here (its marker file answers)
+resolve <ref or path>      what shared item the words name, and where it is on this host.
+                           Accepts a reference, <share>/<path>, /<share>/<path>, a path
+                           under this host's folder for a share, or a path inside a share.
+                           Each reading is one stat (nothing is searched). Answers:
+                             ok           one item: its reference, this host's path, its
+                                          LAN download address
+                             ambiguous    several items match (each is listed)
+                             absent       no reading exists in the reachable shares
+                                          (the nearest existing folder is named)
+                             unavailable  a share it may be in is not reachable here
+                                          (unmounted, or none configured): absence is
+                                          not confirmed
+                             unknown-share, outside
+                           Paths printed here are this host's: never write them into a
+                           tracked record, name the reference. Exit 1 unless ok
+ls <ref or path> [--max <n>]
+                           the files one item holds (path and size; nothing is hashed)
+find <name> [--share <s>]... [--under <ref or path>] [--max-entries <n>] [--depth <n>]
+     [--limit <n>]         search the shares for a file or folder by name, or by the last
+                           segments of a path ("ponderer", "folks/ponderer", "*.png");
+                           without case, breadth first, symbolic links not followed.
+                           Bounded: entries read (default 50000), folder depth (12) and
+                           matches (50). A search that met a bound, an unreadable folder
+                           or an unreachable share says it was incomplete — then finding
+                           nothing is not absence: narrow it with --under or raise a
+                           bound. Exit 1 when nothing was found
+verify <manifest.json> [--quick]
+                           check an input-set or output manifest (devdocs/runs/…/inputs/
+                           i<n>.json, outputs/o<n>.json, or a copy of one) against this
+                           host's share: verified, changed or missing. Needs no run and
+                           no workspace — how another PC checks a delivery it received
+                           by reference. Exit 1 unless verified`,
+  present: `wfe present <subcommand> …   (presentations of a run's result; docs/presentations.md)
+
+register <run> <node> --source <dir> --entry <file> --review <file.md> --title <text>
+                                  freeze the files of <dir> (project-relative) as the
+                                  run's next presentation (p1, p2 …): they are copied into
+                                  devdocs/runs/<wf>/<run>/presentations/<p>/ with the
+                                  review text and a manifest of hashes; the revision is
+                                  the manifest's digest. From a running node, by the
+                                  executing attempt (WFE_ATTEMPT). Later edits of <dir>
+                                  never change a registered presentation. WFE may first
+                                  answer with reminders (registered from a talk or work
+                                  node, no cleanup planned); nothing is copied then, and
+                                  the refusal says how to continue
+start <run> <p>                   serve it on this host, in a session of its own (it
+                                  outlives the attempt, a human wait, a stopped run and
+                                  a service restart). Records it available only after
+                                  its identity, review screen and entry answered. A
+                                  second start returns the instance that serves it
+stop <run> <p> | stop <run> --all stop the run's own instances and verify they are gone
+                                  (process ended, port no longer answers); records
+                                  stopped, or stop-failed (retry). Repeating is harmless
+status [<run>]                    what each presentation's record says and what this host
+                                  observes now; the review link only when it is live
+reconcile                         after a restart: mark instances whose process is gone
+keep <run> <p> --note <text> --owner <who> [--because answer:<q>[:<n>]]
+                                  record that the person asked for it to stay
+                                  available after the review (fix6): on whose words,
+                                  and who stops it later. It starts, stops or keeps
+                                  nothing; reminders then no longer call it a
+                                  forgotten cleanup
+Ask about a presentation: wfe run ask <run> <node> --presentation <p> … (the
+result-confirmation question; the answer binds that revision). Host settings:
+<area>/present.json {bind, publicBase, ports, answerBase}.`,
+  exec: `wfe exec <subcommand> …   (the executor's interface; JSON output)
+
+Every subcommand acts for one execution node: --worker <id>, or the local
+worker of <area>/workers.json (docs/workers.md). A worker claims only jobs of
+runs assigned to it, and only it reports, stops or publishes its attempts.
+Since improve_wfrun p4 a worker holds as many attempts as warden decided
+should run on it (docs/coordination.md): a claim takes the oldest queued job
+of this worker that a decision admitted; a job without one waits with
+"awaiting the coordination decision". The coordination lane (--lane
+<name>, workers.json "coordination") takes coordination runs, one at a time,
+without a decision. An area without coordination keeps one attempt per lane.
+
+claim [--backend <text>] [--profiles-json <{name: backend}>] [--contract <name>=<sha256>]
+      [--sessions-json <{profile: "explicit"}>] [--lane <name>]
+                                  take the next queued job this worker may start:
+                                  records attempt.begin with the settings it is
+                                  launched with (agent, profile → backend, the
+                                  contract and the project guides by hash, and
+                                  the session: new or resumed, by id);
+                                  prints the attempt, workspace, run, a brief
+                                  and the guides for its prompt. A profile the
+                                  host does not offer, a missing guide, or the
+                                  "run" session policy on a profile not in
+                                  --sessions-json ('' = the host default)
+                                  leaves the job waiting with the reason in its
+                                  note (it is the worker's to serve). --receipt:
+                                  the worker's id for this claim; the same
+                                  receipt again gets the same answer. --lane:
+                                  claim in that lane of the worker (default:
+                                  "default"; docs/workers.md, "Lanes")
+started <attempt> --pid <pid>     the attempt's process is running
+session <attempt> --attached <id> the harness reported this session id
+session <attempt> --missing [--detail <text>]
+                                  the session to resume is not on this host and
+                                  nothing was launched in it: records the
+                                  replacement and prints the new session id
+finished <attempt> --exit-code <n> [--signal <name>] [--lost]
+         [--interrupted <reason>] [--attached <id>]
+                                  how it ended; records attempt.end, publishes
+                                  the checkpoint, queues a resume if an answer
+                                  already waits. --interrupted: the host ended
+                                  it (a failed launch, a session mismatch),
+                                  which holds the run; --attached: a session id
+                                  the harness reported and not yet recorded
+stops                             this worker's attempts to terminate (stop or cancel requested)
+heartbeat --pid <pid> [--detail …] [--facts-json <{load: {…}}>]
+                                  this worker reports; --facts-json carries what
+                                  it measured of its host (improve_wfrun p4)
+reconcile [--holding <attempt>]   after a restart: gone processes become
+                                  "unknown"; requests and answers that were not
+                                  queued are queued again under their receipts.
+                                  --holding: an attempt whose process the caller
+                                  still owns keeps the slot (a launch it could
+                                  not register or confirm stopped)
+publish <checkpoint id>           retry a publication; finished steps are kept
+status [<run>]                    the executor and the workers, or one run's
+                                  attempts, jobs and checkpoints
+workers                           every worker: last contact, slot, queue, offer
+adopt                             this worker's running attempts whose process
+                                  still lives (a restarted executor takes them back)
+State is <area>/.local/exec/exec.sqlite (this host only).`,
+  submit: `wfe submit --requester <name> --workflow <project>/<workflow> --key <key> --text-file <file|-> [--about <text>] [--workspace <id>]
+wfe submit --show <receipt>
+
+A machine requester's submission (Observer's recovery request), through this
+installation's running WFE service (--api <base>, default http://127.0.0.1:<WFE_PORT>).
+The receipt submission:<requester>:<key> is the identity: submitting it again is
+the same run. Who may submit what: <area>/submitters.json (nothing without it;
+docs/submissions.md). --show prints the run a receipt is bound to (cluster_teamwork p4).`,
+  manage: `wfe manage <subcommand> …   (a child installation over the agdev link; docs/management.md)
+
+status [<peer>]                   enrollment, the latest observation with its freshness,
+                                  and the update operations with their phases
+observe <peer>                    ask for an observation now
+update <peer> <commit> --reason TEXT [--by WHO]
+                                  ask the child to adopt this exact commit through its
+                                  own lifecycle (one update at a time)
+show <operation id>               receipt, lifecycle id, phases, selected and serving
+                                  release, verified completion`,
+  cluster: `wfe cluster <subcommand> …   (the cluster directory; docs/cluster.md)
+
+advertisement [--rebuild]         what this installation advertises (cluster.json offers,
+                                  enriched from published definitions; cached)
+directory [--refresh]             the directory: collected here (cluster.json
+                                  directory.collect) or the cached copy of peers.json
+                                  directory, with freshness (fresh / stale / unavailable)
+offers [<words>] [--refresh]      offers listed, filtered by words
+show <instance>/<project>/<workflow>
+resolve <project>/<workflow> [--instance <id>] [--refresh]
+                                  where to ask: the directory's entry, then the
+                                  installation itself (confirmed), whether this side may
+                                  request it and has its credential, and whether that
+                                  installation runs it for this one (permitted). Exit 0
+                                  only when ready. Discovery grants nothing
+use <directory URL> | none        the directory this installation consults (peers.json)`,
+  teamwork: `wfe teamwork <subcommand> …   (the teamwork archive; docs/teamwork-archive.md)
+
+status [<request>]                each request sent or received over the agdev link: its
+                                  archive state (current, behind, failed, never,
+                                  unverified, disabled), published commit, records and
+                                  live horizon
+archive [<request>|--all]         publish what the archive lacks (the coordinator's
+                                  reconcile does this every minute); --interrupt-after-push
+                                  is a diagnostic: push, then stop before the bookkeeping
+collect <request>                 the records an export would publish, as JSON
+package <request> --archive <repository>=<instance> … --out <new folder> [--push]
+                                  a self-contained package of the shared outputs the
+                                  archived records name: bytes verified on this host's
+                                  share, the archived records, SHA256SUMS; --push copies it
+                                  to attachments.json "backup" (…/agdev-teamwork/<request>/)
+                                  and verifies every hash there; never replaces a copy
+restore <request> --into <new folder>
+                                  the package back from the backup, every hash verified`,
+  peer: `wfe peer <subcommand> …   (the agdev link to other installations, over HTTP; docs/peers.md)
+
+status                            configuration, peers and what each speaks, the
+                                  last HTTP result per peer, requests sent and
+                                  received, messages awaiting an answer, problems
+messages [--request <id>]         deliveries received and messages queued or sent
+hello                             tell every peer again what this installation applies
+set <instance> [--label L] [--parentage parent|child|none] [--accept …] [--request …]
+    [--grant observe,update] [--manage observe,update] [--replace-parent <i>]
+    [--endpoint <WFE API URL>] [--credential <file>|default] [--manage-credential <file>|default]
+                                  change one peer in peers.json (atomic, others kept;
+                                  created for this installation when absent;
+                                  docs/management.md; HTTP fields: docs/peers.md)
+credential issue <holder> --out <file> [--scope work|manage] | install <issuer> --from <file|-> |
+           revoke <holder|id> | list
+                                  bearer credentials of HTTP delivery (tokens are written
+                                  to files, never printed); a manage credential carries
+                                  only the management its relationship allows
+unlink <instance> [--remove [--force]]
+                                  end the administrative relationship (work kept)
+check [<instance>]                each peer's HTTP readiness and enrollment (pending /
+                                  partial / mutual / contradictory / cycle)
+process                           settle received deliveries now; queue requests,
+                                  operations, facts, retries and state queries (the
+                                  service's HTTP loop does this by itself)
+resend <request id>               a diagnostic: send every message this side sent for
+                                  the request again (recovery does not need it: retries,
+                                  state queries and replays are automatic)
+State is <area>/.local/peerlink/peerlink.sqlite; configuration <area>/peers.json.`,
+  project: `wfe project register <owner>/<name>
+wfe project obtain <project id>
+wfe project unregister <project id>
+wfe project show [--workspace <id>]
+wfe project save --file <yaml|-> --base <rev> [--workspace <id>]
+
+show      prints project.yaml (intent, goals, guides, areas, execution) and its
+          revision. save writes a changed project.yaml like the project
+          editor's Save (the file only, no commit), refused with code
+          definition-conflict when the file is no longer at --base.
+
+register  records a project root that exists on Gitea (its project.yaml must be
+          ag.project.v2), its devdocs repository in submodule mode, and the
+          project, in the registry. Only the registry changes.
+obtain    clones a registered project with its submodules from Gitea into the
+          area (pj-<id>, or pj-<id>-2 … when taken) and registers that
+          workspace. An existing folder is never reused or overwritten.
+unregister removes the project, its workspaces and its root repository entry
+          from the registry, and nothing else: folders and Gitea stay. Refused
+          while a workspace of it has a queued job or an open attempt.
+Needs the Gitea setting (gitea.json beside the registry, --gitea or WFE_GITEA).`,
+  repo: `wfe repo register <owner>/<name> --category study|wedo|other|devdocs
+wfe repo create <name> --category study|wedo|other [--description <text>]
+wfe repo add <owner>/<name>|gitea:<id> <path> [--workspace <id>]
+
+register  records a Gitea repository by its Gitea id; it needs no project.
+create    creates a repository under the configured owner with a README and
+          registers it. A same-named repository with content is refused.
+add       adds a registered repository to this workspace's project as a
+          submodule at <path>, with a URL relative to the project on Gitea.
+          Staged, not committed. Other projects keep their pinned revisions.`,
+  gitea: `wfe gitea whoami [--as <principal>]
+wfe gitea repo <owner>/<name> [--as <principal>]
+wfe gitea git [--as <principal>] -- <git arguments…>
+
+Gitea as a chosen principal (project_migration p9). Without --as, the
+service's own principal (gitea.json: url, owner, tokenFile); --as names
+another one listed in gitea.json "principals". The token is never printed,
+never written to a remote, a URL or a Git config file.
+
+whoami    the login the principal authenticates as
+repo      whether it sees the repository and may pull, push, administer
+git       runs git in the current directory (or git's own -C <dir>) with
+          the principal's authentication for this Gitea's URL only; the
+          output is git's. Push to a remote of this Gitea (origin or a URL).
+          A force push (--force, -f, +<refspec>, --mirror) is refused: it
+          could overwrite others' work; --force-with-lease is allowed.
+          Author your commits yourself (git -c user.name=… -c user.email=…
+          commit …): the principal is who pushes, not who wrote.
+Typical: a preparation checkout of an existing repository, published as
+the principal before \`wfe project register\`.`,
+  dashboard: `wfe dashboard
+
+The agdev dashboard as text: every registered project (where its definition
+was read, its workspaces here, ongoing runs and waits) and every shared
+repository (Gitea state, the projects that use it). Facts that could not be
+read are said so, never listed as empty. Reads only.`,
+  version: `wfe version
+
+The code this command runs: the package directory (symbolic links resolved)
+and, for an installed release, RELEASE.json: the agdev commit it was
+built from. The service reports the same at GET api/version. Reads only; no
+registry is needed.`,
+  serve: `wfe serve [--port <port>]
+
+Starts the editor service for this registry in the foreground: it builds the
+UI, then serves the UI and API on http://127.0.0.1:<port>/ (default 8095, or
+WFE_PORT). Stop it with Ctrl-C. Browser-created projects go beneath the
+authoring area. Open views follow file changes without a reload.`,
+  setup: `wfe setup <area> [--port <port>]
+
+Creates or refreshes an authoring area: <area>/AGENTS.md (from the tracked
+template), START.md, <area>/wfe (a launcher that pins this area's registry and
+port), an empty registry if none exists, and sources/. It never creates or
+changes a project or a run, keeps an existing registry, the projects and
+everything else in the area, and keeps a generated file whose first-line stamp
+was removed. Prints the directory, the tool, the service command, the URL, a
+first authoring prompt and the prompt for executing a workflow.
+
+--installed-url <url> (workflow_editor p13): the operating area's authoring
+entry instead, written by the release script: <area>/authoring/AGENTS.md and
+CLAUDE.md, using <area>/bin/wfe, the installed docs and the published editor
+URL. It sits beside the workspaces, never above them, so executing agents'
+harnesses do not load it.`,
+}
+
+function index(p: Parsed): string {
+  return `wfe — create and register Git-backed projects; inspect, validate, approve and arrange their workflows.
+
+Usage: wfe <command> [options]        wfe help <command>   (or <command> --help)
+
+Projects and workspaces
+  create <dir> --name …     create a project (on Gitea when configured) and register it
+  register [<dir>]          register an existing workspace (<dir>/source is the checkout)
+  list                      registered workspaces and what is observed
+  status                    project, repositories (Git state), workflows, editor service
+  add-repo <path> <loc>     add a Git submodule (git submodule add); --new creates a local repository
+  project register|obtain   a project on Gitea: register it here, or clone a workspace of it
+  repo register|create|add  shared repositories on Gitea, and adding one to this project
+  gitea whoami|repo|git     Gitea as a chosen principal (--as): who, its access, git with its auth
+  dashboard               every project and shared repository, with where each fact was read
+  projects <subcommand>     read any managed project: list, show, tree, read, search, runs, run
+  knowledge <subcommand>    findings projects keep from practice: collections, list, show, check, cite, ref, decisions
+  mind <subcommand>         the mind repository: braindumps as grounds of projects, summonplans, why a project exists
+  summon apply|status|acquire  a summonplan's projects arrive here: acquired, registered, obtained, wired to roles
+                            (committed by default, at a revision, with provenance; docs/access.md)
+  request <workflow> …      a person's request to the executor (autolab): a run of the published
+                            workflow, queued (--editing: a trial of this checkout's file)
+  draft <subcommand>        drafts of a workflow, as the editor makes them: list, show, start, save,
+                            compare, try, apply, discard, edits, import (docs/drafts.md)
+  workspace status|sync     this checkout against the published source; fast-forward it when safe
+                            (for whoever works in it: nothing about workflows depends on it)
+  peer <subcommand>         the agdev link to other installations: status, messages, resend … (docs/peers.md)
+  teamwork <subcommand>     published history of work with other installations: status, archive (docs/teamwork-archive.md)
+  manage <subcommand>       observe and update a child installation over the link (docs/management.md)
+  exec <subcommand>         the executor's interface: claim, started, finished, stops, reconcile …
+  coordinate <subcommand>   execution coordination (warden): view, events, start, defer, assign, note,
+                            reconsider, wake, decisions (improve_wfrun p4; docs/coordination.md)
+  runs index [--rebuild]    runs' own working copies on this host (p9)
+  observe                   a read-only snapshot of every run for monitors (observer p3)
+  rename-project <a> <b>    rename a managed project on this host, with a preview and a journal (rename/warden)
+  present <subcommand>      presentations of a run's result: register, start, status, stop, reconcile
+  share <subcommand>        shared areas on this host: list, resolve, ls, find, verify (docs/shares.md)
+  boast [status] <project>  a project's Boast page (boast/index.html): published or previewed; reference
+  conversation <subcommand> conversations of a person and project agents — one project, several, or
+                            led by the conductor: participants, list, show, post, reply, start, end,
+                            join, invite, ask, ponder, resume, close, archive (challenge p2;
+                            docs/conversations.md; \`wfe discussion\` is the same command)
+  challenge <subcommand>    durable shared records of problems found in work: list, show, history,
+                            evidence, create, edit, resolve, withdraw, reopen, ops, retry, status
+                            (challenge p1; docs/challenges.md)
+  dialogue <subcommand>     character dialogue, the short reading view of conversations: status, show,
+                            history, retry, work (argue p5; docs/dialogue.md)
+  context <subcommand>      scoped context: show (sources for authoring or a run, and where each comes
+                            from), get|set|clear|history (the local overrides), run (used vs next)
+
+Workflows (by file name or id)
+  workflow new <id>         create devdocs/workflows/<id>.yaml in this checkout, from the template
+  nodes <subcommand>        the person's node catalog: list, show, create, update, delete,
+                            example, instantiate (a template into a workflow or a run draft)
+  validate [<workflow>]     validation issues
+  approve <wf> <kind>       record an intent or definition approval by a named approver
+  arrange <workflow>        auto-arrange the layout
+
+Runs (docs/runs.md; wfe run help)
+  run create <workflow> …   create a run: the input, a fixed copy of the definition, run.json
+  run list | show | check   runs, one run in full, record checks
+  run start | complete | …  record node starts, waits, questions, answers, outcomes
+  delegate request | …      entrust a delegate node's work to another workflow (docs/delegation.md; wfe delegate help)
+
+Editor
+  serve                     start the editor (UI and API) for this registry
+  setup <area>              create or refresh an authoring area and its AGENTS.md
+  version                   the code this command runs (an installed release names its agdev commit)
+
+Options: --workspace <id> (default: the workspace containing the current directory),
+         --json (structured output), --registry <file>, --area <dir>
+Registry: ${registryFile(p)}
+File contract (project.yaml, workflow YAML, validation, approvals): ${CONTRACT}
+Run contract (run folders, run.json, states, questions): ${RUN_CONTRACT}
+No command needs the editor service. Definition files may also be edited directly;
+an open editor view follows the change. Exit codes: 0 ok, 1 refused or errors, 2 usage.`
+}
+
+// ---- commands ----------------------------------------------------------------
+
+async function cmdCreate(p: Parsed): Promise<number> {
+  const gitea = p.flags.has('no-gitea') ? undefined : await giteaOf(p)
+  const [dirArg] = p.positional
+  const name = opt(p, 'name')
+  if (!name) throw new UsageError('create needs --name')
+  if (!dirArg && !opt(p, 'id')) throw new UsageError('create needs a destination directory, or --id to create pj-<id> in the project root')
+  // Without a destination, the area's project root (server/placement.ts), as the editor does.
+  const dir = dirArg ? resolve(dirArg) : await workspaceDir(areaDir(p), `pj-${opt(p, 'id')}`, 'wfe create')
+  const id = opt(p, 'id') ?? dir.split('/').pop()!.replace(/^pj-/, '')
+  const r = await createProject({
+    dir, id, name, intent: opt(p, 'intent') ?? '', goals: p.opts.get('goal') ?? [],
+    sourcesDir: resolve(opt(p, 'sources') ?? join(areaDir(p), 'sources')),
+    devdocs: devdocsMode(p), devdocsSource: opt(p, 'devdocs-source'), registryFile: registryFile(p), resume: p.flags.has('resume'),
+    gitea, reuse: p.flags.has('reuse'),
+  })
+  const lines = [r.message, ...r.steps.map(s => `  ${s.status.padEnd(6)} ${s.name}: ${s.detail}`)]
+  if (r.commits.length) lines.push('Commits:', ...r.commits.map(c => `  ${short(c.commit)} ${c.message} (${c.repository})`))
+  if (r.diagnostics?.length) lines.push('Structure:', ...r.diagnostics.map(diag))
+  if (r.ok) lines.push(`Next: cd ${r.root}; write workflows in devdocs/workflows/ (wfe workflow new <id>); wfe status`)
+  out(lines.join('\n'), r)
+  return r.ok ? 0 : 1
+}
+
+async function cmdRegister(p: Parsed): Promise<number> {
+  const r = await registerWorkspace(registryFile(p), resolve(p.positional[0] ?? '.'), { id: opt(p, 'id'), label: opt(p, 'label'), area: areaDir(p) })
+  out([r.message, ...(r.diagnostics.length ? ['Structure:', ...r.diagnostics.map(diag)] : [])].join('\n'), r)
+  return r.ok ? 0 : 1
+}
+
+async function cmdList(p: Parsed): Promise<number> {
+  const reg = await loadRegistry(registryFile(p))
+  const rows = await Promise.all(reg.workspaces.map(async w => ({ ...w, observed: await observe(w) })))
+  const human = !reg.exists ? `No registry yet at ${registryFile(p)}; create or register a project.`
+    : rows.length === 0 ? 'No workspaces registered.'
+      : rows.map(w => `${w.id.padEnd(16)} ${w.observed.available ? 'available' : 'unavailable'}  ${w.observed.available
+        ? `project ${w.observed.projectId ?? '?'} "${w.observed.projectName ?? ''}"  ${w.observed.branch ?? 'detached'} @ ${short(w.observed.head)}${w.observed.reason ? `  (${w.observed.reason})` : ''}`
+        : w.observed.reason}\n${' '.repeat(17)}${w.path}`).join('\n')
+  out(human, { registry: registryFile(p), exists: reg.exists, workspaces: rows })
+  return 0
+}
+
+async function cmdStatus(p: Parsed): Promise<number> {
+  const ws = await workspace(p)
+  const r = await ws.projectResponse()
+  const svc = await serviceState(p)
+  const runs = await listRuns(ws)
+  const pr = r.project
+  const lines = [
+    `Workspace ${ws.reg.id}: ${ws.root}`,
+    pr ? `Project ${pr.id} "${pr.name}"` : `project.yaml: ${r.problem?.message}`,
+    ...(pr ? [`Intent: ${pr.intent.trim() || '(empty)'}`, 'Goals:', ...(pr.goals.length ? pr.goals.map(g => `  - ${g}`) : ['  (none)'])] : []),
+    r.structure.length ? 'Structure:' : 'Structure: complete', ...r.structure.map(diag),
+    'Repositories:', ...r.repositories.map(repoLine),
+    `Workflows (devdocs/workflows):${r.workflowsDir.exists ? '' : ` ${r.workflowsDir.reason}`}`,
+    ...(r.workflows.length ? r.workflows.map(w => workflowLine(w) + (svc.running && svc.sameRegistry ? `\n${' '.repeat(27)}${svc.url}/#/ws/${encodeURIComponent(ws.reg.id)}/wf/${encodeURIComponent(w.file)}` : '')) : ['  (none)']),
+    `Runs (devdocs/runs/<workflow>/<run>/; wfe run show <run>):`,
+    ...(runs.length ? runs.map(s => `  ${s.ref.padEnd(30)} ${s.problem ? `cannot be used: ${s.problem.message}` : `${s.execution}${s.waiting?.length ? `; waiting: ${s.waiting.map(w => `${w.node} (next move: ${w.holder})`).join(', ')}` : ''}${s.ready?.length ? `; ready: ${s.ready.join(', ')}` : ''}`}${svc.running && svc.sameRegistry ? `\n${' '.repeat(33)}${svc.url}/#/ws/${encodeURIComponent(ws.reg.id)}/run/${s.workflow}/${s.run}` : ''}`) : ['  (none)']),
+    svc.running ? `Editor: running at ${svc.url}/${svc.sameRegistry ? `#/ws/${encodeURIComponent(ws.reg.id)}` : ` — but it serves ${svc.registry ? `another registry (${svc.registry})` : 'another registry or an older version'}; start this one with: wfe serve --port <free port>`}`
+      : `Editor: not running at ${svc.url} (start it with: wfe serve)`,
+  ]
+  out(lines.join("\n"), { ...r, workspace: ws.reg.id, root: ws.root, runs, editor: svc })
+  return 0
+}
+
+async function cmdValidate(p: Parsed): Promise<number> {
+  // Inside a run's copy, the copy's files are what is asked about, not the
+  // registered workspace's (gimmickimg freework/run-019 could not validate its fix).
+  const shared = await workspace(p)
+  const { copyWorkspace, readCopy, COPIES_DIR } = await import('../server/runspace.ts')
+  const here = relative(realpathSync(shared.envelope), realpathSync(process.cwd())).split(sep).join('/')
+  const m = here.startsWith(`${COPIES_DIR}/`) ? /^([^/]+)\/([^/]+)\/source(\/|$)/.exec(here.slice(COPIES_DIR.length + 1)) : null
+  const copy = m ? await readCopy(shared, { workflow: m[1], run: m[2] }) : null
+  const ws = copy?.manifest && !copy.problem ? copyWorkspace(shared, copy) : shared
+  ws.peers = shared.peers
+  const files = p.positional[0] ? [await workflowFile(ws, p.positional[0])] : await ws.workflowFiles()
+  const results = []
+  for (const f of files) {
+    const r = await ws.workflowResponse(f)
+    results.push({ file: f, id: r.workflow?.id, problem: r.problem, issues: r.issues })
+  }
+  const bad = results.filter(r => r.problem || r.issues.some(i => i.severity === 'error')).length
+  const human = results.length === 0 ? 'No workflows in devdocs/workflows.' : results.map(r =>
+    `${r.file}${r.id ? ` (id ${r.id})` : ''}: ${r.problem ? `cannot be read — ${r.problem.kind}: ${r.problem.message}${r.problem.line ? ` (line ${r.problem.line})` : ''}`
+      : r.issues.length ? `${r.issues.filter(i => i.severity === 'error').length} errors, ${r.issues.filter(i => i.severity === 'warning').length} warnings\n${r.issues.map(issueLine).join('\n')}` : 'valid'}`).join('\n')
+  out(human, { workspace: ws.reg.id, ok: bad === 0, workflows: results })
+  return bad ? 1 : 0
+}
+
+async function cmdApprove(p: Parsed): Promise<number> {
+  const [name, kind] = p.positional
+  if (!name || !kind) throw new UsageError('approve needs <workflow> and <intent|definition>')
+  if (!(APPROVAL_KINDS as readonly string[]).includes(kind)) throw new UsageError('the kind is intent or definition')
+  const approver = opt(p, 'approver')
+  if (!approver?.trim()) throw new UsageError('approve needs --approver <name>: the person who approves')
+  const ws = await workspace(p)
+  const file = await workflowFile(ws, name)
+  try {
+    const r = await ws.approve(file, kind as ApprovalKind, approver)
+    out(`Recorded ${kind} approval of ${file} by ${approver.trim()}: ${r.state.status} (${r.state.digest})`, { ok: true, file, kind, approver: approver.trim(), state: r.state })
+    return 0
+  } catch (e) {
+    if (e instanceof RequestError) throw new Refused(`approval refused: ${e.message}`, e.detail)
+    throw e
+  }
+}
+
+// Reading and writing a definition as the editor does (project_migration p8):
+// the file's text and revision, and a save checked against the revision the
+// writer read, so an agent's edit never replaces an edit it did not see.
+async function definitionCommand(p: Parsed, kind: 'workflow' | 'project', sub: 'show' | 'save', name?: string): Promise<number> {
+  const ws = await workspace(p)
+  const { parseProject, parseWorkflow } = await import('../server/yamlDoc.ts')
+  const { textHash } = await import('../server/files.ts')
+  let file = 'project.yaml', text: string | null
+  if (kind === 'workflow') {
+    if (!name) throw new UsageError(`workflow ${sub} needs <workflow>`)
+    file = await workflowFile(ws, name)
+    text = (await ws.readWorkflowFile(file)).text
+  } else text = (await ws.readProject()).text
+  if (sub === 'show') {
+    if (text === null) throw new Refused(`${file} does not exist in ${ws.reg.id}`)
+    const rev = textHash(text)
+    out(`# ${ws.reg.id} ${kind === 'workflow' ? `devdocs/workflows/${file}` : file} — revision ${rev}\n${text}`, { ok: true, workspace: ws.reg.id, file, rev, text })
+    return 0
+  }
+  const source = opt(p, 'file'), base = opt(p, 'base')
+  if (!source) throw new UsageError(`${kind} save needs --file <yaml|->: the whole new definition`)
+  if (!base) throw new UsageError(`${kind} save needs --base <rev>: the revision you read (wfe ${kind} show)`)
+  const next = readFileSync(source === '-' ? 0 : resolve(source), 'utf8')
+  try {
+    if (kind === 'workflow') {
+      const parsed = parseWorkflow(next)
+      if (!parsed.ok) throw new Refused(`the new definition does not parse: ${parsed.problem.message}`, parsed.problem)
+      // A save from a discussion turn is recorded there (argue p4 ex3):
+      // journaled with the bytes it replaces, recorded once it succeeded.
+      const ev = process.env.WFE_ATTEMPT ? await discussionTurn(await openExec(p), areaDir(p)) : null
+      const journal = ev ? await quietly(() => ev.wfs.beginDefinitionWrite(ev.turn, ws, file, { operation: 'workflow.save', model: parsed.model })) : null
+      let saved: Awaited<ReturnType<typeof ws.saveWorkflow>>
+      try { saved = await ws.saveWorkflow(file, parsed.model, base) } catch (e) { ev?.wfs.abort(journal); ev?.close(); throw e }
+      const recorded = ev ? await quietly(() => ev.wfs.finishDefinitionWrite(journal, ws, file)) : null
+      ev?.close()
+      if (recorded) process.stderr.write(`Recorded in discussion ${ev!.turn.conv}: workflow record ${recorded.id} (${recorded.relation}).\n`)
+      const issues = validateWorkflowIssues(await ws.workflowResponse(file))
+      out([`${saved.rev === base ? 'Unchanged' : 'Saved'}: devdocs/workflows/${file} (revision ${saved.rev}); not committed.`, ...issues.map(issueLine)].join('\n'), { ok: true, workspace: ws.reg.id, file, rev: saved.rev, changed: saved.rev !== base, issues })
+    } else {
+      const parsed = parseProject(next)
+      if (!parsed.ok) throw new Refused(`the new project.yaml does not parse: ${parsed.problem.message}`, parsed.problem)
+      const saved = await ws.saveProject(parsed.model, base)
+      out(`${saved.rev === base ? 'Unchanged' : 'Saved'}: project.yaml (revision ${saved.rev}); not committed.`, { ok: true, workspace: ws.reg.id, file, rev: saved.rev, changed: saved.rev !== base })
+    }
+    return 0
+  } catch (e) {
+    if (e instanceof RequestError) throw new Refused(e.message, e.detail)
+    throw e
+  }
+}
+const validateWorkflowIssues = (r: { issues?: Issue[] }): Issue[] => r.issues ?? []
+
+async function cmdArrange(p: Parsed): Promise<number> {
+  const [name] = p.positional
+  if (!name) throw new UsageError('arrange needs <workflow>')
+  const ws = await workspace(p)
+  const file = await workflowFile(ws, name)
+  const read = await ws.readWorkflowFile(file)
+  if (!read.workflow || read.text === null) throw new Refused(`${file} cannot be arranged: ${read.problem?.message ?? 'unreadable'}`)
+  const next = structuredClone(read.workflow)
+  autoArrange(next)
+  try {
+    const saved = await ws.saveWorkflow(file, next)
+    const changed = saved.text !== read.text
+    out(`${changed ? 'Arranged' : 'Already arranged'}: ${file} (${Object.keys(next.layout.nodes).length} positions)`, { ok: true, file, changed, layout: next.layout })
+    return 0
+  } catch (e) {
+    if (e instanceof RequestError) throw new Refused(e.message, e.detail)
+    throw e
+  }
+}
+
+async function cmdAddRepo(p: Parsed): Promise<number> {
+  const [path, location] = p.positional
+  const fresh = p.flags.has('new')
+  if (!path || (!location && !fresh) || (location && fresh)) throw new UsageError('add-repo needs <path> and either <location> or --new')
+  const ws = await workspace(p)
+  try {
+    if (location) assertNotRetired(retiredByUrl(await loadBoundary(registryFile(p), areaDir(p)), location), `Adding ${location} as a submodule`)
+    const r = fresh ? await addNewRepository(ws, path, join(areaDir(p), 'sources')) : await ws.addSubmodule(path, location)
+    const lines = [r.message, ...(r.stderr ? [r.stderr] : [])]
+    if (r.partial) lines.push(`Left behind — .gitmodules entry: ${r.partial.gitmodulesEntry}; path exists: ${r.partial.pathExists}; staged: ${r.partial.staged}; module git dir: ${r.partial.gitDirExists}`)
+    out(lines.join('\n'), r)
+    return r.ok ? 0 : 1
+  } catch (e) {
+    if (e instanceof RequestError) throw new Refused(e.message)
+    throw e
+  }
+}
+
+async function cmdWorkflow(p: Parsed): Promise<number> {
+  const [sub, id] = p.positional
+  if (sub === 'basics') {
+    // The basic workflows (p8/ex2, server/basics.ts): added where they are
+    // missing, never over a file or an id that is there.
+    const { placeBasics, placeBasicsEverywhere } = await import('../server/basics.ts')
+    const o: { dryRun: boolean; commit: boolean; push: boolean; gitEnv?: Record<string, string> } = { dryRun: p.flags.has('dry-run'), commit: p.flags.has('commit'), push: p.flags.has('push') }
+    if (o.push && !o.commit) throw new UsageError('--push goes with --commit')
+    // Pushed with the host's Gitea credentials, as run publication is.
+    if (o.push) { const g = await giteaOf(p); if (g) o.gitEnv = await g.gitEnv() }
+    let results
+    if (p.flags.has('all')) {
+      const reg = await loadRegistry(registryFile(p))
+      const boundary = await loadBoundary(registryFile(p), areaDir(p))
+      const list: Workspace[] = []
+      const skipped: Awaited<ReturnType<typeof placeBasics>> = []
+      for (const w of reg.workspaces) {
+        const why = await assertWorkspaceAllowed(boundary, w, 'Adding basic workflows to').then(() => observe(w)).then(x => (x.available ? null : `not available: ${x.reason}`), (e: Error) => e.message)
+        if (why) skipped.push({ workspace: w.id, project: w.project ?? w.id, workflow: 'freework', status: 'unplaceable', reason: why })
+        else list.push(new Workspace(w))
+      }
+      results = [...await placeBasicsEverywhere(list, o), ...skipped]
+    } else results = await placeBasics(await workspace(p), o)
+    const lines = results.map(r => `${r.workspace.padEnd(14)} ${r.workflow.padEnd(10)} ${r.status.padEnd(11)} ${r.file ?? ''}${r.file ? ' — ' : ''}${r.reason}${r.commit ? `; committed ${r.commit}${r.pushed ? ', pushed' : ''}` : ''}${r.publishError ? `; NOT PUBLISHED: ${r.publishError}` : ''}${(r.notes ?? []).map(n => `\n${' '.repeat(16)}${n}`).join('')}`)
+    out([o.dryRun ? 'Dry run: nothing written.' : '', ...lines].filter(Boolean).join('\n'), results)
+    return results.some(r => r.status === 'conflict' || r.publishError) ? 1 : 0
+  }
+  if (sub === 'show' || sub === 'save') return definitionCommand(p, 'workflow', sub, id)
+  if (sub === 'templates') {
+    const { WORKFLOW_TEMPLATES } = await import('../server/templates.ts')
+    out(WORKFLOW_TEMPLATES.map(t => `${t.id.padEnd(12)} ${t.name} — ${t.description}`).join('\n'), WORKFLOW_TEMPLATES)
+    return 0
+  }
+  if (sub !== 'new' || !id) throw new UsageError('usage: wfe workflow new <id> [--name <name>] [--policy default|manual|custom [--steps plan,reports,final]] [--template <id>] | wfe workflow templates | wfe workflow basics [--dry-run] [--commit [--push]] [--workspace <id> | --all]')
+  const ws = await workspace(p)
+  const policy = opt(p, 'policy'), stepsOpt = opt(p, 'steps')
+  if (stepsOpt !== undefined && policy !== 'custom') throw new UsageError('--steps goes with --policy custom')
+  let documentation: string | Documentation | undefined = policy
+  if (policy === 'custom') {
+    if (stepsOpt === undefined) throw new UsageError('--policy custom needs --steps (any of plan, reports, final, comma-separated; or none)')
+    const chosen = stepsOpt === 'none' ? [] : stepsOpt.split(',').map(x => x.trim()).filter(Boolean)
+    const bad = chosen.filter(x => !(DOC_STEPS as readonly string[]).includes(x))
+    if (bad.length) throw new UsageError(`--steps takes plan, reports, final (not ${bad.join(', ')})`)
+    documentation = { policy: 'custom', plan: chosen.includes('plan'), reports: chosen.includes('reports'), final: chosen.includes('final') }
+  }
+  try {
+    const ev = process.env.WFE_ATTEMPT ? await discussionTurn(await openExec(p), areaDir(p)) : null
+    const journal = ev ? await quietly(() => ev.wfs.beginDefinitionWrite(ev.turn, ws, `${id}.yaml`, { operation: 'workflow.new' })) : null
+    let r: Awaited<ReturnType<typeof ws.createWorkflow>>
+    try { r = await ws.createWorkflow(id, opt(p, 'name') ?? '', documentation, opt(p, 'template') ?? 'empty') } catch (e) { ev?.wfs.abort(journal); ev?.close(); throw e }
+    const recorded = ev ? await quietly(() => ev.wfs.finishDefinitionWrite(journal, ws, r.file)) : null
+    ev?.close()
+    if (recorded) process.stderr.write(`Recorded in discussion ${ev!.turn.conv}: workflow record ${recorded.id} (created, a draft).\n`)
+    const path = join(ws.root, 'devdocs', 'workflows', r.file)
+    out(`Created ${path}. Fill in intent, repositories, nodes and edges (docs/contract.md).`, { ok: true, file: r.file, path })
+    return 0
+  } catch (e) {
+    if (e instanceof RequestError) throw new Refused(e.message)
+    throw e
+  }
+}
+
+async function cmdSetup(p: Parsed): Promise<number> {
+  const [dir] = p.positional
+  if (!dir) throw new UsageError('setup needs the area directory')
+  const installed = opt(p, 'installed-url')
+  const r = await setupArea(resolve(dir), { port: port(p), ...(installed ? { installed: { url: installed } } : {}) })
+  out(r.summary, r)
+  return r.files.some(f => f.status === 'error') ? 1 : 0
+}
+
+async function cmdServe(p: Parsed): Promise<number> {
+  const build = spawn(process.execPath, [join(PACKAGE, 'node_modules', 'vite', 'bin', 'vite.js'), 'build', '--logLevel', 'warn'], { cwd: PACKAGE, stdio: 'inherit' })
+  const built = await new Promise<number>(r => build.on('exit', c => r(c ?? 1)))
+  if (built !== 0) { console.error('wfe serve: building the UI failed; run npm ci in the editor package first'); return 1 }
+  const child = spawn(process.execPath, [join(PACKAGE, 'server', 'main.ts'), '--serve-dist', '--port', String(port(p)), '--registry', registryFile(p), '--area', areaDir(p)], { stdio: 'inherit' })
+  for (const s of ['SIGINT', 'SIGTERM'] as const) process.on(s, () => child.kill(s))
+  return new Promise<number>(r => child.on('exit', c => r(c ?? 0)))
+}
+
+async function cmdRun(p: Parsed): Promise<number> {
+  await openExec(p)
+  return runCommand({
+    positional: p.positional,
+    opt: k => opt(p, k),
+    opts: k => p.opts.get(k) ?? [],
+    flag: k => p.flags.has(k),
+    workspace: () => workspace(p),
+    out,
+    usage: m => new UsageError(m),
+    refused: (m, detail) => new Refused(m, detail),
+    serviceUrl: async () => { const s = await serviceState(p); return s.running && s.sameRegistry ? s.url : null },
+    exec: () => execStore!,
+    area: () => areaDir(p),
+  }).finally(() => { execStore?.close(); execStore = undefined })
+}
+
+// Delegation (p10): a run's agent entrusting a delegate node's work.
+async function cmdDelegate(p: Parsed): Promise<number> {
+  const { delegateCommand } = await import('./delegate.ts')
+  await openExec(p)
+  return delegateCommand({
+    positional: p.positional, opt: k => opt(p, k), opts: k => p.opts.get(k) ?? [], flag: k => p.flags.has(k),
+    workspace: () => workspace(p), out, usage: m => new UsageError(m), refused: (m, detail) => new Refused(m, detail),
+    serviceUrl: async () => { const s = await serviceState(p); return s.running && s.sameRegistry ? s.url : null },
+    exec: () => execStore!, area: () => areaDir(p),
+  }).finally(() => { execStore?.close(); execStore = undefined })
+}
+
+// `wfe review …` (p17, docs/reviews.md): a person's review of completed work.
+async function cmdReview(p: Parsed): Promise<number> {
+  const { reviewCommand } = await import('./review.ts')
+  if (p.positional[0] !== 'help' && p.positional.length && !p.flags.has('help')) await openExec(p)
+  return reviewCommand({
+    positional: p.positional, opt: k => opt(p, k), opts: k => p.opts.get(k) ?? [], flag: k => p.flags.has(k),
+    workspace: () => workspace(p), out, usage: m => new UsageError(m), refused: (m, detail) => new Refused(m, detail),
+    serviceUrl: async () => { const s = await serviceState(p); return s.running && s.sameRegistry ? s.url : null },
+    exec: () => execStore!, area: () => areaDir(p),
+  }).finally(() => { execStore?.close(); execStore = undefined })
+}
+
+let execStore: ExecStore | undefined
+async function openExec(p: Parsed): Promise<ExecStore> {
+  execStore ??= new ExecStore({ registryFile: registryFile(p), area: areaDir(p), gitea: await giteaOf(p) })
+  return execStore
+}
+
+// Presentations of a run's result (p7): frozen bundles in the run folder,
+// served on this host by instances that outlive the attempt.
+async function cmdShare(p: Parsed): Promise<number> {
+  const [sub, arg] = p.positional
+  const m = await import('../server/shares.ts')
+  const { formatRef, humanBytes, parseRef } = await import('../shared/shares.ts')
+  m.setShareArea(areaDir(p))
+  switch (sub) {
+    case 'list': {
+      const cfg = m.loadShareConfig()
+      const rows = await Promise.all(Object.entries(cfg.shares).map(async ([id, s]) => ({ share: id, root: s.root, ...(await m.shareRoot(id, cfg)), download: m.downloadBase(id, cfg) })))
+      out(rows.length ? rows.map(r => `${r.share.padEnd(16)} ${r.state.padEnd(12)} ${r.root}${r.detail ? `  (${r.detail})` : ''}${r.download ? `\n${' '.repeat(17)}download: ${r.download}` : ''}`).join('\n') : `No shares configured on this host (${join(areaDir(p), m.SHARES_FILE)}).`, { ok: true, file: cfg.file, shares: rows })
+      return 0
+    }
+    case 'resolve':
+    case 'ls': {
+      if (!arg) throw new UsageError(`${sub} <reference, path or description of a shared item>`)
+      const l = await m.locate(p.positional.slice(1).join(' '))
+      const one = l.state === 'ok' ? l.matches[0] : null
+      if (sub === 'resolve') {
+        const url = one ? m.downloadUrl(parseRef(one.ref)!) : null
+        const lines = one
+          ? [`${one.ref}: ok (${one.folder ? 'folder' : 'file'}${one.as === 'reference' ? '' : `; "${l.text}" read as ${one.as}`})`, `  here: ${one.abs}`, ...(url ? [`  download: ${url}`] : [])]
+          : [`"${l.text}": ${l.state} — ${l.detail}`,
+            ...l.matches.map(x => `  ${x.ref}  (${x.folder ? 'folder' : 'file'}; read as ${x.as})`),
+            ...(l.state !== 'ambiguous' ? l.tried.map(x => `  tried ${formatRef(x.share, x.path)} (${x.as}): ${x.state}`) : []),
+            ...(l.nearest ? [`  nearest existing folder: ${l.nearest} (wfe share ls; wfe share find <name> searches by name)`] : [])]
+        out(lines.join('\n'), { ok: !!one, ...l, ref: one?.ref ?? null, abs: one?.abs ?? null, url })
+        return one ? 0 : 1
+      }
+      if (!one) throw new Refused(`"${l.text}": ${l.state} — ${l.detail}`)
+      const max = Number(opt(p, 'max') ?? 500)
+      const files = await m.listFiles(one.abs, { max: 100000 })
+      out([...files.slice(0, max).map(f => `${String(f.bytes).padStart(12)}  ${f.path}`), `${one.ref}: ${files.length} files, ${humanBytes(files.reduce((n, f) => n + f.bytes, 0))}${files.length > max ? ` (first ${max} shown)` : ''}`].join('\n'), { ok: true, ref: one.ref, files })
+      return 0
+    }
+    case 'find': {
+      if (!arg) throw new UsageError('find <name> [--share <s>] [--under <ref or path>] [--max-entries <n>] [--depth <n>] [--limit <n>]')
+      const num = (k: string) => { const v = opt(p, k); if (v === undefined) return undefined; const n = Number(v); if (!Number.isInteger(n) || n < 1) throw new UsageError(`--${k} takes a positive whole number`); return n }
+      let shares = p.opts.get('share')
+      let under: string | undefined
+      const u = opt(p, 'under')
+      if (u) {
+        const l = await m.locate(u)
+        if (l.state !== 'ok' || !l.matches[0].folder) throw new Refused(`--under "${u}": ${l.state === 'ok' ? 'not a folder' : `${l.state} — ${l.detail}`}`)
+        shares = [l.matches[0].share]; under = l.matches[0].path
+      }
+      const f = await m.findInShares(p.positional.slice(1).join(' '), { shares, under, maxEntries: num('max-entries'), maxDepth: num('depth'), limit: num('limit') })
+      const lines = [
+        ...f.matches.map(x => `${x.ref}  (${x.folder ? 'folder' : 'file'})`),
+        ...f.searched.map(x => `searched ${x.under}: ${x.state === 'ok' ? `${x.entries} entries${x.detail ? `, ${x.detail}` : ', complete'}` : `${x.state} — ${x.detail}`}`),
+        f.matches.length ? `${f.matches.length} match${f.matches.length === 1 ? '' : 'es'}${f.complete ? '' : ' (search incomplete: there may be more)'}`
+          : f.complete ? `"${f.name}" is not in ${f.searched.map(x => x.under).join(', ')} (every entry was read)` : `"${f.name}" was not found in the part searched; the search was incomplete, so this is not absence`,
+      ]
+      out(lines.join('\n'), { ok: f.matches.length > 0, ...f })
+      return f.matches.length ? 0 : 1
+    }
+    case 'verify': {
+      if (!arg) throw new UsageError('verify <manifest.json>')
+      const { readFileSync } = await import('node:fs')
+      const r = await m.verifyManifest(readFileSync(resolve(arg), 'utf8'), { quick: p.flags.has('quick') })
+      out(`${r.ref} (${r.digest.slice(0, 19)}…): ${r.status} — ${r.detail}`, { ok: r.status === 'verified', ...r })
+      return r.status === 'verified' ? 0 : 1
+    }
+    default: throw new UsageError('share list | resolve <ref or path> | ls <ref or path> | find <name> | verify <manifest.json>')
+  }
+}
+
+async function cmdPresent(p: Parsed): Promise<number> {
+  const [sub, runArg, third] = p.positional
+  const { Presenter } = await import('../server/present.ts')
+  const { registerPresentation, resolveRef } = await import('../server/runs.ts')
+  const pr = new Presenter({ registryFile: registryFile(p), area: areaDir(p), by: opt(p, 'by') })
+  const need = (k: string) => { const v = opt(p, k); if (!v?.trim()) throw new UsageError(`--${k} is required`); return v }
+  try {
+    if (sub === 'reconcile') { const notes = await pr.reconcile(); out(notes.join('\n') || 'Every recorded instance is serving or stopped as recorded.', { ok: true, notes }); return 0 }
+    const ws = await workspace(p)
+    const ref = async () => { if (!runArg) throw new UsageError(`${sub} <run> …`); return resolveRef(ws, runArg) }
+    switch (sub) {
+      case 'register': {
+        const r = await ref()
+        if (!third) throw new UsageError('register <run> <node> --source <dir> --entry <file> --review <file.md> --title <text>')
+        const attempt = opt(p, 'attempt') ?? process.env.WFE_ATTEMPT ?? undefined
+        const { runSpace } = await import('../server/runspace.ts')
+        const root = (await runSpace(ws, r)).root // the run's own copy (p9)
+        const rel = (x: string) => { const a = resolve(x); const r2 = relative(root, a); return !r2.startsWith('..') && !isAbsolute(r2) && (isAbsolute(x) || relative(root, process.cwd()) !== '') ? (r2.split(sep).join('/') || '.') : x }
+        const res = await registerPresentation(ws, r, { node: third, source: rel(need('source')), entry: need('entry'), review: rel(need('review')), title: need('title') }, { by: opt(p, 'by'), via: 'cli', attempt, receipt: opt(p, 'receipt'), advice: p.flags.has('yes') ? { yes: true } : {} })
+        const pz = res.presentation
+        out(`${res.duplicate ? 'Already registered (same receipt): ' : 'Registered '}presentation ${pz.id} of ${r.workflow}/${r.run}: ${pz.files.length} files frozen in ${pz.folder}/ (revision ${pz.revision.slice(7, 19)}…).\nNext: wfe present start ${r.workflow}/${r.run} ${pz.id}`, { ok: true, presentation: pz, duplicate: !!res.duplicate })
+        return 0
+      }
+      case 'start': {
+        const r = await ref()
+        if (!third) throw new UsageError('start <run> <presentation>')
+        const res = await pr.start(ws, r, third, { by: opt(p, 'by') })
+        out(res.state === 'starting' ? `Presentation ${third} is being started by another request (instance ${res.instance.id}); ask again in a few seconds.`
+          : `${res.reused ? 'Already served' : 'Serving'} presentation ${third}: ${res.url}${res.local ? ' (opens on this host only)' : ''}\nInstance ${res.instance.id}, pid ${res.instance.pid}; it keeps serving after this attempt ends. Stop: wfe present stop ${r.workflow}/${r.run} ${third}`, { ok: true, ...res })
+        return 0
+      }
+      case 'stop': {
+        const r = await ref()
+        const which = p.flags.has('all') ? 'all' : third
+        if (!which) throw new UsageError('stop <run> <presentation> | stop <run> --all')
+        const res = await pr.stop(ws, r, which, { by: opt(p, 'by') })
+        const bad = res.filter(x => !x.ok)
+        // Already stopped (p17 ex1: a human review's cleanup may have stopped
+        // it first): an idempotent success that says by whom.
+        const last = !res.length && which !== 'all' ? (await readRun(ws, r)).record?.presentations?.[which]?.last : undefined
+        out(res.length ? res.map(x => `${x.presentation}: ${x.ok ? 'stopped' : 'NOT VERIFIED'} — ${x.detail}`).join('\n') : last?.status === 'stopped' ? `${which} is already stopped (recorded by ${last.by} at ${last.at}: ${last.detail}); nothing to stop.` : 'Nothing of this run is served or open.', { ok: !bad.length, results: res })
+        return bad.length ? 1 : 0
+      }
+      case 'keep': {
+        const r = await ref()
+        if (!third) throw new UsageError('keep <run> <presentation> --note <text> --owner <who>')
+        const b = opt(p, 'because')
+        const m = b ? /^answer:([a-z0-9]+)(?::(\d+))?$/.exec(b) : null
+        if (b && !m) throw new UsageError('--because is answer:<question>[:<answer index>]')
+        const { runOp } = await import('../server/runs.ts')
+        const res = await runOp(ws, r, { op: 'presentation.retain', presentation: third, note: need('note'), owner: need('owner'), ...(m ? { because: { kind: 'answer', question: m[1], ...(m[2] ? { answer: Number(m[2]) } : {}) } } : {}) } as never, { by: opt(p, 'by'), via: 'cli' })
+        out(`${res.duplicate ? 'Already recorded' : 'Recorded'}: ${third} stays available on request; ${need('owner')} stops it later (wfe present stop ${r.workflow}/${r.run} ${third}).`, { ok: true, presentation: res.record.presentations?.[third] })
+        return 0
+      }
+      case 'status': {
+        const refs = runArg ? [await ref()] : (await import('../server/runs.ts').then(m => m.listRuns(ws))).map(x => ({ workflow: x.workflow, run: x.run }))
+        const views = []
+        for (const r of refs) {
+          const rec = (await import('../server/runs.ts').then(m => m.readRun(ws, r))).record
+          if (!rec?.presentations) continue
+          views.push({ ref: `${r.workflow}/${r.run}`, presentations: await pr.view(ws, rec) })
+        }
+        out(views.length ? views.flatMap(v => [v.ref, ...v.presentations.map(x => `  ${x.id} ${x.state.padEnd(11)} ${x.title} — ${x.live ? `LIVE ${x.url}${x.local ? ' (this host)' : ''}` : x.observed ? `not live: ${x.observed.detail}${['available', 'stop-failed'].includes(x.state) ? ' (recover: wfe present start or stop)' : ''}` : 'never served'}  revision ${x.revision.slice(7, 19)}…${x.reviews.length ? `\n      for human review ${x.reviews.map(u => `${u.review} (${u.mode} ${u.instance})`).join(', ')}` : ''}`)]).join('\n') : 'No presentations.', { ok: true, runs: views })
+        return 0
+      }
+    }
+  } catch (e) {
+    if (e instanceof RequestError) throw new Refused(e.message, e.detail)
+    throw e
+  } finally { pr.close() }
+  throw new UsageError('wfe present register|start|stop|keep|status|reconcile')
+}
+
+// The executor's interface to this host's execution management. Every
+// subcommand prints JSON; the rules are in server/exec.ts and shared/run.ts.
+async function cmdExec(p: Parsed): Promise<number> {
+  const [sub, arg] = p.positional
+  const x = await openExec(p)
+  json = true
+  const num = (k: string) => { const v = opt(p, k); if (v === undefined || !/^-?\d+$/.test(v)) throw new UsageError(`--${k} <integer> is required`); return Number(v) }
+  // The worker this executor is (project_migration p7); the local one when not given.
+  const worker = () => opt(p, 'worker') ?? x.localWorker
+  try {
+    switch (sub) {
+      case 'claim': {
+        const profiles = opt(p, 'profiles-json')
+        const sessions = opt(p, 'sessions-json')
+        const contract = opt(p, 'contract')
+        const m = contract ? /^([^=]+)=([0-9a-f]{64})$/.exec(contract) : null
+        if (contract && !m) throw new UsageError('--contract <name>=<sha256 of the contract text>')
+        out('', await x.claim(opt(p, 'backend') ?? null, { ...(profiles ? { profiles: JSON.parse(profiles) as Record<string, string> } : {}), ...(sessions ? { sessions: JSON.parse(sessions) as Record<string, 'explicit'> } : {}), ...(m ? { contract: { name: m[1], sha256: m[2] } } : {}) }, { worker: worker(), receipt: opt(p, 'receipt'), lane: opt(p, 'lane') })); return 0
+      }
+      case 'started': if (!arg) throw new UsageError('started <attempt> --pid <pid>'); x.started(arg, num('pid'), worker()); out('', { ok: true }); return 0
+      case 'finished': {
+        if (!arg) throw new UsageError('finished <attempt> --exit-code <n> [--signal <name>]')
+        const code = opt(p, 'exit-code') !== undefined ? num('exit-code') : null
+        const r = await x.finished(arg, { code, signal: opt(p, 'signal') ?? null, lost: p.flags.has('lost'), interrupted: opt(p, 'interrupted'), attached: opt(p, 'attached') }, worker())
+        out('', { ok: true, ...r }); return 0
+      }
+      case 'session': {
+        if (!arg || (!opt(p, 'attached') && !p.flags.has('missing'))) throw new UsageError('session <attempt> --attached <id> | --missing [--detail <text>]')
+        out('', { ok: true, ...await x.session(arg, opt(p, 'attached') ? { attached: opt(p, 'attached') } : { missing: opt(p, 'detail') ?? '' }, worker()) }); return 0
+      }
+      case 'context': {
+        if (!arg || (!p.flags.has('delivered') && !p.flags.has('undelivered'))) throw new UsageError('context <attempt> --delivered | --undelivered [--detail <text>]')
+        out('', { ok: true, ...await x.contextDelivery(arg, { delivered: p.flags.has('delivered'), detail: opt(p, 'detail') }, worker()) }); return 0
+      }
+      case 'stops': out('', x.stopsDue(worker()).map(a => ({ id: a.id, pid: a.pid, run: `${a.workflow}/${a.run}`, workspace: a.workspace, requested: a.stop_requested }))); return 0
+      case 'heartbeat': {
+        // --facts-json (improve_wfrun p4): the host's measured load, kept with the heartbeat.
+        const facts = opt(p, 'facts-json')
+        x.heartbeat(worker(), num('pid'), opt(p, 'detail') ?? '', facts ? { facts: JSON.parse(facts) as import('../server/exec.ts').WorkerFacts } : undefined); out('', { ok: true }); return 0
+      }
+      case 'reconcile': {
+        if (x.isRemote(worker())) throw new UsageError(`reconcile runs on the coordinator for its local worker; ${worker()} reconciles its own attempts through its wfe`)
+        const notes = await x.reconcile(p.opts.get('holding') ?? [])
+        // Conversations (challenge p2): requests to start (failed ones up to
+        // their tries), runs that ended without an answer, conductors to tell,
+        // questions to post; then workflow records and the archive of every
+        // conversation whose records go beyond what is published.
+        const { ConversationStore } = await import('../server/conversations.ts')
+        const cs = new ConversationStore({ area: areaDir(p), exec: x })
+        try {
+          const { ConversationService } = await import('../server/conversationService.ts')
+          const ds = new ConversationService(cs)
+          if (!('disabled' in ds.config())) {
+            notes.push(...await ds.reconcile())
+            // Workflow records (argue p4 ex3): interrupted operations resolved,
+            // revisions and delegated children of open conversations' runs.
+            const { ConversationWorkflows } = await import('../server/conversationWorkflows.ts')
+            notes.push(...(await new ConversationWorkflows(ds).repair().catch(e => [`conversation workflows: repair failed — ${(e as Error).message}`])))
+            const { ConversationArchive } = await import('../server/conversationArchive.ts')
+            const a = await new ConversationArchive(ds).publish().catch(e => ({ published: [], unchanged: [], failed: [{ conv: '*', error: (e as Error).message }] }))
+            notes.push(...a.published.map(x => `conversation ${x.conv}: archived ${x.records} records (${x.commit.slice(0, 12)})`), ...a.failed.map(f => `conversation ${f.conv}: archive failed — ${f.error}`))
+            // Message files (p19): accepted bundles copied outside the live share.
+            const { loadFilesConfig } = await import('../server/messageFiles.ts')
+            const fc = loadFilesConfig(areaDir(p))
+            if (!('disabled' in fc) && fc.backup) {
+              const { FileBackups } = await import('../server/fileBackups.ts')
+              notes.push(...await new FileBackups(ds, fc).run().catch(e => [`message files: backup failed — ${(e as Error).message}`]))
+            }
+          }
+        } finally { cs.close() }
+        // Teamwork (cluster_teamwork p3): work with other installations,
+        // archived beside the conversations; a failure is a note, nothing waits on it.
+        try {
+          const t = await openTeamwork(p, x)
+          if (t) try {
+            const a = await t.ta.publish().catch(e => ({ published: [], unchanged: [], failed: [{ request: '*', error: (e as Error).message }] }))
+            notes.push(...a.published.map(m => `teamwork ${m.request}: archived ${m.records} records (${m.commit.slice(0, 12)})`), ...a.failed.map(f => `teamwork ${f.request}: archive failed — ${f.error}`))
+          } finally { t.close() }
+        } catch (e) { notes.push(`teamwork archive: ${(e as Error).message}`) }
+        // Challenges (challenge p1): writes not yet seen in the repository are
+        // published (each looked up in the remote history first), mirrors caught up.
+        const { ChallengeStore } = await import('../server/challenges.ts')
+        const g = await giteaOf(p)
+        const ch = new ChallengeStore({ area: areaDir(p), env: async () => g ? g.gitEnv() : {} })
+        try {
+          if (!('disabled' in ch.config())) {
+            const r = await ch.publish().catch(e => ({ published: [], failed: [{ id: 0, error: (e as Error).message }], conflicts: [], refused: [] }))
+            notes.push(...r.published.map(n => `challenge operation ${n}: published`), ...r.failed.map(f => `challenge operation ${f.id || '*'}: unsynced — ${f.error}`), ...r.conflicts.map(n => `challenge operation ${n}: conflict (draft kept)`))
+            notes.push(...await ch.mirror().catch(e => [`challenge mirrors: ${(e as Error).message}`]))
+          }
+        } finally { ch.close() }
+        out('', { ok: true, notes }); return 0
+      }
+      // Execution nodes (p7): every worker's state, what it holds and what waits for it.
+      case 'workers': out('', { workers: x.workersState() }); return 0
+      // A restarted executor takes back the processes it left running (p7).
+      case 'adopt': {
+        const live = (pid: number | null) => { if (!pid) return false; try { process.kill(pid, 0); return true } catch (e) { return (e as NodeJS.ErrnoException).code === 'EPERM' } }
+        out('', x.workerDue(worker()).attempts.filter(a => a.state === 'running' && live(a.pid)).map(a => ({ id: a.id, pid: a.pid, log: a.log, lane: a.lane ?? 'default' }))); return 0
+      }
+      case 'publish': { if (!arg) throw new UsageError('publish <checkpoint id>'); out('', await x.publishCheckpoint(Number(arg))); return 0 }
+      case 'status': {
+        // The executor's state needs no workspace (summoner p2: an installation before any project).
+        if (!arg) { out('', { executor: x.executorState(), workers: x.workersState() }); return 0 }
+        const ws = await workspace(p)
+        const ref = await import('../server/runs.ts').then(m => m.resolveRef(ws, arg))
+        out('', await x.runView(ws.reg.id, ref)); return 0
+      }
+    }
+  } catch (e) {
+    if (e instanceof RequestError) throw new Refused(e.message, e.detail)
+    throw e
+  } finally { x.close(); execStore = undefined }
+  throw new UsageError('wfe exec claim|started|session|context|finished|stops|heartbeat|reconcile|publish|status|workers|adopt')
+}
+
+// The teamwork archive (cluster_teamwork p3, docs/teamwork-archive.md):
+// published history of work with other installations.
+async function openTeamwork(p: Parsed, x: import('../server/exec.ts').ExecStore) {
+  const { PeerStore, loadPeerConfig } = await import('../server/peerlink.ts')
+  const c = loadPeerConfig(areaDir(p))
+  if (!('config' in c)) return null
+  const { TeamworkArchive } = await import('../server/teamworkArchive.ts')
+  const s = new PeerStore({ area: areaDir(p), registryFile: registryFile(p), exec: x })
+  return { ta: new TeamworkArchive({ area: areaDir(p), exec: x, peers: s, self: c.config.self }), close: () => s.close() }
+}
+async function cmdTeamwork(p: Parsed): Promise<number> {
+  const [sub, arg] = p.positional
+  // Packages (Step 4): built from published archives and this host's share; no link store.
+  if (sub === 'package' || sub === 'restore') {
+    const pk = await import('../server/teamworkPackage.ts')
+    if (!arg) throw new UsageError(`wfe teamwork ${sub} <request> …`)
+    if (sub === 'package') {
+      const outDir = opt(p, 'out'); if (!outDir) throw new UsageError('--out <new folder> is required')
+      const sources = (p.opts.get('archive') ?? []).map(a => { const m = /^(.+)=([a-z0-9-]+)$/.exec(a); if (!m) throw new UsageError(`--archive <repository>=<instance>, not ${a}`); return { repository: m[1], instance: m[2], request: arg } })
+      const pkg = await pk.buildPackage(sources, resolve(outDir), opt(p, 'by') ?? 'wfe teamwork package')
+      const lines = [`package of ${arg} in ${resolve(outDir)}: ${pkg.outputs.length} output(s), ${pkg.outputs.reduce((n, o) => n + o.files.length, 0)} file(s), ${pk.packageSize(resolve(outDir))} bytes; records from ${pkg.sources.map(s => `${s.instance}@${s.commit.slice(0, 12)}`).join(', ')}`]
+      let backup: unknown = null
+      if (p.flags.has('push')) { const b = await pk.backupPackage(areaDir(p), resolve(outDir)); backup = b; lines.push(`backed up to ${b.destination}: ${b.files} files hash-verified there`) }
+      out(lines.join('\n'), { package: pkg, backup }); return 0
+    }
+    const into = opt(p, 'into'); if (!into) throw new UsageError('--into <new folder> is required')
+    const r = await pk.restorePackage(areaDir(p), arg, resolve(into))
+    out(`restored ${arg} into ${resolve(into)}: ${r.files} files verified against SHA256SUMS and every output against its manifest; records from ${r.package.sources.map(s => `${s.instance}@${s.commit.slice(0, 12)}`).join(', ')}`, r); return 0
+  }
+  const x = await openExec(p)
+  const t = await openTeamwork(p, x)
+  if (!t) throw new Refused('no usable peers.json here: this installation has no teamwork to archive (docs/peers.md)')
+  try {
+    switch (sub ?? 'status') {
+      case 'status': {
+        const o = await t.ta.origin()
+        const rows = (await t.ta.status()).filter(r => !arg || r.request === arg)
+        out([`Teamwork archive of ${t.ta.self}: ${'disabled' in o ? `disabled — ${o.disabled}` : `${o.web ?? o.url}, ${`instances/${t.ta.self}/teamwork/`}`}`,
+          ...rows.map(r => `  ${r.request} ${r.role.padEnd(9)} ${r.peer.padEnd(20)} ${r.state.padEnd(10)} ${r.published?.commit ? `${r.published.commit.slice(0, 12)} ${r.published.records} records` : '—'}${r.live ? ` (live ${r.live.records}: ${Object.entries(r.live.runs).map(([u, q]) => `${u.split('#')[0]}@${q}`).join(', ')}; journal ${r.live.journal})` : ''}${r.error ? ` — ${r.error}` : ''}${r.url ? `\n      ${r.url}` : ''}`)].join('\n'), rows)
+        return rows.some(r => r.state === 'failed') ? 1 : 0
+      }
+      case 'archive': {
+        const r = await t.ta.publish(arg ? [arg] : p.flags.has('all') ? t.ta.requests().map(q => q.request) : undefined, { interruptAfterPush: p.flags.has('interrupt-after-push') })
+        out([...r.published.map(m => `archived ${m.request}: ${m.records} new records (${m.commit.slice(0, 12)})`), ...r.unchanged.map(u => `${u}: nothing new (the published transcript already holds every record)`), ...r.failed.map(f => `${f.request}: FAILED — ${f.error}`), ...(!r.published.length && !r.unchanged.length && !r.failed.length ? ['nothing due'] : [])].join('\n'), r)
+        return r.failed.length ? 1 : 0
+      }
+      case 'collect': {
+        if (!arg) throw new UsageError('wfe teamwork collect <request>: the records an export would publish (nothing is written)')
+        const q = t.ta.requests().find(r => r.request === arg)
+        if (!q) throw new Refused(`${arg} is neither sent nor received here`)
+        const c = await t.ta.collect(q)
+        json = true; out('', { request: q, horizon: c.horizon, records: c.records }); return 0
+      }
+    }
+  } finally { t.close(); x.close(); execStore = undefined }
+  throw new UsageError('wfe teamwork status [<request>] | archive [<request>|--all] [--interrupt-after-push] | collect <request> | package <request> --archive <repo>=<instance> --out <dir> [--push] | restore <request> --into <dir>')
+}
+
+// The agdev link (improve_multinodes p1, docs/peers.md): HTTP delivery to
+// other installations, its configuration and what people read.
+async function cmdPeer(p: Parsed): Promise<number> {
+  const [sub, arg] = p.positional
+  const { PeerStore, loadPeerConfig } = await import('../server/peerlink.ts')
+  const x = await openExec(p)
+  const s = new PeerStore({ area: areaDir(p), registryFile: registryFile(p), exec: x })
+  try {
+    switch (sub) {
+      case 'process': { const notes = await s.process({ quietWhenBusy: true }); out(notes.join('\n') || 'Nothing to settle.', { ok: true, notes }); return 0 }
+      case 'hello': { const notes = s.hello(); out(notes.join('\n') || 'No peers configured.', { ok: true, notes }); return 0 }
+      // p3 (docs/management.md): the relationship, edited locally and checked.
+      case 'set': {
+        if (!arg) throw new UsageError('set <instance> [--label L] [--parentage parent|child|none] [--accept a,b] [--request a,b] [--grant observe,update] [--manage observe,update] [--replace-parent <instance>] [--endpoint <WFE API URL>] [--credential <file>|default] [--manage-credential <file>|default]')
+        const { setPeer } = await import('../server/peersetup.ts')
+        const list = (k: string) => { const v = opt(p, k); return v === undefined ? undefined : v.split(',').map(x => x.trim()).filter(Boolean) }
+        const endpoint = opt(p, 'endpoint'), credential = opt(p, 'credential'), mcred = opt(p, 'manage-credential')
+        const r = setPeer(areaDir(p), { instance: arg, label: opt(p, 'label'), parentage: opt(p, 'parentage') as never, accept: list('accept'), request: list('request'), grant: list('grant') as never, manage: list('manage') as never, replaceParent: opt(p, 'replace-parent'),
+          endpoint: endpoint === undefined ? undefined : endpoint.replace(/\/+$/, ''), credential: credential === undefined ? undefined : credential === 'default' ? null : credential,
+          manageCredential: mcred === undefined ? undefined : mcred === 'default' ? null : mcred })
+        if (r.changed) s.hello()
+        out([...(r.notes.length ? r.notes : ['nothing to change']), r.changed ? 'peers.json written; the relation is told to every peer on the next pass' : 'peers.json unchanged'].join('\n'), { ok: true, ...r })
+        return 0
+      }
+      case 'unlink': {
+        if (!arg) throw new UsageError('unlink <instance> [--remove [--force]]')
+        const { unlinkPeer } = await import('../server/peersetup.ts')
+        const r = unlinkPeer(areaDir(p), s, arg, { remove: p.flags.has('remove'), force: p.flags.has('force') })
+        if (r.changed) s.hello()
+        out([...r.notes, r.changed ? 'peers.json written' : 'peers.json unchanged'].join('\n'), { ok: true, ...r })
+        return 0
+      }
+      case 'check': {
+        const { check } = await import('../server/peersetup.ts')
+        const r = check(areaDir(p), s)
+        out([`Check: ${r.summary}`, ...(r.display ? [`Display: ${r.display}`] : []), ...r.peers.filter(x => !arg || x.instance === arg || x.label === arg).map(x => `  ${x.label} (${x.instance}): ${x.enrollment.state} — ${x.enrollment.detail}; heard ${x.heard ?? 'never'}${x.speaks.length ? `; speaks ${x.speaks.join(', ')}` : ''}`)].join('\n'), r)
+        return r.ok ? 0 : 1
+      }
+      // cluster_teamwork p2: the bearer credentials of HTTP delivery. Tokens
+      // are never printed: issue writes the file to hand over, install reads it.
+      case 'credential': {
+        const [, what, who] = p.positional
+        const cfgOf = () => { const c = loadPeerConfig(areaDir(p)); if (!('config' in c)) throw new Refused('disabled' in c ? c.disabled : c.problems.join('; ')); return c.config }
+        if (what === 'issue') {
+          if (!who) throw new UsageError('credential issue <holder instance> --out <file> [--scope work|manage] [--by WHO]')
+          const file = opt(p, 'out'); if (!file) throw new UsageError('--out <file> (written with mode 600; hand it to the holder\'s operator; the token is not printed)')
+          const scope = opt(p, 'scope') ?? 'work'
+          if (scope !== 'work' && scope !== 'manage') throw new UsageError('--scope is work (requests and their messages) or manage (only the management its relationship allows)')
+          const target = resolve(file)
+          if (existsSync(target)) throw new Refused(`${target} exists; nothing was issued (choose another file)`)
+          const r = s.issueCredential(cfgOf(), who, opt(p, 'by') ?? process.env.USER ?? 'operator', scope)
+          writeFileSync(target, `${r.token}\n`, { mode: 0o600, flag: 'wx' })
+          out(`Issued ${r.scope} credential ${r.id} to ${who} (fingerprint ${r.fingerprint}); token written to ${target} (mode 600). Install it on ${who}: wfe peer credential install ${cfgOf().self} --from <that file>; then remove the file.`, { ok: true, id: r.id, holder: who, fingerprint: r.fingerprint, scope: r.scope, file: target })
+          return 0
+        }
+        if (what === 'install') {
+          if (!who) throw new UsageError('credential install <issuer instance> --from <file|->')
+          const from = opt(p, 'from'); if (!from) throw new UsageError('--from <file|-> (the token file the issuer wrote)')
+          const token = readFileSync(from === '-' ? 0 : resolve(from), 'utf8')
+          const r = PeerStore.installCredential(areaDir(p), cfgOf(), who, token)
+          out(`Installed the ${r.scope} credential ${who} issued to this installation (fingerprint ${r.fingerprint}) at ${r.file} (mode 600).`, { ok: true, issuer: who, ...r })
+          return 0
+        }
+        if (what === 'revoke') {
+          if (!who) throw new UsageError('credential revoke <holder instance | credential id> [--by WHO]')
+          const n = s.revokeCredential(who, opt(p, 'by') ?? process.env.USER ?? 'operator')
+          out(n ? `Revoked ${n} credential(s) of ${who}: new deliveries with it are refused (401). Work it already delivered stands; cancel it explicitly if it must stop.` : `No unrevoked credential matches ${who}.`, { ok: true, revoked: n })
+          return 0
+        }
+        if (what === 'list' || what === undefined) {
+          const { credentialFile, readCredential } = await import('../server/peerlink.ts')
+          const c = cfgOf()
+          const { tokenFingerprint } = await import('../shared/peers.ts')
+          const held = c.peers.flatMap(x => (['work', 'manage'] as const).map(scope => { const t = readCredential(areaDir(p), x, scope); return { peer: x.instance, label: x.label, scope, file: credentialFile(areaDir(p), x, scope), fingerprint: t ? tokenFingerprint(t) : null } })).filter(x => x.scope === 'work' || x.fingerprint)
+          const issued = s.credentials()
+          out(['Issued by this installation (it accepts these):', ...(issued.length ? issued.map(x => `  ${x.id} → ${x.peer} (${x.scope}): issued ${x.issued} by ${x.by}${x.revoked ? `, REVOKED ${x.revoked}` : ''}${x.used ? `, last used ${x.used}` : ', never used'}`) : ['  none']),
+            'Installed here (this installation presents them):', ...held.map(x => `  ${x.label} (${x.peer}) ${x.scope}: ${x.fingerprint ? `fingerprint ${x.fingerprint}` : 'none'} — ${x.file}`)].join('\n'), { issued, held })
+          return 0
+        }
+        throw new UsageError('wfe peer credential issue|install|revoke|list')
+      }
+      case 'resend': {
+        if (!arg) throw new UsageError('resend <request id>')
+        const k = s.resend(arg); out(`${k} message(s) of ${arg} will be posted again.`, { ok: true, count: k }); return 0
+      }
+      case 'messages': {
+        const m = s.messages(opt(p, 'request'))
+        out([
+          ...(m.inbox.length ? ['Posts of the retired Zulip link (history):', ...m.inbox.map(r => `  ${String(r.message).padStart(7)} ${r.state.padEnd(8)} ${r.type ?? '—'} ${r.request ?? ''} from ${r.sender_name} (${r.sender})${r.note ? `\n          ${r.note}` : ''}`)] : []),
+          ...(m.http.length ? ['Received:', ...m.http.map(r => `  ${r.state.padEnd(8)} ${r.type} ${r.id} from ${r.peer} (${r.deliveries} deliver${r.deliveries === 1 ? 'y' : 'ies'}, first ${r.received})${r.note ? `\n          ${r.note}` : ''}`)] : []),
+          'Sent or queued:', ...m.outbox.map(r => `  ${r.state.padEnd(6)} ${r.type.padEnd(8)} ${r.id}${r.route === 'http' ? '' : ' [retired Zulip link]'}${r.message ? ` → message ${r.message}` : ''}${r.error ? ` — ${r.error}` : ''}`),
+        ].join('\n'), m)
+        return 0
+      }
+      case 'status': {
+        const cfg = loadPeerConfig(areaDir(p))
+        const st = s.status()
+        const c = 'config' in cfg ? cfg.config : null
+        const { readCredential } = await import('../server/peerlink.ts')
+        const mgmt = (x: NonNullable<typeof c>['peers'][number]) => x.grant.length || x.manage.length ? `; management credential ${readCredential(areaDir(p), x, 'manage') ? 'installed' : 'MISSING'}` : ''
+        const counts = (o: Record<string, number>) => Object.entries(o).map(([k, v]) => `${v} ${k}`).join(', ')
+        out([
+          `Configuration: ${c ? `this installation ${c.self}` : 'disabled' in cfg ? `off — ${cfg.disabled}` : 'problems' in cfg ? `INVALID — ${cfg.problems.join('; ')}` : ''}`,
+          ...(c ? ['Peers:', ...c.peers.map(x => { const sp = st.peers.find(y => y.instance === x.instance); return `  ${x.instance} ${x.label}: parentage ${x.parentage === 'parent' ? 'it is this installation\'s parent' : x.parentage === 'child' ? 'it is this installation\'s child' : 'none'}; over HTTP (${x.endpoint}; credential ${readCredential(areaDir(p), x) ? 'installed' : 'MISSING'})${mgmt(x)}; runs for it: ${x.accept.join(', ') || 'nothing'}; may ask it: ${x.request.join(', ') || 'nothing'}; speaks: ${sp ? `${sp.capabilities.join(', ') || 'peer/1 only'} (heard ${sp.seen})` : 'not heard yet (peer/1, or no message since)'}${x.grant.length || x.manage.length || x.parentage !== 'none' ? `; administration: grants ${x.grant.join(', ') || 'nothing'}, manages ${x.manage.join(', ') || 'nothing'}, enrollment ${s.manage.enrollment(c, x).state} (wfe manage status)` : ''}` })] : []),
+          `HTTP: received ${counts(st.http.received) || 'none'}; sent ${counts(st.http.sent) || 'none'}${st.http.lease ? `; settle pass held by ${st.http.lease.holder} until ${st.http.lease.until}` : ''}`,
+          ...st.http.peers.map(r => `  → ${r.peer}: ${r.ok ? 'ok' : 'FAILED'} at ${r.at}${r.error ? ` — ${r.error}` : ''}; ${r.sent} delivered`),
+          ...(st.http.refused.length ? ['  refused by the receiver (not retried):', ...st.http.refused.map(r => `    ${r.id} → ${r.peer}: ${r.error}`)] : []),
+          'Requests sent:', ...(st.outbound.length ? st.outbound.map(r => `  ${r.request} → ${r.peer} ${r.target} for ${r.parent_ws} ${r.parent_workflow}/${r.parent_run} ${r.d}: ${r.state === 'requested' ? 'acceptance unknown' : r.state}${r.remote_run ? ` — ${r.remote_run}` : ''}${r.problem ? ` — ${r.problem}` : ''}`) : ['  none']),
+          'Requests received:', ...(st.inbound.length ? st.inbound.map(r => `  ${r.request} ← ${r.peer} ${r.project}/${r.workflow}: ${r.state}${r.run ? ` — ${r.workspace} ${r.run_workflow}/${r.run}, relayed through seq ${r.relayed}` : ''}${r.problem ? ` — ${r.problem}` : ''}`) : ['  none']),
+          ...(st.awaiting.length ? ['Awaiting an answer (retried by themselves):', ...st.awaiting.map(r => `  ${r.id} ${r.state === 'sent' ? `delivered ${r.attempts}×, next retry ${r.next_retry ?? '—'}` : r.state}${r.error ? ` — ${r.error}` : ''}`)] : []),
+          ...(st.oversize.length ? ['Facts too large for the link (kept, the requester told):', ...st.oversize.map(r => `  ${r.id}`)] : []),
+          ...(st.problems.length ? ['Deliveries not applied:', ...st.problems.map(r => `  ${r.message} ${r.state} ${r.type ?? ''} ${r.request ?? ''}: ${r.note}`)] : []),
+          ...(Object.keys(st.history.posts).length || Object.keys(st.history.outbox).length ? [`Retired Zulip link (history, never sent or settled): posts ${counts(st.history.posts) || 'none'}; messages ${counts(st.history.outbox) || 'none'}`] : []),
+        ].join('\n'), { config: cfg, ...st })
+        return 0
+      }
+    }
+  } catch (e) {
+    if (e instanceof RequestError) throw new Refused(e.message, e.detail)
+    if (e instanceof UsageError || e instanceof Refused) throw e
+    throw new Refused((e as Error).message)
+  } finally { s.close(); x.close(); execStore = undefined }
+  throw new UsageError('wfe peer status|messages|hello|resend|set|unlink|check|credential|process')
+}
+
+// The cluster directory (cluster_teamwork p2, docs/cluster.md): what this
+// installation advertises, what the directory lists, and where to ask.
+async function cmdCluster(p: Parsed): Promise<number> {
+  const [sub, arg] = p.positional
+  const { Cluster } = await import('../server/cluster.ts')
+  const x = await openExec(p)
+  const cl = new Cluster({ area: areaDir(p), registryFile: registryFile(p), exec: x })
+  const age = (t: string | null) => t ? `${Math.max(0, Math.round((Date.now() - Date.parse(t)) / 60_000))} min ago` : 'never'
+  const offerLine = (o: ReturnType<typeof Cluster.offersOf>[number]) => `  ${o.instance}/${o.offer.project}/${o.offer.workflow}${o.offer.name ? ` "${o.offer.name}"` : ''} — ${o.state}${o.via ? ` (via ${o.via})` : ''}, fetched ${age(o.fetched)}${o.offer.problem ? ` — PROBLEM: ${o.offer.problem}` : ''}\n      ${o.offer.purpose || '(no purpose given)'}${o.offer.input ? `\n      input: ${o.offer.input}` : ''}${o.offer.delivery ? `\n      delivery: ${o.offer.delivery}` : ''}${o.offer.consult ? `\n      consult: ${o.offer.consult}` : ''}${o.offer.source ? `\n      source: ${o.offer.source.repository}@${o.offer.source.commit.slice(0, 12)}` : ''}`
+  try {
+    switch (sub) {
+      case 'advertisement': {
+        const ad = await cl.advertisement({ force: p.flags.has('rebuild') })
+        out([`${ad.instance}${ad.name ? ` (${ad.name})` : ''} at ${ad.endpoint ?? 'no endpoint (set cluster.json endpoint or peers.json viewBase)'}; built ${ad.built}, revision ${ad.revision.slice(0, 19)}…`, `speaks ${ad.capabilities.peer.join(', ')}; transports ${ad.capabilities.transports.join(', ')}${ad.capabilities.directory ? '; collects a directory' : ''}`, `activity: ${ad.activity ? `${ad.activity.queued} queued, ${ad.activity.running} running` : 'unknown'}`, `offers (${ad.offers.length}):`, ...ad.offers.map(o => offerLine({ instance: ad.instance, state: 'fresh', via: null, endpoint: ad.endpoint, fetched: ad.built, offer: o }))].join('\n'), ad)
+        return 0
+      }
+      case 'directory': {
+        if (p.flags.has('refresh')) { const r = await cl.collect({ force: true }); for (const n of r.notes) console.error(n) }
+        const d = await cl.consult({ refresh: p.flags.has('refresh') })
+        out([`Directory: ${d.source ?? 'none configured (peers.json directory, or cluster.json directory.collect)'}${d.fetched ? `, fetched ${d.fetched}` : ''}${d.stale ? ` — STALE: ${d.stale}` : ''}`,
+          ...(d.directory?.entries ?? []).map(e => `  ${e.instance}${e.advertisement?.name ? ` (${e.advertisement.name})` : ''}: ${e.state}${e.via ? ` via ${e.via}` : ''}; advertised ${e.advertised ? `${e.advertised.built} (${e.advertised.revision.slice(0, 19)}…)` : '—'}; fetched by the directory ${age(e.fetched)}${e.error ? `; last refresh failed: ${e.error}` : ''}; ${e.advertisement ? `${e.advertisement.offers.length} offer(s)${e.advertisement.activity ? `, ${e.advertisement.activity.queued} queued / ${e.advertisement.activity.running} running` : ''}` : 'nothing known'}`)].join('\n'), d)
+        return 0
+      }
+      case 'offers': {
+        const d = await cl.consult({ refresh: p.flags.has('refresh') })
+        const list = Cluster.offersOf(d.directory, arg)
+        out([`From ${d.source ?? 'no directory'}${d.fetched ? ` (fetched ${d.fetched})` : ''}${d.stale ? ` — STALE: ${d.stale}` : ''}. A listing is not an acceptance: \`wfe cluster resolve\` asks the installation.`, ...(list.length ? list.map(offerLine) : ['  no offer matches'])].join('\n'), { ...d, offers: list })
+        return 0
+      }
+      case 'show': {
+        const [inst, project, workflow] = (arg ?? '').split('/')
+        if (!inst || !project || !workflow) throw new UsageError('show <instance>/<project>/<workflow>')
+        const d = await cl.consult({ refresh: p.flags.has('refresh') })
+        const o = Cluster.offersOf(d.directory).find(x => x.instance === inst && x.offer.project === project && x.offer.workflow === workflow)
+        if (!o) throw new Refused(`the directory lists no ${arg}${d.stale ? ` (${d.stale})` : ''}`)
+        out([offerLine(o), ...(d.stale ? [`STALE: ${d.stale}`] : [])].join('\n'), o)
+        return 0
+      }
+      case 'resolve': {
+        if (!arg) throw new UsageError('resolve <project>/<workflow> [--instance <id>] [--refresh]')
+        const r = await cl.resolve(arg, { instance: opt(p, 'instance'), refresh: p.flags.has('refresh') })
+        const yes = (b: boolean | undefined) => b ? 'yes' : 'NO'
+        out([
+          `${arg}: ${r.state.toUpperCase()}${r.instance ? ` — ${r.instance}${r.endpoint ? ` at ${r.endpoint}` : ''}` : ''}${r.detail ? ` — ${r.detail}` : ''}`,
+          `  directory: ${r.directory.source ?? 'none'}${r.directory.fetched ? `, fetched ${r.directory.fetched}` : ''}${r.directory.stale ? ` — STALE: ${r.directory.stale}` : ''}${r.listed ? `; listed ${r.listed.state}${r.listed.via ? ` via ${r.listed.via}` : ''}` : ''}`,
+          ...(r.local ? [`  here: registered ${yes(r.local.registered)}${r.local.endpoint ? ` (endpoint ${r.local.endpoint}${r.local.endpointMatches ? '' : ', not the advertised one'})` : ''}; new work over ${r.local.route ?? '—'}; may request it ${yes(r.local.allowed)}; credential installed ${yes(r.local.credential)}`] : []),
+          ...(r.confirmed !== undefined ? [`  the installation itself: ${r.confirmed ? `${r.confirmed.ok ? 'confirmed' : 'NOT confirmed'} — ${r.confirmed.detail}` : 'not asked (no endpoint)'}`] : []),
+          ...(r.permitted !== undefined ? [`  its permission for this installation: ${r.permitted ? `${r.permitted.ok ? 'permitted' : 'NOT permitted'} — ${r.permitted.detail}` : 'not asked (no credential installed here)'}`] : []),
+          ...(r.connect?.length ? ['  to connect (configuration decisions, not done by discovery):', ...r.connect.map(c => `    ${c}`)] : []),
+          ...(r.state === 'ready' ? ['  Acceptance is still that installation\'s decision: its answer comes back on the delegation.'] : []),
+        ].join('\n'), r)
+        return r.state === 'ready' ? 0 : 1
+      }
+      case 'use': {
+        if (!arg) throw new UsageError('use <directory URL (…/wfe/api/cluster/directory)> | none')
+        const { setDirectory } = await import('../server/peersetup.ts')
+        const r = setDirectory(areaDir(p), arg === 'none' ? null : arg)
+        out([...(r.notes.length ? r.notes : ['nothing to change']), r.changed ? 'peers.json written' : 'peers.json unchanged'].join('\n'), { ok: true, ...r })
+        return 0
+      }
+    }
+  } catch (e) {
+    if (e instanceof RequestError) throw new Refused(e.message, e.detail)
+    if (e instanceof UsageError || e instanceof Refused) throw e
+    throw new Refused((e as Error).message)
+  } finally { x.close(); execStore = undefined }
+  throw new UsageError('wfe cluster advertisement|directory|offers|show|resolve|use')
+}
+
+// Managing a child installation (improve_multinodes p3, docs/management.md).
+// cluster_teamwork p4 (server/submissions.ts): a machine requester's
+// submission, through this installation's running service (it needs no
+// write access here: Observer's account calls it).
+async function cmdSubmit(p: Parsed): Promise<number> {
+  const base = opt(p, 'api') ?? `http://127.0.0.1:${port(p)}`
+  const call = async (method: 'GET' | 'POST', path: string, body?: unknown) => {
+    let r: Response
+    try { r = await fetch(`${base.replace(/\/+$/, '')}/api/${path}`, { method, headers: body ? { 'content-type': 'application/json' } : {}, body: body ? JSON.stringify(body) : undefined, signal: AbortSignal.timeout(120_000) }) } catch (e) { throw new Refused(`the WFE service at ${base} cannot be reached: ${(e as Error).message}`, { code: 'submission-unavailable' }) }
+    const t = await r.text()
+    let d: Record<string, unknown> = {}
+    try { d = JSON.parse(t) as Record<string, unknown> } catch { /* not JSON */ }
+    if (!r.ok) throw new Refused(`${r.status} ${typeof d.error === 'string' ? d.error : t.slice(0, 300)}`, d.detail ?? { status: r.status })
+    return d.submission as Record<string, unknown>
+  }
+  const show = opt(p, 'show')
+  const v = show ? await call('GET', `submissions/${encodeURIComponent(show)}`) : await (async () => {
+    const need = (k: string) => { const x = opt(p, k); if (!x) throw new UsageError(`wfe submit --requester <name> --workflow <project>/<workflow> --key <key> --text-file <file|-> [--about <text>] [--workspace <id>] | --show <receipt>  (--${k} is missing)`); return x }
+    const file = need('text-file')
+    return call('POST', 'submissions', { requester: need('requester'), workflow: need('workflow'), key: need('key'), text: readFileSync(file === '-' ? 0 : resolve(file), 'utf8'), about: opt(p, 'about'), workspace: opt(p, 'workspace') })
+  })()
+  out(`${v.duplicate ? 'Known' : 'Submitted'}: ${String(v.receipt)} → ${String(v.workspace)} ${String(v.workflow)}/${String(v.run)} (${String(v.uid ?? 'uid unknown')}; job ${String(v.job)})`, { ok: true, ...v })
+  return 0
+}
+
+async function cmdManage(p: Parsed): Promise<number> {
+  const [sub, arg, third] = p.positional
+  const { PeerStore, needPeerConfig } = await import('../server/peerlink.ts')
+  const x = await openExec(p)
+  const s = new PeerStore({ area: areaDir(p), registryFile: registryFile(p), exec: x })
+  type View = ReturnType<typeof s.manage.opView>
+  const opLines = (v: View, indent = '  ') => [
+    `${indent}${v.id}  ${v.dir === 'out' ? `→ ${v.peer}` : `← ${v.peer}`}  commit ${v.commit.slice(0, 12)}  (${v.created}${v.route === 'http' ? '' : '; over the retired Zulip link'})`,
+    `${indent}  ${v.outcome}`,
+    ...(v.lifecycle ? [`${indent}  lifecycle update ${v.lifecycle}; acknowledged: ${v.acknowledged}${v.code ? ` (${v.code})` : ''}`] : []),
+    ...(v.history.length ? [`${indent}  phases: ${v.history.map(h => `${h.state} ${h.at}`).join(' → ')}`] : []),
+    ...(v.dir === 'out' && v.phase ? [`${indent}  selected ${v.selected?.slice(0, 12) ?? '—'}; serving ${v.serving?.slice(0, 12) ?? '—'}; healthy ${v.healthy === null ? 'unknown' : String(v.healthy)}; verified ${v.verified ? 'yes' : 'no'}${v.partial ? `; partially active (not started: ${Object.keys(v.notStarted ?? {}).join(', ')})` : ''}`] : []),
+  ]
+  try {
+    const cfg = needPeerConfig(areaDir(p))
+    switch (sub) {
+      case undefined: case 'status': {
+        const st = s.manage.status(cfg)
+        const lines = [`This installation ${st.self}; ancestry ${st.ancestry.join(' → ') || 'none (no parent)'}`]
+        for (const q of st.peers.filter(y => !arg || y.instance === arg || y.label === arg)) {
+          lines.push(`${q.label} (${q.instance}): ${q.parentage === 'child' ? 'child' : q.parentage === 'parent' ? 'parent' : 'no parentage'}; this side grants ${q.grant.join(', ') || 'nothing'}, manages ${q.manage.join(', ') || 'nothing'}`)
+          lines.push(`  enrollment: ${q.enrollment.state} — ${q.enrollment.detail}${q.heard ? ` (told ${q.heardAt}: sees this installation as its ${q.heard.you}; grants ${q.heard.grants.join(', ') || 'nothing'}, manages ${q.heard.manages.join(', ') || 'nothing'})` : ''}`)
+          if (q.grant.length || q.manage.length) lines.push(`  management credential: ${q.manageCredential ? 'installed' : 'MISSING (wfe peer credential install … from its manage credential)'}`)
+          lines.push(`  identity: ${q.identity ? `${q.identity.name ?? '(no name)'} on ${q.identity.host ?? '(unknown host)'}; dashboard ${q.identity.dashboard ?? 'none'} (told ${q.identity.received})` : 'not told (a release without display identity, or no hello since)'}`)
+          if (q.observation) {
+            const o = q.observation, smp = o.body?.sample
+            lines.push(`  observation: ${o.state.toUpperCase()} — ${o.detail}`)
+            if (o.state !== 'fresh') lines.push('    not current: queries continue by themselves; if it persists, check the child\'s transport (`wfe peer status` there) or recover on its host (docs/management.md, Recovery outside the product)')
+            if (smp) lines.push(`    release ${smp.release.active?.slice(0, 12) ?? 'none'}; serving ${smp.serving ? `${smp.serving.release?.slice(0, 12) ?? '—'} (${smp.serving.instance ?? '?'})` : 'not answering'}; services ${Object.entries(smp.services).map(([k, v]) => `${k} ${v}`).join(', ')}${smp.draining ? '; DRAINING' : ''}; update ${smp.update ? `${smp.update.id} ${smp.update.state} since ${smp.update.since}` : 'none running'}${o.state !== 'fresh' ? '  (as last reported, not current)' : ''}`)
+          }
+          if (q.operations.length) { lines.push('  operations:'); for (const v of q.operations) lines.push(...opLines(v, '    ')) }
+        }
+        out(lines.join('\n'), st)
+        return 0
+      }
+      case 'observe': {
+        if (!arg) throw new UsageError('observe <peer>')
+        const notes = s.manage.observeNow(cfg, arg)
+        out(notes.join('\n') || 'Asked already; the answer is shown by `wfe manage status`.', { ok: true, notes })
+        return 0
+      }
+      case 'update': {
+        if (!arg || !third) throw new UsageError('update <peer> <commit> --reason TEXT [--by WHO]')
+        const reason = opt(p, 'reason'); if (!reason) throw new UsageError('--reason <text> is required')
+        let commit = third
+        if (!/^[0-9a-f]{40}$/.test(commit)) {
+          const r = spawnSync('git', ['rev-parse', '--verify', `${commit}^{commit}`], { encoding: 'utf8' })
+          if (r.status !== 0) throw new Refused(`${commit} is not a commit in this working copy; give the full hash`)
+          commit = r.stdout.trim()
+        }
+        const by = opt(p, 'by') ?? process.env.WFE_AGENT ?? process.env.USER ?? 'unknown'
+        const r = s.manage.requestUpdate(cfg, arg, { commit, reason, by, run: process.env.WFE_RUN || null, attempt: process.env.WFE_ATTEMPT || null })
+        out([r.duplicate ? `${r.op}: already asked (the same commit); nothing new recorded` : `${r.op}: recorded and queued for ${arg} (commit ${commit})`, ...opLines(s.manage.opView(r.row)), 'Follow it with `wfe manage show <op>` or `wfe manage status`.'].join('\n'), { ok: true, ...r, view: s.manage.opView(r.row) })
+        return 0
+      }
+      case 'show': {
+        if (!arg) throw new UsageError('show <operation id>')
+        const views = s.manage.show(arg)
+        out(views.flatMap(v => opLines(v, '')).join('\n'), { ok: true, views })
+        return 0
+      }
+    }
+  } catch (e) {
+    if (e instanceof RequestError) throw new Refused(e.message, e.detail)
+    if (e instanceof UsageError || e instanceof Refused) throw e
+    throw new Refused((e as Error).message)
+  } finally { s.close(); x.close(); execStore = undefined }
+  throw new UsageError('wfe manage status [<peer>] | observe <peer> | update <peer> <commit> --reason TEXT [--by WHO] | show <op>')
+}
+
+// The run of an executing attempt: its project and the agent it records as.
+async function readRunRecord(x: ExecStore, row: { workspace: string; workflow: string; run: string }): Promise<{ project: string; agent: string } | null> {
+  try {
+    const ws = await x.workspace(row.workspace)
+    const rec = (await (await import('../server/runs.ts')).readRun(ws, { workflow: row.workflow, run: row.run })).record
+    return rec ? { project: rec.project, agent: rec.executor.name } : null
+  } catch { return null }
+}
+function entrustRef(text: string): import('../shared/run.ts').EntrustRef {
+  if (text.startsWith('file:')) return { kind: 'file', path: text.slice(5) }
+  if (text.startsWith('note:')) return { kind: 'note', text: text.slice(5) }
+  const m = /^(?:([a-z0-9][a-z0-9_.-]*)\/)?([a-z0-9][a-z0-9_.-]*)\/(run-[a-z0-9][a-z0-9_.-]*)$/.exec(text)
+  if (m) return { kind: 'run', workflow: m[2], run: m[3], ...(m[1] ? { project: m[1] } : {}) }
+  throw new UsageError(`--entrusted-by "${text}" must be [<project>/]<workflow>/<run>, file:<path> or note:<text>`)
+}
+
+// A person's request: their words become the run's braindump.md, and the
+// executor is queued. An agent's request: its request.md (p8).
+async function cmdRequest(p: Parsed): Promise<number> {
+  const [workflow] = p.positional
+  if (!workflow) throw new UsageError('request needs a workflow')
+  const file = opt(p, 'braindump'), requestFile = opt(p, 'request')
+  if (!!file === !!requestFile) throw new UsageError('give exactly one of --braindump <file|-> (a person\'s words) or --request <file|-> (an agent\'s request)')
+  const author = opt(p, 'author'); if (file && !author) throw new UsageError('--author <person> is required: whose words the braindump holds')
+  const ws = await workspace(p)
+  const x = await openExec(p)
+  try {
+    const text = readFileSync((file ?? requestFile) === '-' ? 0 : resolve((file ?? requestFile)!), 'utf8')
+    // An executing attempt requesting work (project_migration p8): its run's
+    // agent is the requester and its run what entrusted the request, and the
+    // same command retried by that attempt is the same request.
+    const attempt = process.env.WFE_ATTEMPT
+    const row = attempt ? x.attemptRow(attempt) : undefined
+    const own = row && row.state !== 'ended' ? (await readRunRecord(x, row)) : null
+    const { createHash } = await import('node:crypto')
+    const receipt = opt(p, 'receipt') ?? (own ? `attempt:${attempt}:${createHash('sha256').update(`${ws.reg.id}\n${workflow}\n${text}`).digest('hex').slice(0, 24)}` : `cli-${Date.now()}-${process.pid}`)
+    let input: Parameters<ExecStore['request']>[0]['input']
+    if (requestFile) {
+      const requester = opt(p, 'requester') ?? own?.agent
+      if (!requester) throw new UsageError('--requester <agent> is required outside an executing attempt: the agent that wrote the request')
+      const by = opt(p, 'entrusted-by')
+      const entrustedBy = by ? entrustRef(by) : own ? { kind: 'run' as const, project: own.project, workflow: row!.workflow, run: row!.run } : undefined
+      if (!entrustedBy) throw new UsageError('--entrusted-by is required outside an executing attempt: <project>/<workflow>/<run>, note:<text> or file:<path>')
+      const original = opt(p, 'original')
+      input = { kind: 'request', text, requester, entrustedBy, ...(opt(p, 'on-behalf-of') ? { onBehalfOf: opt(p, 'on-behalf-of') } : {}), ...(original ? { original: readFileSync(original === '-' ? 0 : resolve(original), 'utf8') } : {}) }
+    }
+    const pred = opt(p, 'predecessor')
+    const predecessor = pred ? await (await import('../server/runs.ts')).resolveRef(ws, pred) : undefined
+    // Work requested from a discussion turn is recorded there as executed
+    // (argue p4 ex3), journaled by the request's receipt.
+    const ev = own ? await discussionTurn(x, areaDir(p)) : null
+    const journal = ev ? await quietly(async () => ev.wfs.beginRequest(ev.turn, { workspace: ws.reg.id, workflow, receipt })) : null
+    let r: Awaited<ReturnType<typeof x.request>>
+    // Challenges named with the request (challenge p1), pinned now: the run
+    // is given each as it is at this revision.
+    const wanted = p.opts.get('challenge') ?? []
+    let attachments: import('../server/runs.ts').PinnedAttachment[] = []
+    if (wanted.length) {
+      const { attachRequests, ConversationStore } = await import('../server/conversations.ts')
+      const cs = new ConversationStore({ area: areaDir(p), exec: x })
+      try { attachments = await cs.pinnedTexts(await cs.pinAll(attachRequests(wanted))) } finally { cs.close() }
+    }
+    const trial = p.flags.has('editing') ? { file: workflow } : undefined
+    try { r = await x.request({ workspace: ws.reg.id, workflow, text, author: author ?? input?.requester ?? '', receipt, by: opt(p, 'by') ?? own?.agent, via: 'cli', predecessor, node: opt(p, 'node'), ...(input ? { input } : {}), ...(attachments.length ? { attachments } : {}), ...(trial ? { trial } : {}) }) } catch (e) { if (journal !== null) ev?.wfs.abort(journal); ev?.close(); throw e }
+    if (ev && journal !== null) { const rec = await quietly(() => ev.wfs.finishRequest(journal, `${ws.reg.id}/${r.ref.workflow}/${r.ref.run}`)); if (rec) process.stderr.write(`Recorded in discussion ${ev.turn.conv}: workflow record ${rec.id} (executed).\n`) }
+    ev?.close()
+    const src = (await (await import('../server/runs.ts')).readRun(await (await import('../server/runspace.ts')).runSpace(ws, r.ref), r.ref)).record?.definition.source
+    const from = src?.kind === 'published' ? ` Definition and code: ${src.repository}@${src.commit.slice(0, 10)} (${src.branch}).` : src?.kind === 'trial' ? ` Trial: ${src.file} (sha256 ${src.sha256.slice(0, 12)}) on ${src.baseline.repository}@${src.baseline.commit.slice(0, 10)}.` : src?.kind === 'workspace' ? ` Definition: workspace ${src.workspace} (${src.reason}).` : ''
+    out(`${r.duplicate ? 'Already requested (same receipt)' : 'Requested'}: run ${r.ref.workflow}/${r.ref.run} in ${ws.reg.id}; job ${r.job.id} is ${r.job.state}${r.job.worker ? ` for execution node ${r.job.worker}` : ''}.${from}`, r)
+    return 0
+  } catch (e) {
+    if (e instanceof RequestError) throw new Refused(e.message, e.detail)
+    throw e
+  } finally { x.close(); execStore = undefined }
+}
+
+async function agdevRun(f: () => Promise<{ ok: boolean; message: string } & Record<string, unknown>>): Promise<number> {
+  try {
+    const r = await f()
+    const steps = (r.steps as { name: string; status: string; detail: string }[] | undefined) ?? []
+    out([r.message, ...steps.map(s => `  ${s.status.padEnd(6)} ${s.name}: ${s.detail}`)].join('\n'), r)
+    return r.ok ? 0 : 1
+  } catch (e) {
+    if (e instanceof RequestError || e instanceof GiteaError) throw new Refused(e.message)
+    throw e
+  }
+}
+
+async function cmdProject(p: Parsed): Promise<number> {
+  const [sub, arg] = p.positional
+  const ctx = await agdevCtx(p)
+  if (sub === 'register') return agdevRun(() => { const o = ownerName(arg, '<repository>'); return registerGiteaProject(ctx, o.owner, o.name) })
+  if (sub === 'obtain') { if (!arg) throw new UsageError('obtain needs a project id'); return agdevRun(() => obtainWorkspace(ctx, arg)) }
+  if (sub === 'unregister') {
+    if (!arg) throw new UsageError('unregister needs a project id')
+    const reg = await loadRegistry(registryFile(p))
+    const ids = reg.workspaces.filter(w => w.project === arg).map(w => w.id)
+    const x = await openExec(p)
+    try {
+      const pending = x.pendingFor(ids)
+      if (pending.jobs.length || pending.attempts.length) throw new Refused(`project "${arg}" has unfinished execution here (${pending.attempts.map(a => `attempt ${a.id} ${a.state}`).concat(pending.jobs.map(j => `job ${j.id} ${j.state}`)).join(', ')}); stop or cancel it first (wfe run stop/cancel), then unregister`, pending)
+    } finally { x.close(); execStore = undefined }
+    const r = await unregisterProject(registryFile(p), arg)
+    out([`Unregistered project ${r.project.id}.`, ...r.workspaces.map(w => `  workspace ${w.id} (${w.path}; the folder is kept)`), ...r.repositories.map(e => `  repository ${e.key} ${e.gitea.owner}/${e.gitea.name} (on Gitea it is kept)`)].join('\n'), { ok: true, ...r })
+    return 0
+  }
+  if (sub === 'show' || sub === 'save') return definitionCommand(p, 'project', sub)
+  throw new UsageError('wfe project register <owner>/<name> | obtain <project id> | unregister <project id> | show | save --file <yaml> --base <rev>')
+}
+
+async function cmdRepo(p: Parsed): Promise<number> {
+  const [sub, arg, path] = p.positional
+  const ctx = await agdevCtx(p)
+  const cat = () => { const c = opt(p, 'category'); if (!REPO_CATEGORIES.includes(c as RepoCategory)) throw new UsageError(`--category is one of ${REPO_CATEGORIES.filter(x => x !== 'root').join(', ')}`); return c as RepoCategory }
+  if (sub === 'register') return agdevRun(() => { const o = ownerName(arg, '<repository>'); return registerSharedRepository(ctx, o.owner, o.name, cat()) })
+  if (sub === 'create') { if (!arg) throw new UsageError('create needs a name'); return agdevRun(() => createSharedRepository(ctx, arg, cat(), opt(p, 'description') ?? '')) }
+  if (sub === 'add') {
+    if (!arg || !path) throw new UsageError('add needs <repository> <path>')
+    const ws = await workspace(p)
+    const reg = await loadRegistry(registryFile(p))
+    const key = arg.startsWith('gitea:') ? arg : reg.repositories.find(r => `${r.gitea.owner}/${r.gitea.name}` === arg)?.key
+    if (!key) throw new Refused(`${arg} is not a registered repository (see: wfe dashboard)`)
+    return agdevRun(async () => { const r = await addSharedRepository(ctx, ws, key, path); return { ...r, message: r.ok ? `${r.message} (URL ${r.url})` : r.message } })
+  }
+  throw new UsageError('wfe repo register <owner>/<name> --category … | create <name> --category … [--description …] | add <repository> <path>')
+}
+
+// A push that could overwrite others' work (p9: preparation pushes).
+export function forcePush(args: string[]): string | undefined {
+  const i = args.indexOf('push')
+  if (i < 0) return undefined
+  return args.slice(i + 1).find(a => a === '--force' || a === '-f' || a === '--mirror' || /^-[a-zA-Z]*f/.test(a) && !a.startsWith('--') || a.startsWith('+'))
+}
+
+async function cmdGitea(p: Parsed): Promise<number> {
+  const [sub, ...rest] = p.positional
+  const base = await giteaOf(p)
+  if (!base) throw new Refused(`no Gitea setting at ${giteaFile(p)}`)
+  const as = opt(p, 'as')
+  let g: Gitea
+  try { g = as ? base.as(as) : base } catch (e) { throw new Refused((e as Error).message) }
+  const who = as ?? `${base.owner}'s setting (service)`
+  const wrap = async <T>(f: () => Promise<T>) => { try { return await f() } catch (e) { if (e instanceof GiteaError) throw new Refused(e.message); throw e } }
+  if (sub === 'whoami') { const login = await wrap(() => g.login()); out(`${login} (as ${who}, ${g.url})`, { login, principal: as ?? null, url: g.url }); return 0 }
+  if (sub === 'repo') {
+    const o = ownerName(rest[0], '<repository>')
+    const a = await wrap(() => g.access(o.owner, o.name))
+    if (!a) { out(`${o.owner}/${o.name}: not visible to ${who} (absent or private)`, { visible: false }); return 1 }
+    const perm = Object.entries(a.permissions).filter(([, v]) => v).map(([k]) => k)
+    out(`${a.repo.fullName} (id ${a.repo.id}, ${a.repo.empty ? 'empty' : `default ${a.repo.defaultBranch}`}${a.repo.archived ? ', archived' : ''}): ${who} may ${perm.length ? perm.join(', ') : 'nothing'}`, { visible: true, repository: a.repo, permissions: a.permissions, principal: as ?? null })
+    return 0
+  }
+  if (sub === 'git') {
+    if (!rest.length) throw new UsageError('wfe gitea git [--as <principal>] -- <git arguments…>')
+    const f = forcePush(rest)
+    if (f) throw new Refused(`a force push (${f}) is refused: it could overwrite work others published; fetch and integrate, or use --force-with-lease`)
+    const env = { ...process.env, ...(await wrap(() => g.gitEnv())) }
+    return await new Promise<number>(res => {
+      const c = spawn('git', rest, { stdio: 'inherit', env })
+      c.on('error', e => { console.error(`wfe gitea git: ${e.message}`); res(1) })
+      c.on('exit', code => res(code ?? 1))
+    })
+  }
+  throw new UsageError('wfe gitea whoami | repo <owner>/<name> | git -- <git arguments…>  [--as <principal>]')
+}
+
+async function cmdDashboard(p: Parsed): Promise<number> {
+  const d = await dashboard(await agdevCtx(p))
+  const lines = [`Gitea: ${d.gitea.state}${d.gitea.url ? ` ${d.gitea.url} (owner ${d.gitea.owner})` : ''}${d.gitea.error ? ` — ${d.gitea.error}` : ''}`, `Execution host: ${d.executor.state}${d.executor.detail ? ` — ${d.executor.detail}` : ''}`, '', 'Projects:']
+  if (!d.projects.length) lines.push('  (none registered)')
+  for (const pr of d.projects) {
+    lines.push(`  ${pr.id.padEnd(20)} ${pr.name ?? '?'}  root ${pr.root.fullName ?? pr.root.key}${pr.root.error ? ` (${pr.root.error})` : ''}  devdocs ${pr.devdocs ?? '?'}`)
+    lines.push(`  ${' '.repeat(20)} definition ${pr.definition.error ? `NOT READ (${pr.definition.source}): ${pr.definition.error}` : `read from ${pr.definition.source}`}`)
+    if (!pr.workspaces.length) lines.push(`  ${' '.repeat(20)} no workspace on this host (wfe project obtain ${pr.id})`)
+    for (const w of pr.workspaces) lines.push(`  ${' '.repeat(20)} workspace ${w.id}: ${w.available ? (w.runs ? `${w.runs.ongoing} ongoing, ${w.runs.waitingOnPerson} waiting` : `runs not read: ${w.runsError}`) : `unavailable: ${w.reason}`}`)
+  }
+  lines.push('', 'Repositories:')
+  if (!d.repositories.length) lines.push('  (none registered)')
+  for (const r of d.repositories) {
+    lines.push(`  ${(r.gitea.fullName ?? `${r.registered.owner}/${r.registered.name}`).padEnd(36)} ${r.category.padEnd(8)} ${r.key}${r.gitea.state !== 'ok' ? `  [${r.gitea.state}${r.gitea.error ? `: ${r.gitea.error}` : ''}]` : ''}`)
+    lines.push(`  ${' '.repeat(36)} used by: ${r.usedBy.length ? r.usedBy.map(u => `${u.project} (${u.path})`).join(', ') : 'none'}${r.usageUnknown.length ? `; unknown for ${r.usageUnknown.map(u => u.project).join(', ')}` : ''}`)
+  }
+  if (d.unlinkedWorkspaces.length) lines.push('', 'Workspaces without a registered project:', ...d.unlinkedWorkspaces.map(w => `  ${w.id}`))
+  out(lines.join('\n'), d)
+  return 0
+}
+
+// Runs' own working copies (p9, docs/storage.md): the host-local index.
+// The workflow observation (observer p3, server/observe.ts): read-only.
+async function cmdObserve(p: Parsed): Promise<number> {
+  const { Observer } = await import('../server/observe.ts')
+  const x = await openExec(p)
+  try {
+    const o = await new Observer(x, registryFile(p)).observe({ workspace: opt(p, 'workspace'), runs: p.opts.get('run') ?? [], terminal: p.flags.has('terminal') })
+    const lines = [`Observed ${o.observedAt} on ${o.host}: executor ${o.executor.state}${o.executor.ageSeconds !== null ? ` (heartbeat ${o.executor.ageSeconds} s ago)` : ''}${o.executor.slot ? `, executing ${o.executor.slot.workspace} ${o.executor.slot.run}` : ''}${o.executor.queued ? `, ${o.executor.queued} queued` : ''}`,
+      ...o.runs.map(r => `  ${`${r.identity.workspace} ${r.identity.workflow}/${r.identity.run}`.padEnd(36)} ${(r.situation ?? r.source.state).padEnd(16)} ${r.waiting ? `${r.waiting.responsible}: ${r.waiting.reason}` : ''}${r.problems.length ? `\n    ${r.problems.map(x => x.message).join('\n    ')}` : ''}`),
+      ...o.problems.map(x => `  problem: ${x.message}`)]
+    out(lines.join('\n'), o)
+    return 0
+  } finally { x.close(); execStore = undefined }
+}
+
+async function cmdRuns(p: Parsed): Promise<number> {
+  const [sub] = p.positional
+  if (sub === 'migrate') return cmdMigrate(p)
+  if (sub === 'relocate') return cmdRelocate(p)
+  if (sub === 'storage' || sub === 'retire') return cmdRunsStorage(p, sub)
+  // project_migration p7: record the execution node of every unfinished run.
+  if (sub === 'assign-nodes') {
+    const by = opt(p, 'by'); if (!by) throw new UsageError('--by <name> is required')
+    const x = await openExec(p)
+    try {
+      const notes = await x.migrateNodes({ dryRun: p.flags.has('dry-run'), by })
+      out(notes.join('\n') || 'Every unfinished run has its execution node recorded.', { ok: true, notes })
+      return 0
+    } finally { x.close(); execStore = undefined }
+  }
+  if (sub !== 'index') throw new UsageError('usage: wfe runs index [--rebuild] [--workspace <id>] | wfe runs migrate [--dry-run] [--workspace <id>] --by <name> | wfe runs relocate [--dry-run] [--workspace <id>] --by <name> | wfe runs assign-nodes [--dry-run] --by <name>')
+  const { inspectIndex } = await import('../server/runspace.ts')
+  const ws = await workspace(p)
+  const entries = await inspectIndex(ws, { rebuild: p.flags.has('rebuild') })
+  const lines = entries.length ? entries.map(e => `  ${e.ref.padEnd(28)} ${e.state.padEnd(9)} ${e.branch ?? ''}${e.problem ? `\n    ${e.problem}` : ''}`) : ['  (no run has a working copy in this workspace)']
+  out([`Run copies of workspace ${ws.reg.id}:`, ...lines].join('\n'), { workspace: ws.reg.id, entries })
+  return entries.some(e => e.state === 'damaged') ? 1 : 0
+}
+
+// Which runs could be retired, and retiring an inspected selection
+// (improve_wfrun p2, docs/storage.md). Every run is checked again when its turn comes.
+async function cmdRunsStorage(p: Parsed, sub: string): Promise<number> {
+  const { inspectWorkspace, retireRun } = await import('../server/retention.ts')
+  const x = await openExec(p)
+  try {
+    if (sub === 'storage') {
+      const ws = await workspace(p)
+      const all = await inspectWorkspace(x, ws)
+      const lines = [`Run copies of workspace ${ws.reg.id}: ${all.filter(e => e.eligible).length} of ${all.length} could be retired now (running processes are checked when a run is retired).`, ...all.map(e => `  ${e.ref.padEnd(32)} ${e.state.padEnd(9)} ${e.eligible ? 'candidate' : e.state === 'retired' ? '' : e.reasons[0] ?? ''}`)]
+      out(lines.join('\n'), { workspace: ws.reg.id, runs: all })
+      return 0
+    }
+    const file = opt(p, 'selection'); const by = opt(p, 'by')
+    if (!file || !by) throw new UsageError('wfe runs retire --selection <file.json> --by <name> [--dry-run]: the file lists {"workspace", "ref"} entries')
+    const selection = JSON.parse(await readFile(file, 'utf8')) as { workspace: string; ref: string; discard?: { path: string; reason: string }[] }[]
+    const results = []
+    for (const s of selection) {
+      const [workflow, run] = s.ref.split('/')
+      results.push({ workspace: s.workspace, ...await retireRun(x, await x.workspace(s.workspace), { workflow, run }, { by, dryRun: p.flags.has('dry-run'), discard: s.discard }) })
+    }
+    out(results.map(r => `  ${`${r.workspace}/${r.ref}`.padEnd(40)} ${r.outcome.padEnd(8)} ${r.reasons[0] ?? ''}`).join('\n'), { results })
+    return results.some(r => r.outcome === 'failed') ? 1 : 0
+  } finally { x.close(); execStore = undefined }
+}
+
+// Moving runs' folders into durable storage (improve_wfrun p2, docs/storage.md).
+async function cmdRelocate(p: Parsed): Promise<number> {
+  const { relocate, relocationPlan } = await import('../server/relocate.ts')
+  const x = await openExec(p)
+  try {
+    const only = opt(p, 'workspace')
+    if (p.flags.has('dry-run')) {
+      const plan = await relocationPlan(x, only)
+      const n = (a: string) => plan.runs.filter(r => r.action === a).length
+      out([`Relocation plan (nothing was changed). Executor: ${plan.executor}.`, `  relocate ${n('relocate')}, relocated already ${n('relocated')}, blocked ${n('blocked')}`, ...plan.runs.filter(r => r.action === 'blocked').map(r => `  blocked ${r.workspace}/${r.ref}: ${r.why}`)].join('\n'), plan)
+      return 0
+    }
+    const by = opt(p, 'by'); if (!by) throw new UsageError('--by <name> is required')
+    const r = await relocate(x, { workspace: only, allowLive: p.flags.has('allow-live-executor'), by })
+    out([`Moved ${r.moved.length}, already durable ${r.already}. Recovery copies: ${r.backup}`, ...r.blocked.map(b => `  blocked ${b}`), ...r.problems.map(b => `  problem ${b}`)].join('\n'), r)
+    return r.problems.length ? 1 : 0
+  } finally { x.close(); execStore = undefined }
+}
+
+// The p9 migration (docs/storage.md *Migration*): an inventory first
+// (--dry-run changes nothing), then the move of non-terminal runs into
+// working copies of their own; resumable from its journal.
+async function cmdRenameProject(p: Parsed): Promise<number> {
+  const [from, to] = p.positional
+  const repository = opt(p, 'repository'), by = opt(p, 'by')
+  if (!from || !to || !repository) throw new UsageError('usage: wfe rename-project <from> <to> --repository <name> [--preview] --by <name>')
+  const { renamePreview, renameProject } = await import('../server/renameProject.ts')
+  const x = await openExec(p)
+  try {
+    const o = { from, to, repository, by: by ?? 'preview', allowLive: p.flags.has('allow-live-executor'), sessions: opt(p, 'sessions') }
+    if (p.flags.has('preview')) {
+      const v = await renamePreview(x, o)
+      out([`Rename ${from} → ${to} (nothing was changed). Executor: ${v.executor}.`,
+        `  workspace ${v.workspace.from} → ${v.workspace.to}${v.workspace.moved ? ' (moved already)' : ''}`,
+        `  runs ${v.runs.total}: to rename ${v.runs.toRename}, renamed ${v.runs.renamed}, retired ${v.runs.retired}`,
+        `  session folders ${v.sessions}; context folder ${v.contexts ? 'present' : 'absent'}`,
+        ...v.stores.filter(s => s.rows).map(s => `  ${s.store}.${s.change}: ${s.rows}`),
+        ...v.problems.map(t => `  problem: ${t}`)].join('\n'), v)
+      return v.problems.length ? 1 : 0
+    }
+    if (!by) throw new UsageError('--by <name> is required')
+    const r = await renameProject(x, o)
+    out([`Renamed ${from} → ${to}. Journal: ${r.journal}`, ...Object.entries(r.steps).map(([k, v]) => `  ${k}: ${JSON.stringify(v.detail ?? null).slice(0, 400)}`), ...r.problems.map(t => `  problem: ${t}`)].join('\n'), r)
+    return r.problems.length ? 1 : 0
+  } finally { x.close(); execStore = undefined }
+}
+
+async function cmdMigrate(p: Parsed): Promise<number> {
+  const { inventory, migrate } = await import('../server/migrate.ts')
+  const x = await openExec(p)
+  try {
+    const only = opt(p, 'workspace')
+    if (p.flags.has('dry-run')) {
+      const inv = await inventory(x, only)
+      const lines = ['Inventory (nothing was changed):', `Executor: ${inv.executor}`, ...inv.runs.map(r => `  ${`${r.workspace}/${r.ref}`.padEnd(36)} ${r.action.padEnd(13)} ${r.why}${r.jobs ? `; ${r.jobs} queued job(s)` : ''}${r.checkpoints.length ? `; checkpoints ${r.checkpoints.map(c => `${c.id} ${c.state}`).join(', ')} keep their mode` : ''}${r.presentations.length ? `; open presentations ${r.presentations.join(', ')}` : ''}`),
+        'Repositories:', ...inv.repositories.map(r => `  ${r.workspace} ${r.path.padEnd(20)} ${r.branch ?? '(detached)'} ${r.head?.slice(0, 10) ?? '?'}${r.dirty.length ? ` — ${r.dirty.length} uncommitted` : ''}`),
+        ...inv.unattributed.map(u => `Uncommitted in ${u.workspace}, outside run folders (not moved): ${u.paths.join(', ')}`)]
+      out(lines.join('\n'), inv)
+      return 0
+    }
+    const by = opt(p, 'by')
+    if (!by?.trim()) throw new UsageError('--by <name> is required: who migrates')
+    const env = (await giteaOf(p)) ? await (await giteaOf(p))!.gitEnv() : {}
+    const r = await migrate(x, { workspace: only, by: by.trim(), env, allowLive: p.flags.has('allow-live-executor') })
+    out([`Recovery copies: ${r.backup}`, `Migrated: ${r.migrated.join(', ') || '—'}`, `Already migrated: ${r.already.join(', ') || '—'}`, `Kept where they are:`, ...r.kept.map(k => `  ${k}`), ...(r.blocked.length ? ['Blocked:', ...r.blocked.map(b => `  ${b}`)] : []), ...(r.problems.length ? ['Problems:', ...r.problems.map(b => `  ${b}`)] : [])].join('\n'), { ...r, inventory: undefined })
+    return r.problems.some(x => !/uncommitted files outside run folders/.test(x)) || r.blocked.length ? 1 : 0
+  } catch (e) {
+    if (e instanceof Error && !(e instanceof UsageError) && !(e instanceof RequestError)) throw new Refused(e.message)
+    throw e
+  } finally { x.close(); execStore = undefined }
+}
+
+// Run branch cleanup (improve_wfrun p3, docs/storage.md).
+async function cmdBranches(p: Parsed): Promise<number> {
+  const m = await import('../server/branchCleanup.ts')
+  const [sub, arg] = p.positional
+  const x = await openExec(p)
+  try {
+    const c = await m.cleanupContext(x)
+    const by = () => { const v = opt(p, 'by'); if (!v) throw new UsageError('--by <name> is required'); return v }
+    const { workspaces } = await import('../server/migrate.ts')
+    const only = opt(p, 'workspace')
+    const all = async () => { const list = await workspaces(x); const pick = list.filter(w => !only || w.reg.id === only); if (only && !pick.length) throw new Refused(`workspace "${only}" is not available`); return pick }
+    if (sub === 'inventory') {
+      const rows = []
+      for (const ws of await all()) rows.push(await m.inventory(c, ws))
+      const lines = rows.map(r => `  ${r.workspace.padEnd(16)} ${String(r.totals.refs).padStart(4)} run branches in ${Object.keys(r.totals.byRepository).length} repositories, ${r.unknown.length} with no owner here${r.unread.length ? `, ${r.unread.length} remotes unread` : ''}`)
+      out([`Run branches: ${rows.reduce((n, r) => n + r.totals.refs, 0)}.`, ...lines].join('\n'), { workspaces: rows })
+      return rows.some(r => r.unread.length) ? 1 : 0
+    }
+    if (sub === 'preview') {
+      const previews = []
+      for (const ws of await all()) previews.push(await m.previewWorkspace(c, ws, p.opts.get('run')))
+      const runs = previews.flatMap(v => v.runs)
+      const selection = m.selectionFrom(runs)
+      const file = opt(p, 'selection-out')
+      if (file) await writeFile(file, `${JSON.stringify(selection, null, 1)}\n`)
+      const lines = runs.map(r => `  ${`${r.workspace}:${r.ref}`.padEnd(44)} ${r.eligible ? `can go: ${r.refs.filter(z => z.eligible).length} branches` : `stays: ${r.reasons[0] ?? ''}`}`)
+      out([`${runs.filter(r => r.eligible).length} of ${runs.length} runs could lose ${selection.reduce((n, s) => n + s.refs.length, 0)} branches (nothing was changed).${file ? ` Selection: ${file}.` : ''}`, ...lines, m.STORAGE_LIMITS].join('\n'), { previews, selection, limits: m.STORAGE_LIMITS })
+      return 0
+    }
+    const wsOf = async (id: string) => { const w = (await workspaces(x)).find(z => z.reg.id === id); if (!w) throw new Refused(`workspace "${id}" is not available`); return w }
+    if (sub === 'delete') {
+      const file = opt(p, 'selection'); if (!file) throw new UsageError('--selection <file.json> is required')
+      const selection = JSON.parse(await readFile(file, 'utf8'))
+      const r = await m.deleteSelection(c, wsOf, selection, { by: by(), dryRun: p.flags.has('dry-run') })
+      out(r.map(z => `  ${z.workspace}:${z.ref} ${z.outcome}${z.reasons.length ? `: ${z.reasons[0]}` : ''}\n${z.refs.map(v => `    ${v.result} ${v.ref} at ${v.oid.slice(0, 12)}${v.detail ? ` (${v.detail})` : ''}`).join('\n')}`).join('\n'), { results: r })
+      return r.every(z => z.outcome === 'done') ? 0 : 1
+    }
+    if (sub === 'recreate') {
+      if (!arg || !only) throw new UsageError('wfe branches recreate <wf>/<run> --workspace <id> --by <name> [--dry-run]')
+      const [workflow, run] = arg.split('/')
+      const r = await m.recreateBranches(c, await wsOf(only), { workflow, run }, { by: by(), dryRun: p.flags.has('dry-run') })
+      out(r.refs.map(v => `  ${v.result} ${v.ref} at ${v.oid.slice(0, 12)}${v.detail ? ` (${v.detail})` : ''}`).join('\n') || '  (nothing was deleted for this run)', r)
+      return r.refs.some(v => v.result === 'conflict' || v.result === 'failed') ? 1 : 0
+    }
+    throw new UsageError('wfe branches inventory|preview|delete|recreate')
+  } finally { x.close(); execStore = undefined }
+}
+
+// Backup of retired runs (improve_wfrun p3, docs/storage.md).
+async function cmdBackup(p: Parsed): Promise<number> {
+  const b = await import('../server/runBackup.ts')
+  const [sub] = p.positional
+  const need = (k: string) => { const v = opt(p, k); if (!v) throw new UsageError(`--${k} is required`); return v }
+  if (sub === 'restore') {
+    const into = resolve(need('into'))
+    const from = opt(p, 'from')
+    const cfg = from ? { file: null, host: null, path: resolve(from).replace(/\/+$/, ''), ssh: [], keep: 7, checkouts: {} } : await b.loadBackupConfig(areaDir(p))
+    if (!cfg) throw new Refused('no backup destination is configured; pass --from <path>')
+    const r = await b.restoreGeneration(cfg, { generation: opt(p, 'generation'), into })
+    out(r.failures.length ? [`Generation ${r.id} does not verify; no recovery area was made.`, ...r.failures.slice(0, 20).map(f => `  ${f}`), `Runs affected: ${r.affected.join(', ') || '(all)'}`].join('\n') : `Generation ${r.id} restored and verified in ${r.seconds} s: ${r.files} files, ${(r.bytes / 2 ** 30).toFixed(2)} GiB. Isolated area: ${r.area}`, r)
+    return r.failures.length ? 1 : 0
+  }
+  if (sub === 'rehearse') {
+    const r = await b.rehearse({ into: resolve(need('into')), by: need('by'), failureCases: !p.flags.has('no-failure-cases'), only: p.opts.get('run') })
+    const bad = r.checks.filter(c => !c.ok)
+    out([`Rehearsal of ${r.generation} on ${r.host}: ${r.ok ? 'every check passed' : `${bad.length} of ${r.checks.length} checks failed`} in ${r.seconds} s. ${r.restored.runs} runs restored, ${(r.restored.bytes / 2 ** 30).toFixed(2)} GiB; ${r.compared} comparisons.`, ...bad.map(c => `  FAILED ${c.check}${c.run ? ` ${c.run}` : ''}: ${c.detail}`), `Details: ${join(resolve(need('into')), 'rehearsal.json')}`].join('\n'), r)
+    return r.ok ? 0 : 1
+  }
+  const area = areaDir(p)
+  const x = await openExec(p)
+  try {
+    const cfg = await b.loadBackupConfig(area)
+    if (sub === 'create') {
+      const r = await b.createBackup(x, { by: need('by') })
+      const covered = r.manifest?.runs.filter(z => z.covered).length ?? 0
+      out(r.outcome === 'failed' ? [`Backup failed; the last generation stays in place.`, ...r.failures.map(f => `  ${f}`)].join('\n') : [`Backup ${r.id}: ${r.outcome}. ${covered} of ${r.manifest!.runs.length} retired runs covered, ${r.manifest!.identityOnly.length} other runs for identity only, ${r.manifest!.files} files, ${(r.manifest!.bytes / 2 ** 30).toFixed(2)} GiB.`, ...r.failures.map(f => `  ${f}`), ...r.manifest!.runs.filter(z => !z.covered).map(z => `  not covered ${z.workspace}:${z.ref}: ${z.reasons[0]}`)].join('\n'), { ...r, manifest: undefined })
+      return r.outcome === 'failed' ? 1 : 0
+    }
+    if (sub === 'status') {
+      const o = await b.backupOverview(x) as { configured: boolean; destination: string | null; latest: string | null; status: Awaited<ReturnType<typeof b.readStatus>>; ageSeconds: number | null; generations: string[]; retired: number; uncovered: string[]; outside: { identityOnly: number; legacy: number } | null }
+      out(!o.configured ? 'No backup destination is configured.' : [`Last verified: ${o.status.last ? `${o.status.last.id}, ${Math.round((o.ageSeconds ?? 0) / 3600)} h ago, ${(o.status.last.bytes / 2 ** 30).toFixed(2)} GiB` : 'none'}. At the destination: LATEST ${o.latest ?? 'none'}, ${o.generations.length} generations.`, `Retired runs: ${o.retired}; not covered at their current generation: ${o.uncovered.length ? o.uncovered.join(', ') : 'none'}.`, `Outside the guarantee: ${o.outside ? `${o.outside.identityOnly} runs for identity only, ${o.outside.legacy} legacy names` : 'unknown'}; Gitea, workspaces, credentials.`, ...(o.status.lastAttempt ? [`Last attempt: ${o.status.lastAttempt.outcome} at ${o.status.lastAttempt.at}${o.status.lastAttempt.failures.length ? `: ${o.status.lastAttempt.failures.join('; ')}` : ''}`] : [])].join('\n'), o)
+      return 0
+    }
+    if (!cfg) throw new Refused('no backup destination is configured (run-backup.json)')
+    const dest = new b.Dest(cfg)
+    if (sub === 'list') {
+      const ids = await dest.generations(), latest = await dest.latest()
+      const rows = []
+      for (const id of ids) { const m = await b.readManifest(dest, id).catch(() => null); rows.push({ id, latest: id === latest, covered: m?.runs.filter(r => r.covered).length ?? null, runs: m?.runs.length ?? null, bytes: m?.bytes ?? null, release: m?.source.release?.agdevworld ?? null }) }
+      out(rows.map(r => `  ${r.id}${r.latest ? ' LATEST' : ''}  ${r.covered ?? '?'}/${r.runs ?? '?'} runs  ${r.bytes === null ? '?' : (r.bytes / 2 ** 30).toFixed(2)} GiB`).join('\n') || '  (no generations)', { generations: rows })
+      return 0
+    }
+    if (sub === 'verify') {
+      const r = await b.verifyGeneration(dest, opt(p, 'generation'))
+      out(r.ok ? `Generation ${r.id}: every file and retained ref verified at ${dest.where}.` : [`Generation ${r.id ?? '(none)'} does NOT verify:`, ...r.failures.slice(0, 30).map(f => `  ${f}`), `Runs affected: ${r.affected.join(', ') || '(none named)'}`].join('\n'), r)
+      return r.ok ? 0 : 1
+    }
+    if (sub === 'reinstate') {
+      const r = await b.reinstate(x, cfg, { generation: opt(p, 'generation'), workspace: opt(p, 'workspace'), dryRun: p.flags.has('dry-run'), by: need('by') })
+      const changed = r.items.filter(i => i.action !== 'present')
+      out([`Reinstating from ${r.generation}${p.flags.has('dry-run') ? ' (dry run, nothing changed)' : ''}: ${changed.length} of ${r.items.length} items.`, ...changed.map(i => `  ${i.action} ${i.item}${i.detail ? `: ${i.detail}` : ''}`), ...r.losses.map(l => `  LOSS ${l}`)].join('\n'), r)
+      return 0
+    }
+    throw new UsageError('wfe backup create|status|list|verify|restore|rehearse|reinstate')
+  } finally { x.close(); execStore = undefined }
+}
+
+const COMMANDS: Record<string, (p: Parsed) => Promise<number>> = {
+  backup: cmdBackup, branches: cmdBranches,
+  runs: cmdRuns, 'rename-project': cmdRenameProject, observe: cmdObserve, projects: cmdProjects, knowledge: cmdKnowledge, mind: cmdMind, summon: cmdSummon, run: cmdRun, delegate: cmdDelegate, review: cmdReview, present: cmdPresent, share: cmdShare, project: cmdProject, repo: cmdRepo, gitea: cmdGitea, dashboard: cmdDashboard, exec: cmdExec, request: cmdRequest, peer: cmdPeer, teamwork: cmdTeamwork, cluster: cmdCluster, manage: cmdManage, submit: cmdSubmit,
+  create: cmdCreate, placement: cmdPlacement, register: cmdRegister, list: cmdList, status: cmdStatus, validate: cmdValidate,
+  approve: cmdApprove, arrange: cmdArrange, 'add-repo': cmdAddRepo, workflow: cmdWorkflow, serve: cmdServe, setup: cmdSetup,
+  version: cmdVersion, nodes: cmdNodes, workspace: cmdWorkspace, draft: cmdDraft, boast: cmdBoast, context: cmdContext, challenge: cmdChallenge, conversation: cmdConversation, discussion: cmdConversation, dialogue: cmdDialogue, coordinate: cmdCoordinate,
+}
+
+// Execution coordination (improve_wfrun p4, docs/coordination.md).
+async function cmdCoordinate(p: Parsed): Promise<number> {
+  return coordinateCommand({
+    positional: p.positional, opt: k => opt(p, k), opts: k => p.opts.get(k) ?? [], flag: k => p.flags.has(k), out,
+    usage: m => new UsageError(m), refused: (m, d) => new Refused(m, d),
+    exec: () => openExec(p), workspace: id => workspaceNamed(p, id),
+    resolveRun: async (ws, text) => (await import('../server/runs.ts')).resolveRef(ws, text),
+  })
+}
+
+// Challenges (challenge p1, docs/challenges.md).
+async function cmdChallenge(p: Parsed): Promise<number> {
+  return challengeCommand({
+    positional: p.positional, opt: k => opt(p, k), opts: k => p.opts.get(k) ?? [], flag: k => p.flags.has(k), out,
+    usage: m => new UsageError(m), refused: (m, d) => new Refused(m, d), isUsage: e => e instanceof UsageError || e instanceof Refused,
+    area: () => areaDir(p), env: async () => { const g = await giteaOf(p); return g ? g.gitEnv() : {} },
+  })
+}
+
+// Conversations (project_migration p8 … challenge p2, docs/conversations.md);
+// `wfe discussion` is the same command under its former name.
+async function cmdConversation(p: Parsed): Promise<number> {
+  return conversationCommand({
+    positional: p.positional, opt: k => opt(p, k), opts: k => p.opts.get(k) ?? [], flag: k => p.flags.has(k), out,
+    usage: m => new UsageError(m), refused: (m, d) => new Refused(m, d),
+    exec: () => openExec(p), area: () => areaDir(p),
+  })
+}
+
+// Character dialogue (argue p5, docs/dialogue.md).
+async function cmdDialogue(p: Parsed): Promise<number> {
+  return dialogueCommand({
+    positional: p.positional, opt: k => opt(p, k), flag: k => p.flags.has(k), out,
+    usage: m => new UsageError(m), exec: () => openExec(p), area: () => areaDir(p),
+  })
+}
+
+// Scoped context (workflow_editor p13, docs/context.md).
+async function cmdContext(p: Parsed): Promise<number> {
+  return contextCommand({
+    positional: p.positional, opt: k => opt(p, k), opts: k => p.opts.get(k) ?? [], flag: k => p.flags.has(k), out,
+    usage: m => new UsageError(m), refused: (m, d) => new Refused(m, d),
+    area: () => areaDir(p),
+    access: async () => { const g = await giteaOf(p); return { registryFile: registryFile(p), area: areaDir(p), gitea: g, giteaProblem: g ? undefined : `no Gitea setting at ${giteaFile(p)}` } },
+    workspace: () => workspace(p), exec: () => openExec(p),
+    resolveRun: async (ws, text) => (await import('../server/runs.ts')).resolveRef(ws, text),
+  })
+}
+
+// Drafts (workflow_editor p20, docs/drafts.md): the service's code, on its storage.
+async function cmdDraft(p: Parsed): Promise<number> {
+  const [sub, arg] = p.positional
+  const ws = await workspace(p)
+  const g = await giteaOf(p)
+  if (!g) throw new Refused(`drafts are published through Gitea, which is not configured here (${giteaFile(p)})`)
+  const ctx = { registryFile: registryFile(p), area: areaDir(p), gitea: g }
+  const d = await import('../server/drafts.ts')
+  const store = new d.DraftStore(areaDir(p))
+  const need = (k: string) => { const v = opt(p, k); if (!v) throw new UsageError(`--${k} is required`); return v }
+  const revision = () => { const n = Number(need('revision')); if (!Number.isInteger(n)) throw new UsageError('--revision is a number'); return n }
+  const id = () => { if (!arg) throw new UsageError(`draft ${sub} needs a draft id`); return arg }
+  const line = (x: import('../shared/drafts.ts').DraftMeta) => `  ${x.id}  ${x.file.padEnd(24)} r${String(x.revision).padEnd(4)} ${x.state.padEnd(9)} by ${x.author}, saved ${x.updated}${x.apply ? `; last apply ${x.apply.outcome}` : ''}`
+  const said = (x: import('../shared/drafts.ts').DraftRecord, what: string) => { out(`${what}\n${line(d.draftMeta(x))}`, d.draftMeta(x)); return 0 }
+  try {
+    if (sub === 'list') {
+      const list = (await store.list({ project: ws.reg.project, file: arg })).map(d.draftMeta)
+      out(list.length ? list.map(line).join('\n') : 'No open drafts.', { drafts: list })
+      return 0
+    }
+    if (sub === 'show') {
+      const r = await d.readDraft(ctx, store, ws.reg, id())
+      const errors = r.issues.filter(i => i.severity === 'error')
+      out([line(r.draft), `base: ${r.draft.base.source?.definition ? `${r.draft.base.source.definition.repository}@${r.draft.base.source.definition.revision.slice(0, 10)}` : r.draft.provenance.kind}`, `latest version: ${r.sourceProblem ?? (r.latest?.deleted ? 'deleted' : r.latest?.changed ? 'changed since this draft began' : 'unchanged')}`, `validation: ${r.problem ? r.problem.message : errors.length ? errors.map(i => i.message).join('; ') : 'no errors'}`, '', r.text ?? ''].join('\n'), r)
+      return 0
+    }
+    if (sub === 'start') { if (!arg) throw new UsageError('draft start needs a workflow file'); return said(await d.startDraft(ctx, store, ws.reg, { file: arg, by: need('by'), another: p.flags.has('another') }), 'Started from the published definition.') }
+    if (sub === 'save') return said(await d.saveDraft(store, id(), { revision: revision(), by: need('by'), text: readFileSync(need('file') === '-' ? 0 : resolve(need('file')), 'utf8') }), 'Saved. Runs use it once applied.')
+    if (sub === 'discard') return said(await d.discardDraft(store, id(), { revision: revision(), by: need('by') }), 'Discarded.')
+    if (sub === 'compare') {
+      const r = await d.compareDraft(ctx, store, ws.reg, id())
+      const c = r.comparison
+      out(c.state === 'conflict' ? `conflict (${c.conflict.kind}): ${c.conflict.message}` : `${c.state}${r.check?.problem || r.check?.issues.length ? `; would be invalid: ${r.check.problem ?? r.check.issues.map(i => i.message).join('; ')}` : ''}`, r)
+      return 0
+    }
+    if (sub === 'apply') {
+      const r = await d.applyDraft(ctx, store, ws.reg, id(), { revision: revision(), by: need('by'), key: opt(p, 'key') })
+      const src = r.apply.result
+      out(r.ok ? `Applied${r.duplicate ? ' (found applied earlier)' : ''}: ${src?.definition ? `${src.definition.repository}@${src.definition.revision.slice(0, 10)}` : ''}${r.apply.root ? `, pin ${r.apply.root.repository}@${r.apply.root.commit.slice(0, 10)}` : ''}. New runs use it.` : `Not applied (${r.apply.outcome}): ${r.apply.error}${r.issues?.length ? `\n${r.issues.map(i => `  ${i.message}`).join('\n')}` : ''}\nThe draft is kept.`, r)
+      return r.ok ? 0 : 1
+    }
+    if (sub === 'try') {
+      const dr = await store.read(id())
+      if (dr.project !== ws.reg.project) throw new Refused(`draft ${dr.id} is of project ${dr.project}`)
+      if (dr.revision !== revision()) throw new Refused(`draft ${dr.id} is at revision ${dr.revision}, not ${opt(p, 'revision')}`)
+      const x = await openExec(p)
+      try {
+        const r = await x.request({ workspace: ws.reg.id, workflow: dr.file, text: readFileSync(need('braindump') === '-' ? 0 : resolve(need('braindump')), 'utf8'), author: need('author'), receipt: opt(p, 'receipt') ?? `cli-${Date.now()}-${process.pid}`, via: 'cli', trial: { file: dr.file, sha256: dr.sha256, draft: { id: dr.id, revision: dr.revision, author: dr.author, text: dr.text } } })
+        out(`${r.duplicate ? 'Already started' : 'Started'} ${r.ref.workflow}/${r.ref.run}, trying revision ${dr.revision} of ${dr.id} on the published code.`, r)
+        return 0
+      } finally { x.close() }
+    }
+    if (sub === 'edits' || sub === 'import') {
+      const m = await import('../server/localEdits.ts')
+      if (sub === 'import') { if (!arg) throw new UsageError('draft import needs a workflow file'); return said(await m.importEdit(ctx, store, ws.reg, { file: arg, sha256: need('sha256'), by: need('by') }), 'Imported; the checkout is unchanged and nothing is applied.') }
+      const v = await m.localEdits(ctx, store, ws.reg)
+      out(v.edits.length ? v.edits.map(e => `  ${e.file.padEnd(24)} ${e.edit.padEnd(14)} sha256 ${e.sha256}${e.draft ? `  (draft ${e.draft.id}, ${e.draft.state})` : ''}`).join('\n') : `No workflow edits only in this checkout.${v.available ? '' : ` (${v.reason})`}`, v)
+      return 0
+    }
+    throw new UsageError('draft needs list, show, start, save, compare, try, apply, discard, edits or import')
+  } catch (e) {
+    if (e instanceof RequestError) throw new Refused(e.message)
+    throw e
+  }
+}
+
+// The workspace beside the published source (improve_wfrun p1).
+async function cmdWorkspace(p: Parsed): Promise<number> {
+  const [sub] = p.positional
+  if (sub === 'relocate') return cmdWorkspaceRelocate(p)
+  if (sub === 'migrate') return cmdWorkspaceMigrate(p)
+  if (sub !== 'status' && sub !== 'sync') throw new UsageError('workspace needs status, sync, relocate or migrate')
+  const ws = await workspace(p)
+  const g = await giteaOf(p)
+  if (!g) throw new Refused(`the published source is read from Gitea, which is not configured here (${giteaFile(p)})`)
+  const ctx = { registryFile: registryFile(p), area: areaDir(p), gitea: g }
+  const m = await import('../server/workspaceSync.ts')
+  const line = (r: import('../server/workspaceSync.ts').RepoRelation) => `  ${r.path.padEnd(24)} ${r.initialized ? `${(r.branch ?? 'detached').padEnd(10)} ${r.head?.slice(0, 10) ?? '-'} → ${r.published?.slice(0, 10) ?? '-'}  ${r.relation}${r.behind ? `, ${r.behind} published commit${r.behind === 1 ? '' : 's'} missing` : ''}${r.ahead ? `, ${r.ahead} local commit${r.ahead === 1 ? '' : 's'}` : ''}${r.dirty ? `; ${r.dirty} uncommitted` : ''}` : 'not checked out'}${r.problem && r.initialized ? `  (${r.problem})` : ''}`
+  try {
+    if (sub === 'status') {
+      const r = await m.workspaceRelation(ctx, ws, { fresh: p.flags.has('refresh') })
+      out([`${ws.reg.id}: published ${r.source.repository}@${r.source.commit.slice(0, 10)} (${r.source.branch}, fetch ${r.source.fetch.state} ${r.source.fetch.at})`, line(r.root), ...r.submodules.map(line), r.summary, r.next === 'sync' ? 'Next: wfe workspace sync' : r.next === 'resolve-by-hand' ? 'Next: reconcile it by hand (published runs are unaffected).' : ''].filter(Boolean).join('\n'), r)
+      return 0
+    }
+    const r = await m.syncWorkspace(ctx, ws, { dryRun: p.flags.has('dry-run') })
+    out([r.message, ...r.steps.map(x => `  ${x.path.padEnd(24)} ${x.state.padEnd(9)} ${x.before?.slice(0, 10) ?? '-'} → ${x.after?.slice(0, 10) ?? '-'}  ${x.detail}`), r.recovery ?? ''].filter(Boolean).join('\n'), r)
+    return r.ok ? 0 : 1
+  } catch (e) {
+    if (e instanceof RequestError) throw new Refused(e.message, e.detail)
+    throw e
+  }
+}
+
+// Converting old-layout workspaces into envelopes (better_git_strategy p1, docs/storage.md).
+async function cmdWorkspaceMigrate(p: Parsed): Promise<number> {
+  const m = await import('../server/layoutMigrate.ts')
+  const ctx = { registryFile: registryFile(p), area: areaDir(p), sessions: opt(p, 'sessions') }
+  const ids = p.positional.slice(1)
+  const all = p.flags.has('all')
+  if (!ids.length && !all) throw new UsageError('migrate needs workspace ids, or --all')
+  try {
+    const pv = await m.migrationPreview(ctx, all ? undefined : ids)
+    if (!p.flags.has('apply')) {
+      const line = (x: import('../server/layoutMigrate.ts').MigrationPlan) => x.layout === 'envelope' ? `  ${x.id.padEnd(16)} already an envelope` : [
+        `  ${x.id.padEnd(16)} ${x.path} (${x.layout}): ${x.runs.length} run checkouts, retention ${x.retention ? 'yes' : 'no'}, dialogue ${x.dialogue ? 'yes' : 'no'}, ${x.dirty} uncommitted entries kept, ${x.sessions} session folders, ${x.presentations} presentation configs`,
+        x.localMoves.length ? `      to the workspace root: ${x.localMoves.join(', ')} (declare in project.yaml workspace.run-files what runs need)` : '',
+        x.localKept.length ? `      stays in source/.local/: ${x.localKept.join(', ')}` : '',
+        x.worktrees.length ? `      linked worktrees repaired: ${x.worktrees.join(', ')}` : '',
+        x.problems.length ? `      refused: ${x.problems.join('; ')}` : ''].filter(Boolean).join('\n')
+      out([`Preview (nothing was changed):`, ...pv.plans.map(line), pv.ok ? 'Repeat with --apply (services stopped) to convert.' : 'Some are refused.'].join('\n'), pv)
+      return pv.ok ? 0 : 1
+    }
+    const done = []
+    for (const x of pv.plans) {
+      if (x.layout === 'envelope' && !x.problems.length) continue
+      const j = await m.migrateWorkspace(ctx, x.id, { by: opt(p, 'by') })
+      done.push(j)
+      process.stderr.write(`${m.migrationSummary(j).join('\n')}\n`)
+    }
+    out(`Converted ${done.filter(j => j.finished).length} workspace${done.length === 1 ? '' : 's'}.`, { journals: done })
+    return 0
+  } catch (e) {
+    if (e instanceof RequestError) throw new Refused(e.message, e.detail)
+    throw e
+  }
+}
+
+// Relocating workspaces and the project root (agedev_selfassembly p4, docs/placement.md).
+async function cmdWorkspaceRelocate(p: Parsed): Promise<number> {
+  const m = await import('../server/workspaceRelocate.ts')
+  const ctx = { registryFile: registryFile(p), area: areaDir(p) }
+  const ids = p.positional.slice(1)
+  const all = p.flags.has('all')
+  const verify = opt(p, 'verify') === 'content' ? 'content' as const : 'metadata' as const
+  try {
+    if (p.flags.has('resume')) {
+      const j = await m.relocate(ctx, { resume: true, sessions: opt(p, 'sessions') })
+      out(m.relocationSummary(j).join('\n'), j)
+      return 0
+    }
+    if (!ids.length && !all) throw new UsageError('relocate needs workspace ids, or --all')
+    const o = { workspaces: all ? undefined : ids, to: opt(p, 'to'), verify, by: opt(p, 'by'), sessions: opt(p, 'sessions') }
+    if (!p.flags.has('apply')) {
+      const pv = await m.relocationPreview(ctx, o)
+      out([`Preview: ${pv.items.length} workspace${pv.items.length === 1 ? '' : 's'} to ${pv.to}${pv.ok ? '' : ' (refused)'}`,
+        ...pv.items.map(i => `  ${i.id.padEnd(16)} ${i.from} → ${i.to}  ${i.sameDevice ? 'same volume' : 'another volume'}${i.worktrees.length ? `; worktrees stay with the source: ${i.worktrees.join(', ')}` : ''}${i.alternates.length ? `; alternates ${i.alternates.join(', ')}` : ''}${i.problems.length ? `\n      refused: ${i.problems.join('; ')}` : ''}`),
+        pv.ok ? 'Nothing was changed. Repeat with --apply to copy, verify and switch; the sources stay.' : 'Nothing was changed.'].join('\n'), pv)
+      return pv.ok ? 0 : 1
+    }
+    const j = await m.relocate(ctx, o)
+    out(m.relocationSummary(j).join('\n'), j)
+    return 0
+  } catch (e) {
+    if (e instanceof RequestError) throw new Refused(e.message, e.detail)
+    throw e
+  }
+}
+
+async function cmdPlacement(p: Parsed): Promise<number> {
+  const m = await import('../server/placement.ts')
+  const [sub, dir] = p.positional
+  const area = areaDir(p)
+  if (sub === 'set') {
+    if (!dir) throw new UsageError('placement set <absolute folder>')
+    try {
+      const r = await m.setPlacement(area, resolve(dir), { instance: process.env.AGDEV_INSTANCE_ID })
+      out(`project root: ${r.projectRoot} (${r.file}). New and obtained workspaces go there; existing ones stay until relocated (wfe workspace relocate).`, r)
+      return 0
+    } catch (e) { if (e instanceof RequestError) throw new Refused(e.message); throw e }
+  }
+  if (sub && sub !== 'show') throw new UsageError('placement [show] | set <folder>')
+  const pl = await m.loadPlacement(area)
+  const problem = await m.rootProblem(pl)
+  const reg = await (await import('../server/registry.ts')).loadRegistry(registryFile(p))
+  const outside = reg.workspaces.filter(w => !resolve(w.path).startsWith(resolve(pl.projectRoot) + '/')).map(w => `${w.id} (${w.path})`)
+  out([`project root: ${pl.projectRoot}${pl.configured ? '' : ' (not configured: the area itself)'}`, problem ? `NOT AVAILABLE: ${problem}` : 'available',
+    outside.length ? `workspaces elsewhere: ${outside.join(', ')}` : 'every workspace is under it'].join('\n'), { ...pl, available: !problem, problem, outside })
+  return problem ? 1 : 0
+}
+
+// Project access (project_migration p4): reads of any managed project.
+async function cmdProjects(p: Parsed): Promise<number> {
+  return projectsCommand({
+    positional: p.positional, opt: k => opt(p, k), flag: k => p.flags.has(k), out, json: () => json,
+    usage: m => new UsageError(m),
+    ctx: async () => { const g = await giteaOf(p); return { registryFile: registryFile(p), area: areaDir(p), gitea: g, giteaProblem: g ? undefined : `no Gitea setting at ${giteaFile(p)}`, refresh: p.flags.has('refresh') } },
+  })
+}
+
+// Reusable findings (improve_workflow p2): over the same project access.
+async function cmdKnowledge(p: Parsed): Promise<number> {
+  return knowledgeCommand({
+    positional: p.positional, opt: k => opt(p, k), opts: k => p.opts.get(k) ?? [], flag: k => p.flags.has(k), out,
+    usage: m => new UsageError(m),
+    currentProject: async () => (await workspace(p).catch(() => null))?.reg.project ?? undefined,
+    ctx: async () => { const g = await giteaOf(p); return { registryFile: registryFile(p), area: areaDir(p), gitea: g, giteaProblem: g ? undefined : `no Gitea setting at ${giteaFile(p)}`, refresh: p.flags.has('refresh') } },
+  })
+}
+
+// The mind repository (summoner p1, docs/mind.md).
+async function cmdMind(p: Parsed): Promise<number> {
+  return mindCommand({
+    positional: p.positional.slice(0), opt: k => opt(p, k), flag: k => p.flags.has(k), out,
+    usage: m => new UsageError(m), refused: m => new Refused(m),
+    ctx: async () => { const g = await giteaOf(p); return { registryFile: registryFile(p), area: areaDir(p), gitea: g, giteaProblem: g ? undefined : `no Gitea setting at ${giteaFile(p)}` } },
+  })
+}
+
+// Summoning a plan's projects (summoner p2, docs/summon.md).
+async function cmdSummon(p: Parsed): Promise<number> {
+  return summonCommand({
+    positional: p.positional.slice(0), opt: k => opt(p, k), flag: k => p.flags.has(k), out,
+    usage: m => new UsageError(m), refused: m => new Refused(m),
+    ctx: async () => { const g = await giteaOf(p); return { registryFile: registryFile(p), area: areaDir(p), gitea: g, giteaProblem: g ? undefined : `no Gitea setting at ${giteaFile(p)}` } },
+    confirm: async question => {
+      if (!process.stdin.isTTY) return false
+      const { createInterface } = await import('node:readline/promises')
+      const rl = createInterface({ input: process.stdin, output: process.stdout })
+      try { return /^y(es)?$/i.test((await rl.question(`${question} [y/N] `)).trim()) } finally { rl.close() }
+    },
+  })
+}
+
+// The person's node catalog (p7/ex1): templates, examples, instantiation.
+async function cmdNodes(p: Parsed): Promise<number> {
+  const reg = await loadRegistry(registryFile(p)).catch(() => null)
+  return nodesCommand({
+    positional: p.positional, opt: k => opt(p, k), opts: k => p.opts.get(k) ?? [], flag: k => p.flags.has(k),
+    area: () => areaDir(p), by: () => reg?.approver || undefined,
+    workspace: () => workspace(p), workflowFile, out,
+    usage: m => new UsageError(m), refused: (m, d) => new Refused(m, d),
+  })
+}
+
+// Boast (p12, docs/boast.md): a project's showcase page, read-only.
+async function cmdBoast(p: Parsed): Promise<number> {
+  const [first, ...rest] = p.positional
+  if (first === 'reference') { console.log(readFileSync(join(dirname(fileURLToPath(import.meta.url)), '..', 'docs', 'boast.md'), 'utf8')); return 0 }
+  const project = first === 'status' ? rest[0] : first
+  if (!project) throw new UsageError('boast needs a project id')
+  const source = opt(p, 'source') ?? 'committed'
+  if (source !== 'committed' && source !== 'worktree') throw new UsageError('--source is committed or worktree')
+  const g = await giteaOf(p)
+  const { boastState } = await import('../server/boast.ts')
+  const { loadPresentConfig } = await import('../server/present.ts')
+  const s = await boastState({ registryFile: registryFile(p), area: areaDir(p), gitea: g, giteaProblem: g ? undefined : `no Gitea setting at ${giteaFile(p)}`, refresh: p.flags.has('refresh') }, project, { source, workspace: opt(p, 'workspace') })
+  const base = (() => { try { return loadPresentConfig(areaDir(p)).answerBase } catch { return null } })()
+  const reg = await loadRegistry(registryFile(p)).catch(() => null)
+  const ws = s.workspace?.id ?? reg?.workspaces.find(w => w.project === project)?.id
+  const editor = base && ws ? `${base}#/ws/${encodeURIComponent(ws)}` : null
+  const page = base && s.entry ? new URL(s.entry, base).href : null
+  const fetch = s.provenance.fetch
+  out([
+    `${project}: ${s.state === 'present' ? 'boast/index.html is' : 'no boast/index.html'} ${s.source === 'committed' ? `on ${s.provenance.revision.ref ?? 'main'} at ${s.commit}` : `in workspace ${s.workspace?.id}'s working tree (HEAD ${short(s.commit)}${s.workspace?.dirty ? ', boast/ has uncommitted changes' : ''})`}`,
+    ...(fetch?.state === 'stale' ? [`  fetched ${fetch.at}; Gitea could not be read now: ${fetch.error}`] : []),
+    ...(page ? [`  page:           ${page}`] : []),
+    ...(editor ? [`  Project Editor: ${editor}`] : base ? [] : ['  (present.json has no answerBase: no LAN address to name)']),
+  ].join('\n'), { ...s, urls: { page, editor } })
+  return 0
+}
+
+async function cmdVersion(p: Parsed): Promise<number> {
+  let instance: string | null = null
+  try { instance = areaInstance(areaDir(p)) } catch (e) { if (!(e instanceof UsageError)) throw e }
+  const v = { ...codeVersion(), instance }
+  out(v.release ? `release of agdev ${v.release.agdevworld} (built ${v.release.built})\n${v.package}` : `source checkout (no RELEASE.json)\n${v.package}`, v)
+  return 0
+}
+
+export async function main(argv: string[]): Promise<number> {
+  // On a remote worker (project_migration p7, docs/workers.md) wfe is the
+  // coordinator's client; only its shared areas are read here.
+  if (process.env.WFE_WORKER_AREA && !process.env.WFE_REGISTRY && !remoteLocal) {
+    const { remoteMain } = await import('./remote.ts')
+    return remoteMain(argv, a => { remoteLocal = true; return main(a) })
+  }
+  let p: Parsed
+  try { p = parse(argv) } catch (e) { console.error(`wfe: ${(e as Error).message}`); return 2 }
+  json = p.flags.has('json')
+  const [cmd, ...rest] = p.positional
+  if (!cmd || cmd === 'help' || (!cmd && p.flags.has('help'))) {
+    const topic = cmd === 'help' ? rest[0] : undefined
+    if (topic === 'run') console.log(runIndex())
+    else if (topic === 'delegate') console.log((await import('./delegate.ts')).DELEGATE_INDEX)
+    else if (topic === 'review') console.log((await import('./review.ts')).REVIEW_INDEX)
+    else if (topic && HELP[topic]) console.log(HELP[topic])
+    else if (topic) { console.error(`wfe: no command "${topic}"\n`); console.log(index(p)); return 2 }
+    else console.log(index(p))
+    return 0
+  }
+  if (!COMMANDS[cmd]) { console.error(`wfe: no command "${cmd}" (see: wfe help)`); return 2 }
+  if (p.flags.has('help') && cmd !== 'run' && cmd !== 'delegate' && cmd !== 'review') { console.log(HELP[cmd]); return 0 }
+  p.positional = rest
+  // Shared-area references resolve against this area's shares.json
+  // (docs/shares.md); a command without a registry (setup) has no area yet.
+  try {
+    const area = areaDir(p)
+    const wrong = instanceMismatch(area)
+    if (wrong) { console.error(`wfe: ${wrong}`); return 3 }
+    ;(await import('../server/shares.ts')).setShareArea(area)
+  } catch (e) { if (!(e instanceof UsageError)) throw e }
+  try {
+    // An isolated recovery area (docs/storage.md) never runs the operating commands.
+    if (['exec', 'request', 'peer'].includes(cmd)) { let area = ''; try { area = areaDir(p) } catch { /* no registry */ } if (area && existsSync(join(area, 'recovery.json'))) throw new Refused(`${area} is an isolated recovery area: wfe ${cmd} is not available in it`) }
+    return await COMMANDS[cmd](p)
+  } catch (e) {
+    if (e instanceof UsageError) { console.error(`wfe ${cmd}: ${e.message}\n\n${cmd === 'run' ? 'See: wfe run help <subcommand>' : cmd === 'delegate' ? 'See: wfe delegate help <subcommand>' : cmd === 'review' ? 'See: wfe review help <subcommand>' : cmd === 'conversation' || cmd === 'discussion' ? 'Nothing was posted or recorded. See: wfe conversation help' : cmd === 'challenge' ? 'Nothing was written. See: wfe challenge help' : HELP[cmd]}`); return 2 }
+    if (e instanceof RequestError && !(e instanceof Refused)) e = new Refused(e.message, e.detail)
+    // A store that could not be opened or written: store, operation, SQLite code.
+    if (e instanceof StoreError) e = new Refused(e.message)
+    if (e instanceof Refused || e instanceof RegistryError) {
+      const detail = (e as Refused).detail
+      if (json) console.log(JSON.stringify({ ok: false, error: e.message, detail }, null, 2))
+      else {
+        console.error(`wfe ${cmd}: ${e.message}`)
+        if (Array.isArray(detail)) for (const i of detail as Issue[]) console.error(issueLine(i))
+      }
+      return 1
+    }
+    throw e
+  }
+}
+
+const invoked = (() => { try { return realpathSync(process.argv[1] ?? '') === fileURLToPath(import.meta.url) } catch { return false } })()
+if (invoked) process.exitCode = await main(process.argv.slice(2))

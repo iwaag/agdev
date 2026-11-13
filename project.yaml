@@ -1,0 +1,10 @@
+# Project definition (ag.project.v2). Repositories come from .gitmodules.
+schema: ag.project.v2
+id: agdev
+name: agdev
+devdocs: directory
+intent: "agdev: WFE, executor, Observer and the installation resources, on one revision, built by every installation (a main installation and its children) from canonical main; changes are tried on an explicitly designated candidate when there is one, and children adopt releases through their parent"
+goals:
+  - A change is made and checked in a run copy, tried on a designated candidate when one exists, integrated, and adopted as the exact commit (children through their parent)
+  - An installation can be created, updated, removed and recreated from source revisions and explicit inputs
+guides: [agent/guide.md]

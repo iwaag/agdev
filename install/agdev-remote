@@ -1,0 +1,207 @@
+#!/usr/bin/env python3
+"""Develop against another agdev installation (a candidate runtime) from a run of this one.
+
+  agdev-remote targets                                   the installations this one may operate
+  agdev-remote identity <target>                         its instance id, name, active release and source
+  agdev-remote status <target>                           services, clock, release, drain, last update
+  agdev-remote deploy <target> [<rev>] --reason TEXT     publish <rev> (default HEAD) as a candidate branch
+                                                         and ask the target to activate that exact commit
+  agdev-remote update <target> <id> [--wait SECONDS]     what happened to a deploy request
+  agdev-remote requests                                  deploy requests sent from this account, newest last
+  agdev-remote logs <target> <service> [--lines N]       journal of wfe, executor, observer, watchdog, lifecycle;
+                                                         container log of web, gitea, ...
+  agdev-remote repair <target> start|stop|restart <service>...
+  agdev-remote same-runtime <rev-a> <rev-b>              whether two commits carry the same runtime code
+
+A target is another installation with its own identity, services and stores. Every request names the
+instance id this installation expects there; the target refuses anything else before any effect
+(exit 2). Nothing here touches this installation: its lifecycle folder, registry, drain and updates
+are not used, and activating this installation is `agdev-update`, a separate decision.
+
+deploy pushes the commit to `candidate/<12 hex>` on the working copy's origin, the source the target
+builds from, then writes the request with an id made here and journaled before sending. The target's
+lifecycle builds and checks that commit, waits for the target's own open attempts and switches; it
+does not wait for or look up this run. If the answer is lost (exit 3), ask `update` with the printed
+id, or repeat `deploy ... --request <id>`: the same id never makes a second update. A build takes
+tens of minutes; `update --wait` polls. Only a target designated as a candidate takes a deploy: its own
+`[remote] candidate = true`; a `[targets.<name>] role = "recovery"` entry here is recovery access to a node
+with durable work (status, logs, update, repair), whose releases come through its parent.
+
+same-runtime compares the trees that make a release (workflow_editor, agautolab, agobserver, install,
+scripts). Integration of a run adds a checkpoint commit, so the commit on main differs from the
+tested candidate; when the runtime trees are the same, so is the release built from it.
+"""
+import argparse
+import datetime as dt
+import json
+import os
+import secrets
+import shutil
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+RUNTIME_PATHS = ["workflow_editor", "agautolab", "agobserver", "install", "scripts"]
+JOURNAL = Path.home() / ".local" / "state" / "agdev-remote" / "requests.jsonl"
+
+
+def targets() -> dict:
+    path = os.environ.get("AGDEV_TARGETS", "")
+    if not path or not Path(path).exists():
+        sys.exit("agdev-remote: no targets are configured for this installation (AGDEV_TARGETS; `agdevctl target <name>` on its host)")
+    return json.loads(Path(path).read_text())
+
+
+def target(name: str) -> tuple[dict, str]:
+    known = targets()
+    if name not in known["targets"]:
+        sys.exit(f"agdev-remote: unknown target {name!r}; known: {', '.join(known['targets']) or 'none'}")
+    return known["targets"][name], known["from"]
+
+
+def call(name: str, request: dict, timeout: int = 180) -> dict:
+    """One request over SSH. Exit 3 when no answer arrived: the outcome is then unknown, not failed."""
+    t, _ = target(name)
+    request = {**request, "expect": t["instance"]}
+    cmd = ["ssh", "-T", "-i", t["key"], "-o", "BatchMode=yes", "-o", "IdentitiesOnly=yes", "-o", "StrictHostKeyChecking=yes",
+           "-o", f"UserKnownHostsFile={t['knownHosts']}", "-o", "ConnectTimeout=15", "-o", "ServerAliveInterval=15", f"{t['user']}@{t['host']}"]
+    try:
+        done = subprocess.run(cmd, input=json.dumps(request), text=True, capture_output=True, timeout=timeout)
+    except subprocess.TimeoutExpired:
+        done = None
+    try:
+        answer = json.loads(done.stdout.strip().splitlines()[-1]) if done and done.stdout.strip() else None
+    except ValueError:
+        answer = None
+    if answer is None:
+        why = "no answer within the time limit" if done is None else f"ssh exited {done.returncode}: {done.stderr.strip()[-400:]}"
+        print(json.dumps({"ok": False, "error": "no-answer", "target": name, "detail": why}, indent=1))
+        sys.exit(3)
+    if answer.get("instance") != t["instance"]:
+        print(json.dumps({**answer, "ok": False, "error": "identity-mismatch", "detail": f"answered by {answer.get('instance')!r}, expected {t['instance']}"}, indent=1))
+        sys.exit(2)
+    return answer
+
+
+def show(answer: dict) -> int:
+    print(json.dumps(answer, indent=1, ensure_ascii=False))
+    return 0 if answer.get("ok") else 2 if answer.get("error") == "identity-mismatch" else 1
+
+
+def git(*args: str) -> str:
+    done = subprocess.run(["git", *args], text=True, capture_output=True)
+    if done.returncode != 0:
+        sys.exit(f"agdev-remote: git {' '.join(args)}: {done.stderr.strip()[-400:]}")
+    return done.stdout.strip()
+
+
+def run_of_copy() -> dict:
+    """The run whose copy this is, read from where the copy lives (<workspace>/.agdev/runs/<workflow>/<run>/source);
+    the executor gives an attempt only WFE_ATTEMPT."""
+    top = Path(git("rev-parse", "--show-toplevel"))
+    parts = top.parts
+    if len(parts) >= 6 and parts[-1] == "source" and parts[-5:-3] == (".agdev", "runs"):
+        return {"workspace": parts[-6], "run": f"{parts[-3]}/{parts[-2]}"}
+    return {"workspace": "", "run": ""}
+
+
+def deploy(args) -> int:
+    t, me = target(args.target)
+    if t.get("role") == "recovery":
+        sys.exit(f"agdev-remote: {args.target} is recovery access only (role = \"recovery\"): it takes no deploy; "
+                 "its releases come through its parent (`wfe manage update`). Try changes on a target designated as a candidate")
+    commit = git("rev-parse", "--verify", f"{args.rev}^{{commit}}")
+    if not args.no_publish:
+        # The target fetches every branch of the source; a candidate branch makes the exact commit reachable there.
+        # Pushed with this installation's Gitea authentication (wfe gitea git) when the area provides it.
+        push = ["push", "-q", "origin", f"{commit}:refs/heads/candidate/{commit[:12]}"]
+        if shutil.which("wfe"):
+            done = subprocess.run(["wfe", "gitea", "git", "--", *push], text=True, capture_output=True)
+            if done.returncode != 0:
+                sys.exit(f"agdev-remote: publishing the candidate failed: {(done.stderr or done.stdout).strip()[-400:]}")
+        else:
+            git(*push)
+    identity = args.request or dt.datetime.now(dt.timezone.utc).strftime("%Y%m%dT%H%M%SZ-") + secrets.token_hex(3)
+    origin = {"instance": me, **run_of_copy(), "attempt": os.environ.get("WFE_ATTEMPT", "")}
+    JOURNAL.parent.mkdir(parents=True, exist_ok=True)
+    with JOURNAL.open("a") as journal:
+        journal.write(json.dumps({"id": identity, "target": args.target, "targetInstance": t["instance"], "commit": commit,
+                                  "at": dt.datetime.now(dt.timezone.utc).isoformat(), "from": origin}) + "\n")
+    print(f"request {identity}: {commit} -> {args.target} ({t['instance']})", file=sys.stderr)
+    return show(call(args.target, {"op": "deploy", "request": identity, "commit": commit, "reason": args.reason, "from": origin}))
+
+
+def update(args) -> int:
+    deadline = time.monotonic() + (args.wait or 0)
+    while True:
+        answer = call(args.target, {"op": "update", "id": args.id})
+        state = (answer.get("update") or {}).get("state")
+        if not args.wait or not answer.get("ok") or state in ("succeeded", "failed", "refused") or time.monotonic() > deadline:
+            return show(answer)
+        print(f"{args.id}: {state or 'requested'}", file=sys.stderr)
+        time.sleep(30)
+
+
+def same_runtime(args) -> int:
+    a, b = (git("rev-parse", "--verify", f"{r}^{{commit}}") for r in (args.a, args.b))
+    trees = {p: (git("rev-parse", f"{a}:{p}"), git("rev-parse", f"{b}:{p}")) for p in RUNTIME_PATHS}
+    differ = [p for p, (x, y) in trees.items() if x != y]
+    print(json.dumps({"a": a, "b": b, "same": not differ, "differ": differ,
+                      "diffstat": git("diff", "--stat", a, b, "--", *differ) if differ else ""}, indent=1))
+    return 0 if not differ else 1
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    commands = parser.add_subparsers(dest="command", required=True)
+    commands.add_parser("targets")
+    commands.add_parser("requests")
+    for name in ("identity", "status"):
+        commands.add_parser(name).add_argument("target")
+    d = commands.add_parser("deploy")
+    d.add_argument("target")
+    d.add_argument("rev", nargs="?", default="HEAD")
+    d.add_argument("--reason", required=True)
+    d.add_argument("--request", help="repeat an earlier request whose answer was lost")
+    d.add_argument("--no-publish", action="store_true", help="the commit is already on a branch of the source")
+    u = commands.add_parser("update")
+    u.add_argument("target")
+    u.add_argument("id")
+    u.add_argument("--wait", type=int, default=0, help="poll until the update ends or this many seconds pass")
+    lg = commands.add_parser("logs")
+    lg.add_argument("target")
+    lg.add_argument("service")
+    lg.add_argument("--lines", type=int, default=200)
+    r = commands.add_parser("repair")
+    r.add_argument("target")
+    r.add_argument("action", choices=["start", "stop", "restart"])
+    r.add_argument("services", nargs="+")
+    s = commands.add_parser("same-runtime")
+    s.add_argument("a")
+    s.add_argument("b")
+    args = parser.parse_args()
+    if args.command == "targets":
+        return show({"ok": True, **targets()})
+    if args.command == "requests":
+        print(JOURNAL.read_text() if JOURNAL.exists() else "", end="")
+        return 0
+    if args.command in ("identity", "status"):
+        return show(call(args.target, {"op": args.command}))
+    if args.command == "deploy":
+        return deploy(args)
+    if args.command == "update":
+        return update(args)
+    if args.command == "logs":
+        answer = call(args.target, {"op": "logs", "service": args.service, "lines": args.lines})
+        if answer.get("ok"):
+            print(answer["log"], end="")
+            return 0
+        return show(answer)
+    if args.command == "repair":
+        return show(call(args.target, {"op": "repair", "action": args.action, "services": args.services}, timeout=300))
+    return same_runtime(args)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

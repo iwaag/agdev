@@ -1,0 +1,346 @@
+// The HTTP boundary between the local service and any client. Plain JSON;
+// nothing here depends on the UI.
+import type { ApprovalState } from './canonical.ts'
+import type { ApprovalKind, Issue, Project, Workflow } from './model.ts'
+import type { RepositoryInfo } from './validate.ts'
+import type { ExecutionState, RunRecord } from './run.ts'
+import type { RunCatalog } from './catalog.ts'
+
+export interface FileProblem {
+  kind: 'malformed' | 'unsupported' | 'shape' | 'missing' | 'unreadable'
+  message: string
+  line?: number
+  col?: number
+}
+
+export interface WorkspaceSummary {
+  id: string
+  label: string
+  host: string
+  // Registration is a local record; observation is what this service sees now.
+  observed: {
+    available: boolean
+    reason?: string
+    projectId?: string
+    projectName?: string
+    branch?: string | null
+    head?: string
+  }
+}
+
+// The registry and the authoring area as the service sees them.
+export interface WorkspacesResponse {
+  approver: string
+  workspaces: WorkspaceSummary[]
+  registry: { path: string; exists: boolean }
+  area: { path: string; sources: string } // where browser-created projects and new sources go
+}
+
+// Something a project root lacks, with the action that fixes it.
+export interface Diagnostic { severity: 'error' | 'warning'; code: string; message: string; fix?: string }
+
+export interface CreateStep { name: string; status: 'done' | 'kept' | 'failed'; detail: string }
+export interface CreateProjectResult {
+  ok: boolean
+  message: string
+  root: string
+  workspace?: string
+  steps: CreateStep[]
+  commits: { repository: string; commit: string; message: string }[]
+  resumable?: boolean // an unfinished creation can be continued with resume
+  diagnostics?: Diagnostic[]
+}
+
+export interface RegisterResponse {
+  ok: boolean
+  status: 'registered' | 'already-registered' | 'refused'
+  message: string
+  registration?: { id: string; label: string; host: string; path: string }
+  diagnostics: Diagnostic[]
+}
+
+export type RepoCategory = 'root' | 'devdocs' | 'study' | 'wedo' | 'mind' | 'other'
+
+export interface RepositoryStatus extends RepositoryInfo {
+  name: string
+  category: RepoCategory
+  url?: string // as written in .gitmodules
+  description?: string // a local area's description from project.yaml
+  recorded?: string // gitlink in HEAD
+  staged?: string // gitlink in the index, when it differs from HEAD
+  head?: string // checked-out commit
+  branch?: string | null // null = detached HEAD
+  dirty: number // changed entries in `git status --porcelain`
+  matchesRecorded?: boolean
+  // Publication: the branch's upstream as last fetched (no network read).
+  // ahead = local commits not published; null upstream = nothing to compare.
+  publication?: { upstream: string | null; ahead: number; behind: number }
+  error?: string
+}
+
+export interface WorkflowSummary {
+  file: string
+  id?: string
+  name?: string
+  problem?: FileProblem
+  errors: number
+  warnings: number
+  approvals?: Record<ApprovalKind, ApprovalState['status']>
+  delegates: string[]
+  intake?: boolean // takes requests (acceptsRequests: delegations, submissions)
+}
+
+export interface ProjectResponse {
+  workspace: string
+  rev: string | null // content hash of project.yaml, for display and echo detection only
+  project?: Project
+  problem?: FileProblem
+  issues: Issue[]
+  repositories: RepositoryStatus[]
+  workflows: WorkflowSummary[]
+  workflowsDir: { exists: boolean; reason?: string }
+  structure: Diagnostic[]
+}
+
+// Another registered project and its workflows (p10): delegate targets.
+export interface PeerProject { project: string; workspace: string; label?: string; workflows: { id: string; name?: string; file: string; delegates: string[]; intake: boolean }[] }
+
+export interface WorkflowResponse {
+  workspace: string
+  project?: string // this workspace's project id (p10)
+  peers?: PeerProject[] // the other registered projects' workflows, when the registry is known (p10)
+  file: string
+  rev: string | null
+  text: string | null
+  workflow?: Workflow
+  problem?: FileProblem
+  issues: Issue[]
+  approvals?: Record<ApprovalKind, ApprovalState>
+  repositories: RepositoryStatus[]
+  workflows: WorkflowSummary[]
+}
+
+export interface SaveResponse { ok: true; rev: string; text: string }
+
+export interface AddSubmoduleResponse {
+  ok: boolean
+  message: string
+  stderr?: string
+  // After a failure: what Git left behind, so it can be inspected; nothing is reset.
+  partial?: { gitmodulesEntry: boolean; pathExists: boolean; staged: boolean; gitDirExists: boolean }
+}
+
+export interface ApiError { error: string; detail?: unknown }
+
+export interface ChangeEvent {
+  byEditor?: boolean // the content matches the editor's own last save of that file
+  type: 'changed'
+  workspace: string
+  // workflows: a file appeared or disappeared; git: HEAD, index, dirty or
+  // submodule checkout state changed; registry: the workspace list changed.
+  // run: a run's record or its folder's files changed; runs: a run appeared or disappeared.
+  kind: 'project' | 'workflow' | 'workflows' | 'repositories' | 'git' | 'registry' | 'run' | 'runs'
+  file?: string
+  run?: string // `<workflow>/<run>` for kind run
+  rev: string | null
+}
+
+// ---- runs (docs/runs.md) ------------------------------------------------------
+
+// A run as listed: its record when it reads cleanly, or why it does not.
+export interface RunSummary {
+  ref: string // `<workflow>/<run>`
+  workflow: string
+  run: string
+  dir: string // project-relative
+  title?: string // the same result title as the opened run
+  workflowName?: string // name from the run's definition in force
+  problem?: FileProblem & { code?: string }
+  created?: string
+  updated?: string
+  seq?: number
+  execution?: ExecutionState
+  counts?: Record<string, number>
+  waiting?: { node: string; holder: string }[]
+  ready?: string[]
+  failed?: string[]
+  input?: 'braindump' | 'request'
+  executor?: string // the agent identity
+  executorHost?: string // the execution host that launches it (p6)
+  pendingInstructions?: number // received and not acknowledged (p6)
+  decision?: 'accepted' | 'rejected'
+  hold?: { kind: string; by: string } // a hold in force (p8 ex1)
+  status?: import('./status.ts').RunStatus // the shared reading (p8 ex1, shared/status.ts)
+}
+
+export interface RunFile { name: string; size: number; modified: string }
+
+// What a bundled workflow is compared with: the current source in devdocs/workflows.
+export interface SourceComparison {
+  workflow: string
+  status: 'same' | 'changed' | 'deleted' | 'unreadable'
+  source?: string // where the bundle was copied from
+  file?: string // where the workflow id is now
+  renamed?: boolean // the id now lives in another file of devdocs/workflows
+  detail?: string
+}
+
+export interface RelatedRun {
+  ref: string
+  execution?: ExecutionState
+  seq?: number
+  problem?: string // missing, unreadable, inconsistent …
+}
+
+// A commit of the repository that owns devdocs (server/devdocs.ts):
+// `root` in directory mode, `devdocs` in submodule mode. `root` names the
+// project root commit whose gitlink was followed, when one was.
+export interface HistoryRev { owner: 'root' | 'devdocs'; commit: string; subject: string; date: string; root?: string }
+
+export interface RunResponse {
+  workspace: string
+  ref: string
+  dir: string
+  rev?: string // the owning repository's commit, when the run was read from history
+  revInfo?: HistoryRev
+  record?: RunRecord
+  problem?: FileProblem & { code?: string }
+  bundle: Record<string, { file: string; workflow?: Workflow; problem?: string; text?: string }>
+  // Adjusted revisions of the root workflow (p7), in order; the last is in force.
+  revisions?: { revision: string; file: string; workflow?: Workflow; text?: string }[]
+  sources: SourceComparison[]
+  files: RunFile[]
+  predecessor?: RelatedRun
+  artifacts: { path: string; exists: boolean }[]
+  catalog?: RunCatalog // what the run was given of the person's node catalog (p7/ex1)
+  // Where the run's files are (p9, docs/storage.md): its own working copy
+  // (with its branch), or the project workspace.
+  place?: { kind: 'run-copy'; branch: string | null } | { kind: 'project' }
+  // Shared-area references, input sets and outputs as this host reaches them
+  // now (project_migration p6, docs/shares.md): a bounded stat, never a hash;
+  // `url` is where the LAN downloads them.
+  shares?: { references: ShareAvailability[]; inputs: Record<string, ShareAvailability>; outputs: Record<string, ShareAvailability> }
+}
+export interface ShareAvailability { ref: string; state: 'ok' | 'unknown-share' | 'unmounted' | 'unavailable' | 'absent' | 'outside' | 'not-a-folder' | 'not-a-file'; url: string | null }
+
+export interface RunOpResponse { ok: true; seq: number; record: RunRecord }
+
+// ---- the agdev dashboard (p4) -----------------------------------------------------
+
+// Where a listed fact was read and when. A fact that could not be read
+// carries `error` instead of a value: unavailable is never shown as empty.
+export interface Observation { source: string; at: string; error?: string }
+
+export interface DashboardWorkspace {
+  id: string
+  label: string
+  host: string
+  available: boolean
+  reason?: string
+  runs?: { ongoing: number; waitingOnPerson: number; problems: number; list: { ref: string; execution?: string; waiting: { node: string; holder: string }[] }[] }
+  runsError?: string
+}
+
+export interface DashboardProject {
+  id: string
+  root: { key: string; fullName?: string; htmlUrl?: string; error?: string }
+  name?: string
+  intent?: string
+  devdocs?: string
+  definition: Observation // where name, intent and devdocs mode were read
+  workspaces: DashboardWorkspace[]
+}
+
+export interface RepositoryUse { project: string; path: string; source: string; at: string }
+
+export interface DashboardRepository {
+  key: string
+  category: 'root' | 'devdocs' | 'study' | 'wedo' | 'mind' | 'other'
+  description: string
+  registered: { owner: string; name: string }
+  gitea: { state: 'ok' | 'renamed' | 'missing' | 'unknown'; fullName?: string; htmlUrl?: string; description?: string; empty?: boolean; error?: string; at: string }
+  usedBy: RepositoryUse[]
+  usageUnknown: { project: string; error: string }[] // projects whose usage could not be read
+}
+
+export interface DashboardResponse {
+  at: string
+  registry: { path: string; exists: boolean }
+  gitea: { state: 'ok' | 'unconfigured' | 'unreachable'; url?: string; owner?: string; error?: string }
+  executor: { state: 'available' | 'unavailable' | 'unknown' | 'not-configured'; detail?: string; at?: string }
+  // project_migration p7: every execution node (worker) and its last contact.
+  workers?: { id: string; label: string; local: boolean; state: 'available' | 'unavailable' | 'unknown'; at: string | null; detail: string }[]
+  projects: DashboardProject[]
+  repositories: DashboardRepository[]
+  // Workspaces registered without a project entry (local-only projects).
+  unlinkedWorkspaces: DashboardWorkspace[]
+}
+
+export interface AgdevStep { name: string; status: 'done' | 'kept' | 'failed'; detail: string }
+export interface AgdevResult { ok: boolean; message: string; steps?: AgdevStep[]; [k: string]: unknown }
+
+// The published source a workspace's project offers (improve_wfrun p1,
+// server/published.ts), and the workspace beside it (server/workspaceSync.ts).
+export interface PublishedSourceView {
+  schema: string; kind: 'published'; project: string; selector: 'default-branch' | 'commit'
+  repository: string; branch: string; commit: string
+  definitions: { path: string; repository: string; commit: string } | null
+  fetch: { state: 'fresh' | 'recent' | 'stale'; at: string; error?: string }
+}
+// What a definition reading is, for published, draft and run reads alike
+// (workflow_editor p20, docs/drafts.md). `definition` is where the bytes are:
+// in submodule mode its repository is the submodule, at the commit `root` pins.
+export interface DefinitionDescriptor {
+  schema: string; kind: 'published' | 'draft' | 'run'; project: string; workflow: string | null; file: string
+  definition: { repository: string; path: string; revision: string } | null
+  root: { repository: string; branch: string; commit: string } | null
+  digest: string | null
+  fetch?: { state: 'fresh' | 'recent' | 'stale'; at: string; error?: string }
+  draft?: { id: string; revision: number }
+  run?: { ref: string; revision: string }
+}
+export interface RepoRelationView { path: string; head: string | null; branch: string | null; published: string | null; relation: 'same' | 'behind' | 'ahead' | 'diverged' | 'unknown'; behind: number | null; ahead: number | null; dirty: number; initialized: boolean; problem?: string }
+export interface WorkspaceRelationView { workspace: string; project: string; source: PublishedSourceView; observed: string; root: RepoRelationView; submodules: RepoRelationView[]; summary: string; next: 'none' | 'sync' | 'resolve-by-hand' }
+export interface PublishedResponse { source: PublishedSourceView; workflows: WorkflowSummary[]; problem?: string; relation: WorkspaceRelationView | { problem: string } }
+export interface SyncResultView { ok: boolean; workspace: string; source: PublishedSourceView; steps: { path: string; before: string | null; after: string | null; state: string; detail: string }[]; relation: WorkspaceRelationView; message: string; recovery?: string }
+
+// GET api/site (agedev_selfassembly p2, docs/site.md): what the pages show about this
+// installation. A name, link or parent that is unusable is null, with why in problems.
+export interface SiteView {
+  schema: string
+  name: string | null
+  instance: string | null
+  gitea: string | null
+  parent: { name: string; url: string } | null
+  // The release this service runs, from its RELEASE.json; null when it has none (a source checkout).
+  release: { commit: string; built: string | null; commitUrl: string | null } | null
+  problems: string[]
+}
+
+// The management read model (GET api/manage; improve_multinodes p4, docs/management.md):
+// this installation, its directly configured peers and what it last heard
+// from each. Only what this installation knows: no peer is asked on read.
+export type ManageSample = import('./peers.ts').InstallationSample
+export interface ManageIdentity { name: string | null; host: string | null; dashboard: string | null }
+export interface ManageLocal extends ManageIdentity {
+  instance: string | null
+  release: { commit: string; built: string | null } | null
+  lifecycle: { sample: ManageSample | null; age: number | null; problem: string | null }
+}
+export interface ManageOperation {
+  id: string; dir: 'out' | 'in'; peer: string; commit: string; reason: string; created: string; acknowledged: string; code: string | null; lifecycle: string | null
+  phase: string | null; terminal: boolean; history: { state: string; at: string }[]; selected: string | null; serving: string | null; healthy: boolean | null; verified: boolean; partial: boolean; heard: string | null; outcome: string
+}
+export interface ManagePeer {
+  instance: string; label: string; parentage: 'parent' | 'child' | 'none'; grant: string[]; manage: string[]
+  enrollment: { state: 'none' | 'pending' | 'partial' | 'mutual' | 'contradictory' | 'cycle'; detail: string }
+  heard: { you: string; grants: string[]; manages: string[]; ancestry: string[] } | null; heardAt: string | null
+  capabilities: string[]; capabilitiesSeen: string | null
+  identity: (ManageIdentity & { received: string }) | null
+  observation: { state: 'fresh' | 'stale' | 'unknown'; detail: string; body: { at: string; refused: string | null; sample: ManageSample | null; sampleAge: number | null; problem: string | null } | null; received: string | null; asked: string | null } | null
+  operations: ManageOperation[]
+}
+export interface ManageResponse {
+  configured: boolean; config: 'ok' | 'disabled' | 'invalid'; reason: string | null; at: string
+  local: ManageLocal; self: string | null; ancestry: string[]; peers: ManagePeer[]
+}
