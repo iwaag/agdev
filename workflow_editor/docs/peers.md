@@ -37,8 +37,8 @@ labels.
 ```json
 {
   "version": 1,
-  "self": "b-vm2-f6ea6da98a9d",
-  "viewBase": "http://agautolab1.home.arpa:8082/wfe/",
+  "self": "b-0123456789ab",
+  "viewBase": "http://peer.example:8082/wfe/",
   "peers": [
     {
       "instance": "<instance id>", "label": "main", "endpoint": "http://<host>:8093/wfe/api",
@@ -72,7 +72,7 @@ Each installation keeps its own Gitea and everything else.
 ```yaml
   produce:
     type: delegate
-    instance: b-vm2-f6ea6da98a9d   # the other installation; absent = this one
+    instance: b-0123456789ab   # the other installation; absent = this one
     project: peerdemo              # required with instance: that installation's project
     workflow: produce
     accepts: parent
@@ -368,7 +368,7 @@ installations' own WFE services. Rules:
 
 | `peers.json` field | Meaning |
 | --- | --- |
-| `peers[].endpoint` | the peer's WFE API base, e.g. `http://agautolab1.home.arpa:8082/wfe/api` (required). It grants nothing |
+| `peers[].endpoint` | the peer's WFE API base, e.g. `http://peer.example:8082/wfe/api` (required). It grants nothing |
 | `peers[].credential` | the file of the token that peer issued to this side (default `<area>/.local/peerlink/credentials/<instance>.token`, mode 600) |
 | `peers[].route`, `peers[].manageRoute` | may still say `http` (older files); any other value is refused |
 | `directory` | the cluster directory this installation consults ([cluster.md](cluster.md)) |
@@ -380,9 +380,9 @@ installation when there is none).
 
 ```sh
 # on the receiver (B), for holder C — writes the token to a file, never prints it:
-wfe peer credential issue c-5ba67eac599e --out /tmp/for-c.token
+wfe peer credential issue c-ba9876543210 --out /tmp/for-c.token
 # move the file to C by an authorized operational route, then on C:
-wfe peer credential install b-vm2-f6ea6da98a9d --from /tmp/for-c.token   # then remove the file
+wfe peer credential install b-0123456789ab --from /tmp/for-c.token   # then remove the file
 wfe peer credential list            # issued here / installed here (fingerprints only)
 wfe peer credential revoke <holder|id>   # new deliveries refused; accepted work stands
 ```

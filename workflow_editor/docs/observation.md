@@ -81,8 +81,8 @@ whatever its state. The same document is served at `GET /api/observe`
     "slot": { "attempt": "a…", "workspace": "jevlab", "run": "study/run-001", "uid": "…" },
     "queued": 0
   },
-  "workers": [ { "id": "studio", "state": "available", "slot": { … }, "slots": [ { "attempt": "a…", "run": "…", "lane": "default", "decision": 12 } ], "lanes": ["conversation", "coordination"], "coordination": true, "load": { "at": "…", "cpus": 12, "load1": 2.1, "memFreeMB": 20480 }, "queued": 2, "awaiting": 1, "deferred": 1, "waiting": [ { "job": 9, "run": "…", "note": "…", "decision": "defer", "deferUntil": "…" } ] } ],
-  "coordination": { "configured": true, "worker": "studio", "lane": "coordination", "workflow": "warden/coordinate", "turn": { "id": 4, "run": "run-004", "attempt": "a…", "since": "…" } | null,
+  "workers": [ { "id": "main", "state": "available", "slot": { … }, "slots": [ { "attempt": "a…", "run": "…", "lane": "default", "decision": 12 } ], "lanes": ["conversation", "coordination"], "coordination": true, "load": { "at": "…", "cpus": 12, "load1": 2.1, "memFreeMB": 20480 }, "queued": 2, "awaiting": 1, "deferred": 1, "waiting": [ { "job": 9, "run": "…", "note": "…", "decision": "defer", "deferUntil": "…" } ] } ],
+  "coordination": { "configured": true, "worker": "main", "lane": "coordination", "workflow": "warden/coordinate", "turn": { "id": 4, "run": "run-004", "attempt": "a…", "since": "…" } | null,
     "stalled": { "since": "…", "failures": 3, "until": "…", "last": "…" } | null, "awaiting": 1, "deferred": 1, "needs": ["…"], "pendingEvents": 3, "oldestPendingEvent": "…",
     "overdue": [ { "job": 9, "workspace": "…", "run": "…", "uid": "…", "until": "…", "decision": 7 } ], "lastTurn": { "id": 3, "state": "ended", "ended": "…", "outcome": "…", "decisions": 2 } },
   "workspaces": [ { "id": "jevlab", "available": true, "problem": null } ],

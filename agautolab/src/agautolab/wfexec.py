@@ -855,7 +855,7 @@ class Executor:
         if r.abandon:
             return self.abandon(r, r.abandon)
         # An adopted process gone without its exit file is lost (p4: seen on
-        # gpupc when the gate was killed): ended as such here, not held
+        # gpu-worker when the gate was killed): ended as such here, not held
         # forever while the reconcile is told it is still owned.
         if r.proc.poll() is None and not getattr(r.proc, "lost", False):
             self.watch_session_end(r)

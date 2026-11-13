@@ -17,11 +17,11 @@ this repository's `agautolab` and `workflow_editor` from an installed release.
 `<area>/workers.json` on the coordinator:
 
 ```json
-{ "default": "studio",
-  "coordination": { "worker": "studio", "lane": "coordination", "workspace": "warden", "workflow": "coordinate" },
+{ "default": "main",
+  "coordination": { "worker": "main", "lane": "coordination", "workspace": "warden", "workflow": "coordinate" },
   "workers": {
-    "studio": { "local": true, "label": "the coordinator's host", "lanes": ["conversation", "coordination"] },
-    "gpupc":  { "label": "the GPU PC", "tokenFile": "workers/gpupc.token" } } }
+    "main": { "local": true, "label": "the coordinator's host", "lanes": ["conversation", "coordination"] },
+    "gpu-worker":  { "label": "the GPU PC", "tokenFile": "workers/gpu-worker.token" } } }
 ```
 
 - Ids match `^[a-z][a-z0-9-]{0,31}$`; they are logical names recorded in
@@ -43,7 +43,7 @@ this repository's `agautolab` and `workflow_editor` from an installed release.
 On a remote worker, `<worker area>/worker.json`:
 
 ```json
-{ "coordinator": "http://<coordinator>:8098/", "worker": "gpupc", "label": "…",
+{ "coordinator": "http://<coordinator>:8098/", "worker": "gpu-worker", "label": "…",
   "tokenFile": "worker.token", "facts": { "os": "…", "godot": "…", "display": "…" } }
 ```
 

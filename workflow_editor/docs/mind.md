@@ -38,7 +38,12 @@ agdev-mind/
 
 **Publication** is the owner's choice. The repository always stays on the
 cluster's Gitea. A copy on GitHub, if any, is made with the external
-publication tools (docs/external-publication.md in the core). Nothing in the
+publication tools (docs/external-publication.md in the core), under the same
+fixed name: `<github user>/agdev-mind`. A summoner looks there for a user's
+shared projects. The owner of this core publishes `iwaag/agdev-mind`, with
+`catalog.yaml` and `mind.yaml` only (its `owner` becomes the public account);
+braindumps and summonplans stay internal, and a catalog entry's `because`
+then only says that grounds exist. Nothing in the
 mind repository may hold host facts, credentials or cluster addresses that
 are not already in a `source` URL. Cluster facts belong to the system context.
 

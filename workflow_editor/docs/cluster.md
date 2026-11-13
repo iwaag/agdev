@@ -17,7 +17,7 @@ decision, told on the delegation.
 ```json
 {
   "version": 1,
-  "endpoint": "http://agautolab1.home.arpa:8082/wfe/api",
+  "endpoint": "http://peer.example:8082/wfe/api",
   "offers": [
     { "project": "team-story-b", "workflow": "story",
       "purpose": "Short branching stories (team-story/1 packages) for other installations' games",

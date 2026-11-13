@@ -18,9 +18,9 @@ The agent's side (the warden project's guides) is not WFE's.
 `<area>/workers.json` names where coordination runs:
 
 ```json
-{ "default": "studio",
-  "coordination": { "worker": "studio", "lane": "coordination", "workspace": "warden", "workflow": "coordinate" },
-  "workers": { "studio": { "local": true, "lanes": ["conversation", "coordination"] }, "gpupc": { "tokenFile": "workers/gpupc.token" } } }
+{ "default": "main",
+  "coordination": { "worker": "main", "lane": "coordination", "workspace": "warden", "workflow": "coordinate" },
+  "workers": { "main": { "local": true, "lanes": ["conversation", "coordination"] }, "gpu-worker": { "tokenFile": "workers/gpu-worker.token" } } }
 ```
 
 - `workspace`/`workflow`: the registered workspace of the coordinating
