@@ -24,6 +24,13 @@ export const EPISODES_DIR = 'braindumps/episodes'
 export const BRAINDUMP_FILE = 'braindump.md'
 export const REVIEW_FILE = 'review.md'
 export const SUMMONPLAN_DIR = 'summonplans'
+// user_catalog p2: the owner's challenges live in the catalog (challenges/<id>/…,
+// docs/challenges.md), and challenges.md at the root is the index of what is not
+// yet real: braindumps not carried out and challenges not resolved. An agent
+// writes the index; the core stores and shows it and reads nothing from it.
+export const CHALLENGES_DIR = 'challenges'
+export const INDEX_PATH = 'challenges.md'
+export const PUBLICATION_CONTRACT = 'publication/github.toml'
 // The layout before user_catalog p1; never read, only recognized (wfe catalog migrate).
 export const OLD_LAYOUT = { marker: 'mind.yaml', schema: 'ag.mind.v1', projects: 'catalog.yaml', projectsSchema: 'ag.catalog.v1' } as const
 export const OLD_LAYOUT_PROBLEM = 'an old layout (mind.yaml, catalog.yaml, braindumps/<slug>.md): run `wfe catalog migrate`'
@@ -280,4 +287,62 @@ export function validateProjects(c: ProjectsDoc, ctx: CatalogRefs = {}): Issue[]
     issues.push(...roleIssues(e.roles, at))
   })
   return issues
+}
+
+// ---- the published part (user_catalog p2) -------------------------------------------
+
+// What publication/github.toml (agdev.publication.v1, docs/external-publication.md)
+// selects from the source: [[file]] from = "source:<path>" and [[tree]] from =
+// "source:<dir>" minus its exclude globs. Only those keys are read here; the
+// publication tool is the authority on the contract.
+export interface PublicationSelection { destination: string; files: { public: string; from: string }[]; trees: { public: string; from: string; exclude: string[] }[] }
+
+export function readPublicationContract(text: string): PublicationSelection {
+  const out: PublicationSelection = { destination: '', files: [], trees: [] }
+  let cur: Record<string, unknown> | null = null
+  const lines = text.split('\n')
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i].trim()
+    const table = /^\[\[?([A-Za-z0-9_.-]+)\]?\]/.exec(line)
+    if (table) {
+      cur = {}
+      if (line.startsWith('[[file]]')) out.files.push(cur as never)
+      else if (line.startsWith('[[tree]]')) out.trees.push(Object.assign(cur, { exclude: [] }) as never)
+      continue
+    }
+    const kv = /^([A-Za-z0-9_-]+)\s*=\s*(.*)$/.exec(line)
+    if (!kv) continue
+    let value = kv[2]
+    // An array may span lines: read to its closing bracket.
+    if (value.startsWith('[')) while (!/\]\s*(#.*)?$/.test(value) && i + 1 < lines.length) value += ` ${lines[++i].trim()}`
+    const strings = [...value.matchAll(/"((?:[^"\\]|\\.)*)"|'([^']*)'/g)].map(m => m[1] !== undefined ? m[1].replace(/\\(.)/g, '$1') : m[2])
+    const v: unknown = value.startsWith('[') ? strings : strings[0] ?? ''
+    if (cur) cur[kv[1]] = v
+    else if (kv[1] === 'destination' && typeof v === 'string') out.destination = v
+  }
+  const src = (from: unknown) => typeof from === 'string' && from.startsWith('source:') ? from.slice(7).replace(/^\/+|\/+$/g, '') : null
+  return {
+    destination: out.destination,
+    files: out.files.flatMap(f => src(f.from) !== null && typeof f.public === 'string' ? [{ public: f.public, from: src(f.from)! }] : []),
+    trees: out.trees.flatMap(t => src(t.from) !== null ? [{ public: typeof t.public === 'string' ? t.public.replace(/^\.?\/+|\/+$/g, '').replace(/^\.$/, '') : '', from: src(t.from)!, exclude: Array.isArray(t.exclude) ? t.exclude.filter((x): x is string => typeof x === 'string') : [] }] : []),
+  }
+}
+
+// A glob as the publication tool reads it: `*` crosses "/"; a glob that
+// matches a directory excludes everything below it.
+const globRe = (g: string) => new RegExp(`^${g.replace(/[.+^${}()|\\]/g, '\\$&').replace(/\*/g, '.*').replace(/\?/g, '.')}$`)
+const excluded = (rel: string, patterns: string[]) => patterns.some(p => globRe(p).test(rel) || globRe(`${p.replace(/\/+$/, '')}/*`).test(rel))
+
+// The public path of each source path the contract selects (source path → public path).
+export function publishedPaths(sel: PublicationSelection, sourcePaths: string[]): Map<string, string> {
+  const out = new Map<string, string>()
+  const present = new Set(sourcePaths)
+  for (const f of sel.files) if (present.has(f.from)) out.set(f.from, f.public)
+  for (const t of sel.trees) for (const p of sourcePaths) {
+    if (t.from && !p.startsWith(`${t.from}/`)) continue
+    if (p === '.gitmodules' || p.startsWith('publication/')) continue
+    const rel = t.from ? p.slice(t.from.length + 1) : p
+    if (!excluded(rel, t.exclude)) out.set(p, t.public ? `${t.public}/${rel}` : rel)
+  }
+  return out
 }

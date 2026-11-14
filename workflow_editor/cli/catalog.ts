@@ -15,6 +15,12 @@ wfe catalog braindump edit <path> (--file <md> | --text <text>) --author <who> [
 wfe catalog braindump remove <path> --author <who> [--force]
 wfe catalog review show <path>
 wfe catalog review put <path> (--file <md> | --text <text>) --author <who> [--base <commit>] [--message <m>]
+wfe catalog review request [<path>] --author <who>
+wfe catalog index show
+wfe catalog index put (--file <md> | --text <text>) --author <who> [--base <commit>] [--message <m>]
+wfe catalog index request --author <who>
+wfe catalog publication status
+wfe catalog publication use <folder>
 wfe catalog why <project>
 wfe catalog plan show <name> [--yaml]
 wfe catalog plan check <file>
@@ -32,6 +38,10 @@ Git URL at which commit, filling which roles, and because of which braindumps.
 projects.yaml lists the projects the user shares. docs/mycatalog.md has the
 formats. The GitHub copy <user>/mycatalog is the published part of the same
 repository.
+
+The owner's challenges (problems found during work; wfe challenge) live in the
+same repository under challenges/<id>/; challenges.md beside them is the index
+of what is not yet real.
 
 The one rule: any braindump.md under braindumps/episodes/, at any depth, is a
 braindump; its folder path below braindumps/episodes/ is its identity (<path>,
@@ -57,6 +67,21 @@ review     put writes review.md beside the braindump, one commit authored by
            --author (an agent signs by being the author); --base as for edit.
            No structure is required. show also says whether the braindump
            changed after its review (derived from Git).
+           request asks the summoner's workflow review to write or refresh
+           the review of <path>, or of every braindump with no review or
+           changed after its review. Refused when no summoner is here.
+index      challenges.md at the catalog's root: what is not yet real, from
+           both origins (a braindump not carried out, a challenge not
+           resolved), each with its kind, a link and a line or two. An agent
+           writes it; nothing reads meaning from it. show also says what
+           changed under braindumps/ or challenges/ since it was written
+           (derived from Git). put writes it whole, one commit authored by
+           --author. request asks the summoner's workflow index to rewrite it.
+publication  status: the public paths publication/github.toml selects,
+           grouped as braindumps, reviews, challenges and the rest; what is
+           not selected is internal. The last public commit is read from the
+           journal of the folder the catalog is published from (use <folder>
+           records it in catalog.json).
 why        the project's entry in this installation's plan, the braindumps
            behind it, and other plans of this catalog that list it
 plan       show / check (validate a file against the repository, no write) /
@@ -76,6 +101,7 @@ export interface CatalogCli {
   usage: (m: string) => Error
   refused: (m: string) => Error
   ctx: () => Promise<CatalogContext>
+  request: (o: { workspace: string; workflow: string; text: string; author: string; receipt: string }) => Promise<{ message: string; data: unknown }>
 }
 
 const issueLine = (where: string, i: Issue) => `  ${i.severity === 'error' ? 'error  ' : 'warning'} ${where}: ${i.code}: ${i.message}`
@@ -104,7 +130,9 @@ export async function catalogCommand(c: CatalogCli): Promise<number> {
         `${v.repository} @ ${short(v.head)}  ${v.title ? `"${v.title}"  ` : ''}${v.web}`,
         `this installation's plan: ${v.plan || '(none named; wfe catalog plan use <name>)'}`,
         '', `Braindumps (${v.braindumps.length})`,
-        ...v.braindumps.map(b => `  ${b.id.padEnd(32)} ${b.title}\n  ${''.padEnd(32)} ${b.projects.length ? `grounds: ${b.projects.join(', ')}` : `grounds no project in ${v.plan || 'the plan'}`}\n  ${''.padEnd(32)} ${reviewLine(b)}`),
+        ...v.braindumps.map(b => `  ${b.id.padEnd(32)} ${b.title}${b.published ? '  [published]' : ''}\n  ${''.padEnd(32)} ${b.projects.length ? `grounds: ${b.projects.join(', ')}` : `grounds no project in ${v.plan || 'the plan'}`}\n  ${''.padEnd(32)} ${reviewLine(b)}`),
+        '', `Challenges: ${v.challenges.available ? `${v.challenges.items.length} (${Object.entries(v.challenges.counts).filter(([, n]) => n).map(([k, n]) => `${k} ${n}`).join(', ') || 'none'})${v.challenges.inCatalog ? '' : `; ${v.challenges.reason}`}` : v.challenges.reason}`,
+        `Index (${v.index.path}): ${v.index.updated ? `${v.index.updated.author}, ${v.index.updated.at.slice(0, 10)}, ${short(v.index.updated.commit)}${v.index.note ? `; ${v.index.note}` : ''}` : v.index.note}`,
         '', `Projects (${v.projects.length})`,
         ...v.projects.map(p => `  ${p.project.padEnd(20)} ${!p.registered ? '(not registered) ' : ''}${!p.entry ? 'not in the plan' : p.braindumps.length ? p.braindumps.map(b => b.id + (b.missing ? ' (missing)' : '')).join(', ') : 'no ground'}${p.entry && Object.keys(p.entry.roles).length ? `  roles: ${Object.entries(p.entry.roles).map(([k, x]) => x === true ? k : `${k}=${x}`).join(', ')}` : ''}`),
         '', `Plans: ${v.plans.map(p => `${p.name} (${p.entries} entries${p.errors ? `, ${p.errors} errors` : ''}${p.warnings ? `, ${p.warnings} warnings` : ''})`).join(', ') || 'none'}`,
@@ -118,7 +146,7 @@ export async function catalogCommand(c: CatalogCli): Promise<number> {
       if (a1 === 'list' || a1 === undefined) {
         const v = await m.catalogView(ctx, { maxAgeMs: 0 })
         if (!v.configured) { c.out(v.reason, v); return 1 }
-        c.out(v.braindumps.map(b => `${b.id.padEnd(32)} ${b.title}  [${b.projects.join(', ') || 'no project'}]  ${short(b.updated?.commit)} ${b.updated?.author ?? ''}  ${reviewLine(b)}`).join('\n') || 'No braindumps yet.', v.braindumps.map(({ text: _t, ...b }) => b))
+        c.out(v.braindumps.map(b => `${b.id.padEnd(32)} ${b.title}  [${b.projects.join(', ') || 'no project'}]  ${short(b.updated?.commit)} ${b.updated?.author ?? ''}  ${reviewLine(b)}`).join('\n') || 'No braindumps yet.', v.braindumps)
         return 0
       }
       if (!a2) throw c.usage(`wfe catalog braindump ${a1} <path>`)
@@ -132,10 +160,44 @@ export async function catalogCommand(c: CatalogCli): Promise<number> {
       throw c.usage('wfe catalog braindump list | show | add | edit | remove')
     }
     if (sub === 'review' || sub === 'reviews') {
-      if (!a2 || (a1 !== 'show' && a1 !== 'put')) throw c.usage('wfe catalog review show <path> | put <path> (--file <md> | --text <text>) --author <who> [--base <commit>]')
+      if (a1 === 'request') {
+        const r = await m.upkeepRequest(ctx, { kind: 'review', id: a2 })
+        const q = await c.request({ workspace: r.workspace, workflow: r.workflow, text: r.text, author: author(), receipt: r.receipt })
+        c.out(q.message, { ...r, request: q.data }); return 0
+      }
+      if (!a2 || (a1 !== 'show' && a1 !== 'put')) throw c.usage('wfe catalog review show <path> | put <path> (--file <md> | --text <text>) --author <who> [--base <commit>] | request [<path>] --author <who>')
       if (a1 === 'put') { const r = await m.putReview(ctx, { id: a2, text: await textArg(), author: author(), base: c.opt('base'), message: c.opt('message') }); c.out(r.message, r); return 0 }
       const r = await m.review(ctx, a2)
-      c.out([`${r.id}: ${r.title}`, `braindump: ${r.braindump.updated ? `${r.braindump.updated.author}, ${r.braindump.updated.at.slice(0, 10)}, ${short(r.braindump.updated.commit)}` : '?'}`, reviewLine(r), ...(r.review ? ['', r.review.text] : [])].join('\n'), r)
+      c.out([`${r.id}: ${r.title}`, `braindump: ${r.braindump.updated ? `${r.braindump.updated.author}, ${r.braindump.updated.at.slice(0, 10)}, ${short(r.braindump.updated.commit)}` : '?'}`, reviewLine(r), ...(r.review ? ['', r.review.text ?? ''] : [])].join('\n'), r)
+      return 0
+    }
+    if (sub === 'index') {
+      if (a1 === 'put') { const r = await m.putIndex(ctx, { text: await textArg(), author: author(), base: c.opt('base'), message: c.opt('message') }); c.out(r.message, r); return 0 }
+      if (a1 === 'request') {
+        const r = await m.upkeepRequest(ctx, { kind: 'index' })
+        const q = await c.request({ workspace: r.workspace, workflow: r.workflow, text: r.text, author: author(), receipt: r.receipt })
+        c.out(q.message, { ...r, request: q.data }); return 0
+      }
+      if (a1 !== 'show' && a1 !== undefined) throw c.usage('wfe catalog index show | put (--file <md> | --text <text>) --author <who> [--base <commit>] | request --author <who>')
+      const r = await m.index(ctx, { maxAgeMs: 0 })
+      c.out([`${r.path} @ ${short(r.updated?.commit)}${r.updated ? ` (${r.updated.author}, ${r.updated.at})` : ''}  catalog head ${short(r.head)}`, ...(r.note ? [r.note] : []), ...(r.text === null ? [] : ['', r.text])].join('\n'), r)
+      return 0
+    }
+    if (sub === 'publication') {
+      if (a1 === 'use') { if (!a2) throw c.usage('wfe catalog publication use <folder>'); const r = await m.setPublicationWorkspace(ctx, a2); c.out(r.message, r); return 0 }
+      if (a1 !== 'status' && a1 !== undefined) throw c.usage('wfe catalog publication status | use <folder>')
+      const r = await m.publicationStatus(ctx, { maxAgeMs: 0 })
+      if (!r.contract) { c.out('The catalog has no publication/github.toml: nothing is published.', r); return 0 }
+      const list = (name: string, xs: string[]) => [`${name} (${xs.length})`, ...xs.map(x => `  ${x}`)]
+      c.out([
+        `${r.destination}  catalog head ${short(r.head)}`,
+        r.last ? `last public commit ${short(r.last.publicCommit)} from catalog ${short(r.last.sourceRev)} at ${r.last.at}` : `last public commit: ${r.note}`,
+        '', ...list('Braindumps', r.braindumps.map(b => `${b.id} → ${b.public}`)),
+        ...list('Reviews', r.reviews.map(b => `${b.id} → ${b.public}`)),
+        ...list('Challenges', r.challenges.map(x => `${x.id} (${x.files} file${x.files === 1 ? '' : 's'})`)),
+        ...list('The rest', r.rest.map(e => e.from === e.public ? e.public : `${e.from} → ${e.public}`)),
+        '', `Internal braindumps (${r.internal.braindumps.length}): ${r.internal.braindumps.join(', ') || 'none'}`,
+      ].join('\n'), r)
       return 0
     }
     if (sub === 'migrate') {

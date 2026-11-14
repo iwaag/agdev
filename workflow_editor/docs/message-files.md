@@ -228,7 +228,7 @@ bytes and their hash.
   recovery package: the transcript, the manifests, every original file and
   `package.json` (`ag.conversation-package.v1`) with every hash. Hashes are
   checked while packaging. Pinned challenges are not embedded: restoring
-  their content still needs `pj-challenges` beside it.
+  their content still needs the challenge repository (the owner's catalog) beside it.
 - `wfe conversation restore <package> --into <dir>` unpacks into an isolated
   folder, checking every hash, and reports the message ↔ file associations.
   It writes no store, starts no run and replays no delivery.

@@ -190,7 +190,7 @@ A target project needs a `publication-edit` workflow (the project's own agent, t
 | `github.com/iwaag/pj-warden` | warden: the `recovery` and `coordination` roles | `pj-warden` |
 | `github.com/iwaag/pj-ponderer` with `study-argue`, `wedo-argue` | ponderer: `facilitation`, `conversation-archive` | `pj-ponderer` and its submodules |
 | `github.com/iwaag/pj-aghangout` | aghangout: `conversation-page`, `dialogue-renderer` | `pj-aghangout` |
-| `github.com/iwaag/mycatalog` | the published part of the owner's catalog (`projects.yaml`, `mycatalog.yaml`) | the owner's catalog on Gitea (`<owner>/mycatalog`) |
+| `github.com/iwaag/mycatalog` | the published part of the owner's catalog (`projects.yaml`, `mycatalog.yaml`, and the braindumps and challenges its file list names) | the owner's catalog on Gitea (`<owner>/mycatalog`) |
 | `github.com/iwaag/pj-forge`, `pj-agsfx`, `wedo-sfx` | other shared projects (not role projects) | their Gitea repositories |
 
 Each is an edited derivative with its own history. A public commit's message names the internal
@@ -205,6 +205,13 @@ public commit of a role project is then a change of `projects.yaml` (its `commit
 `mycatalog` is republished by hand with this tool from a clone of the catalog outside the
 service's (`build`, read, `stage`, `push`). Installations that summoned the project move to it by a
 plan revision (fast-forward).
+
+**The catalog's file list.** In `mycatalog`, `publication/github.toml` chooses what is public per
+braindump and per challenge: one `[[tree]]` for each folder (`braindumps/episodes/<path>`,
+`challenges/<id>`), with `exclude` globs for evidence files that should stay internal. Everything not
+listed is internal. `wfe catalog publication status` shows what the list selects and the last public
+commit; `build` shows the candidate and the forbidden-word result before anything is pushed
+(`workflow_editor/docs/mycatalog.md`, "The published part").
 
 ## Not covered
 

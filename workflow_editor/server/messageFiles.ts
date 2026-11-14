@@ -299,7 +299,7 @@ export async function writePackage(out: string, o: { conversation: string; by: s
   const pkg: Package = {
     kind: PACKAGE_KIND, conversation: o.conversation, created: new Date().toISOString(), by: o.by, horizon: o.horizon,
     transcript: { path: 'transcript.jsonl', bytes: Buffer.byteLength(o.transcript), sha256: sha(o.transcript) }, manifests, files, challenges: o.challenges,
-    note: 'Original files and their manifests are included. Pinned challenges are referenced, not embedded: their content needs the challenge repository (pj-challenges) beside it. Restoring this package starts nothing and replays no delivery.',
+    note: 'Original files and their manifests are included. Pinned challenges are referenced, not embedded: their content needs the challenge repository (the catalog of the owner) beside it. Restoring this package starts nothing and replays no delivery.',
   }
   await writeFile(join(out, 'package.json'), `${JSON.stringify(pkg, null, 2)}\n`)
   return pkg

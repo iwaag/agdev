@@ -8,26 +8,37 @@
 // a cache: it is reset to Gitea before every write and never holds work of its
 // own. Gitea credentials are the service's own (gitea.json), as for any other
 // repository it pushes to.
+//
+// user_catalog p2: the owner's challenges live in the same repository
+// (challenges/<id>/…, written by server/challenges.ts through its own journal
+// and clone), challenges.md at the root is the index of what is not yet real
+// (written by an agent, stored and shown here, never parsed), and
+// publication/github.toml says which braindumps and challenges are in the
+// published part.
 import { mkdir, readdir, rename, rm, stat, writeFile } from 'node:fs/promises'
 import { basename, dirname, join, resolve } from 'node:path'
 import type { Issue } from '../shared/model.ts'
 import {
-  braindumpExcerpt, braindumpPath, braindumpTitle, BRAINDUMP_DIR, BRAINDUMP_FILE, CATALOG_FILE, CATALOG_REPOSITORY, EPISODES_DIR, isBraindumpId,
-  MAX_BRAINDUMP_DEPTH, MYCATALOG_SCHEMA, OLD_LAYOUT, OLD_LAYOUT_PROBLEM, PLAN_NAME_PATTERN, PROJECTS_PATH, PROJECTS_SCHEMA, reviewPath,
+  braindumpExcerpt, braindumpPath, braindumpTitle, BRAINDUMP_DIR, BRAINDUMP_FILE, CATALOG_FILE, CATALOG_REPOSITORY, CHALLENGES_DIR, EPISODES_DIR, INDEX_PATH, isBraindumpId,
+  MAX_BRAINDUMP_DEPTH, MYCATALOG_SCHEMA, OLD_LAYOUT, OLD_LAYOUT_PROBLEM, PLAN_NAME_PATTERN, PROJECTS_PATH, PROJECTS_SCHEMA, PUBLICATION_CONTRACT, publishedPaths, readPublicationContract, reviewPath,
   SEGMENT_PATTERN, summonplanPath, SUMMONPLAN_DIR, validateMycatalog, validateProjects, validateSummonplan,
   type CatalogDoc, type ProjectsDoc, type SummonEntry, type Summonplan,
 } from '../shared/catalog.ts'
 import { atomicWrite, readTextOrNull } from './files.ts'
 import { git, gitOk } from './git.ts'
 import { Gitea, GiteaError } from './gitea.ts'
+import { loadChallengeConfig, type ChallengeStore } from './challenges.ts'
 import { withLock } from './lock.ts'
 import { loadRegistry, registerRepository } from './registry.ts'
 import { RequestError } from './workspace.ts'
 import { parseMycatalog, parseProjects, parseSummonplan } from './yamlDoc.ts'
 
 export const CATALOG_SETTING = 'catalog.json'
-export interface CatalogSetting { repository: { id: number; owner: string; name: string }; branch: string; plan: string }
-export interface CatalogContext { area: string; registryFile: string; gitea?: Gitea; giteaProblem?: string }
+// publicationWorkspace: where the owner publishes the catalog from (the folder
+// agdev-external-publish works in); only its journal is read, for the last public commit.
+export interface CatalogSetting { repository: { id: number; owner: string; name: string }; branch: string; plan: string; publicationWorkspace?: string }
+// challenges: the service's own challenge store; without it one is opened for the read.
+export interface CatalogContext { area: string; registryFile: string; gitea?: Gitea; giteaProblem?: string; challenges?: ChallengeStore }
 
 const settingFile = (area: string) => join(area, CATALOG_SETTING)
 const checkoutDir = (area: string) => join(area, '.local', 'catalog')
@@ -53,7 +64,8 @@ export async function loadCatalogSetting(area: string): Promise<CatalogSetting |
   try { raw = JSON.parse(text) } catch (e) { throw new RequestError(500, `${settingFile(area)} is not valid JSON (${(e as Error).message}); fix it`) }
   const r = isObj(raw) && isObj(raw.repository) ? raw.repository : null
   if (!isObj(raw) || !r || typeof r.id !== 'number' || typeof r.owner !== 'string' || typeof r.name !== 'string') throw new RequestError(500, `${settingFile(area)} needs {"repository": {"id", "owner", "name"}, "branch", "plan"}`)
-  return { repository: { id: r.id, owner: r.owner, name: r.name }, branch: typeof raw.branch === 'string' && raw.branch ? raw.branch : 'main', plan: typeof raw.plan === 'string' ? raw.plan : '' }
+  return { repository: { id: r.id, owner: r.owner, name: r.name }, branch: typeof raw.branch === 'string' && raw.branch ? raw.branch : 'main', plan: typeof raw.plan === 'string' ? raw.plan : '',
+    ...(typeof raw.publicationWorkspace === 'string' && raw.publicationWorkspace ? { publicationWorkspace: raw.publicationWorkspace } : {}) }
 }
 
 const needGitea = (ctx: CatalogContext): Gitea => {
@@ -124,6 +136,7 @@ async function commitChanges(ctx: CatalogContext, s: CatalogSetting, changes: Ca
       const p = await git(dir, ['push', '-q', '--', g.cloneUrl(s.repository.owner, s.repository.name), `HEAD:refs/heads/${s.branch}`], { env: await wrap(() => g.gitEnv()), timeoutMs: 120_000 })
       if (p.code === 0) {
         await gitOk(dir, ['update-ref', `refs/remotes/origin/${s.branch}`, 'HEAD'])
+        void pushMirrors(ctx, s, (await gitOk(dir, ['rev-parse', 'HEAD'])).trim())
         return { commit: (await gitOk(dir, ['rev-parse', 'HEAD'])).trim(), changed: true }
       }
       if (attempt >= 1) throw new RequestError(409, `pushing to the catalog failed: ${p.stderr.trim()}`)
@@ -131,13 +144,37 @@ async function commitChanges(ctx: CatalogContext, s: CatalogSetting, changes: Ca
   }, { what: 'the catalog' })
 }
 
+// Whether <area>/challenges.json names this catalog as the challenge repository.
+const sameRepository = (a: string, b: string) => a.replace(/\/\/[^@/]+@/, '//').replace(/\/+$/, '').replace(/\.git$/, '') === b.replace(/\/+$/, '').replace(/\.git$/, '')
+function challengesHere(ctx: CatalogContext, s: CatalogSetting) {
+  const c = loadChallengeConfig(ctx.area)
+  if ('disabled' in c) return { config: null, inCatalog: false, reason: c.disabled }
+  const inCatalog = !!ctx.gitea && sameRepository(c.destination, ctx.gitea.cloneUrl(s.repository.owner, s.repository.name))
+  return { config: c, inCatalog, reason: inCatalog ? '' : `challenges.json names ${c.destination}, not this catalog` }
+}
+
+// The catalog's backup: when the challenges are in the catalog, the mirrors
+// challenges.json names hold the whole repository, so a catalog commit goes
+// there too. Best effort, as for a challenge publication; never read.
+async function pushMirrors(ctx: CatalogContext, s: CatalogSetting, commit: string): Promise<void> {
+  try {
+    const { config, inCatalog } = challengesHere(ctx, s)
+    if (!config || !inCatalog) return
+    for (const m of config.mirrors) {
+      const r = await git(checkoutDir(ctx.area), ['push', '-q', '--', m, `${commit}:refs/heads/${s.branch}`], { env: { GIT_TERMINAL_PROMPT: '0', ...(config.sshCommand ? { GIT_SSH_COMMAND: config.sshCommand } : {}) }, timeoutMs: 60_000 })
+      if (r.code !== 0) console.error(`catalog: mirror ${m} was not updated: ${r.stderr.trim()}`)
+    }
+  } catch (e) { console.error(`catalog: mirrors: ${(e as Error).message}`) }
+}
+
 // ---- reading ---------------------------------------------------------------------
 
 export interface Change { commit: string; at: string; author: string }
-export interface ReviewInfo { path: string; text: string; updated: Change | null }
+export interface ReviewInfo { path: string; text?: string; updated: Change | null; published: boolean }
 export interface BraindumpInfo {
   id: string; path: string; title: string; excerpt: string; text?: string
   updated: Change | null
+  published: boolean // in the published part (publication/github.toml selects it)
   review: ReviewInfo | null
   // Derived from Git: the braindump's newest change is newer than its review's.
   changedAfterReview: boolean
@@ -151,7 +188,13 @@ export interface CatalogSnapshot {
   braindumps: BraindumpInfo[]
   plans: PlanInfo[]
   projects: { doc: ProjectsDoc | null; problem?: string; issues: Issue[] }
+  index: IndexInfo
+  published: Map<string, string> // source path → public path
 }
+// challenges.md: the index of what is not yet real. `stale` lists what
+// changed under braindumps/ or challenges/ after the index's last change
+// (derived from Git; a commit that only moves files does not count).
+export interface IndexInfo { path: string; text: string | null; updated: Change | null; stale: (Change & { under: string })[]; note: string }
 
 // The last change of a file's content. A commit that only moved it (a
 // migration, a renamed folder's history) is not a change of what it says.
@@ -159,6 +202,35 @@ async function lastChange(dir: string, path: string): Promise<Change | null> {
   const r = await git(dir, ['log', '-1', '--follow', '-M100%', '--diff-filter=AM', '--format=%H%x09%aI%x09%an', '--', path])
   const [commit, at, author] = r.stdout.trim().split('\n')[0].split('\t')
   return commit ? { commit, at, author } : null
+}
+
+// The newest commit that changed what a directory says (not one that only moved files).
+async function lastChangeUnder(dir: string, under: string): Promise<Change | null> {
+  const r = await git(dir, ['log', '-1', '-M100%', '--diff-filter=AMD', '--format=%H%x09%aI%x09%an', '--', under])
+  const [commit, at, author] = r.stdout.trim().split('\n')[0].split('\t')
+  return commit ? { commit, at, author } : null
+}
+const isAfter = async (dir: string, later: string, earlier: string) => later !== earlier && (await git(dir, ['merge-base', '--is-ancestor', earlier, later])).code === 0
+
+async function readIndex(dir: string): Promise<IndexInfo> {
+  const text = await readTextOrNull(join(dir, INDEX_PATH))
+  if (text === null) return { path: INDEX_PATH, text: null, updated: null, stale: [], note: `No index yet (${INDEX_PATH}).` }
+  const updated = await lastChange(dir, INDEX_PATH)
+  const stale: IndexInfo['stale'] = []
+  if (updated) for (const under of [BRAINDUMP_DIR, CHALLENGES_DIR]) {
+    const c = await lastChangeUnder(dir, under)
+    if (c && await isAfter(dir, c.commit, updated.commit)) stale.push({ ...c, under })
+  }
+  return { path: INDEX_PATH, text, updated, stale, note: stale.length ? `Changed since the index was written: ${stale.map(c => `${c.under}/ (${c.author}, ${c.at.slice(0, 10)}, ${c.commit.slice(0, 7)})`).join('; ')}.` : '' }
+}
+
+// What publication/github.toml selects of the repository's files (source path → public path).
+async function readPublished(dir: string): Promise<{ contract: boolean; destination: string; paths: Map<string, string> }> {
+  const text = await readTextOrNull(join(dir, PUBLICATION_CONTRACT))
+  if (text === null) return { contract: false, destination: '', paths: new Map() }
+  const sel = readPublicationContract(text)
+  const files = (await gitOk(dir, ['-c', 'core.quotePath=false', 'ls-files', '-z'])).split('\0').filter(Boolean)
+  return { contract: true, destination: sel.destination, paths: publishedPaths(sel, files) }
 }
 
 // The one rule: every braindump.md under braindumps/episodes/, at any depth.
@@ -176,15 +248,15 @@ async function braindumpIds(dir: string): Promise<string[]> {
 }
 const knownBraindumps = async (dir: string) => (await braindumpIds(dir)).map(braindumpPath)
 
-async function readBraindump(dir: string, id: string, withText: boolean): Promise<BraindumpInfo> {
+async function readBraindump(dir: string, id: string, withText: boolean, published: Map<string, string>): Promise<BraindumpInfo> {
   const path = braindumpPath(id)
   const text = (await readTextOrNull(join(dir, path))) ?? ''
   const updated = await lastChange(dir, path)
   const rt = await readTextOrNull(join(dir, reviewPath(id)))
-  const review: ReviewInfo | null = rt === null ? null : { path: reviewPath(id), text: rt, updated: await lastChange(dir, reviewPath(id)) }
+  const review: ReviewInfo | null = rt === null ? null : { path: reviewPath(id), ...(withText ? { text: rt } : {}), updated: await lastChange(dir, reviewPath(id)), published: published.has(reviewPath(id)) }
   const changedAfterReview = !!(updated && review?.updated && updated.commit !== review.updated.commit
     && (await git(dir, ['merge-base', '--is-ancestor', review.updated.commit, updated.commit])).code === 0)
-  return { id, path, title: braindumpTitle(id, text), excerpt: braindumpExcerpt(text), ...(withText ? { text } : {}), updated, review, changedAfterReview }
+  return { id, path, title: braindumpTitle(id, text), excerpt: braindumpExcerpt(text), ...(withText ? { text } : {}), updated, published: published.has(path), review, changedAfterReview }
 }
 
 async function readSnapshot(ctx: CatalogContext, s: CatalogSetting, head: string, withText: boolean): Promise<CatalogSnapshot> {
@@ -194,8 +266,9 @@ async function readSnapshot(ctx: CatalogContext, s: CatalogSetting, head: string
   const mp = mt === null ? null : parseMycatalog(mt)
   const old = mt === null && await exists(join(dir, OLD_LAYOUT.marker))
   const catalog = mt === null ? { doc: null, problem: old ? OLD_LAYOUT_PROBLEM : `${CATALOG_FILE} is missing`, issues: [] } : mp!.ok ? { doc: mp!.model, issues: validateMycatalog(mp!.model) } : { doc: null, problem: mp!.problem.message, issues: [] }
+  const published = (await readPublished(dir)).paths
   const braindumps: BraindumpInfo[] = []
-  for (const id of await braindumpIds(dir)) braindumps.push(await readBraindump(dir, id, withText))
+  for (const id of await braindumpIds(dir)) braindumps.push(await readBraindump(dir, id, withText, published))
   const known = braindumps.map(b => b.path)
   const plans: PlanInfo[] = []
   for (const f of (await readdir(join(dir, SUMMONPLAN_DIR)).catch(() => [] as string[])).filter(f => f.endsWith('.yaml')).sort()) {
@@ -207,7 +280,7 @@ async function readSnapshot(ctx: CatalogContext, s: CatalogSetting, head: string
   const ct = await readTextOrNull(join(dir, PROJECTS_PATH))
   const cp = ct === null ? null : parseProjects(ct)
   const projects = ct === null ? { doc: null, problem: `${PROJECTS_PATH} is missing`, issues: [] } : cp!.ok ? { doc: cp!.model, issues: validateProjects(cp!.model, { braindumps: known }) } : { doc: null, problem: cp!.problem.message, issues: [] }
-  return { setting: s, web: g.webUrl(s.repository.owner, s.repository.name), head, catalog, braindumps, plans, projects }
+  return { setting: s, web: g.webUrl(s.repository.owner, s.repository.name), head, catalog, braindumps, plans, projects, index: await readIndex(dir), published }
 }
 
 // What the catalog holds now (read from Gitea at most every maxAgeMs).
@@ -233,8 +306,29 @@ export interface CatalogView {
   braindumps: (BraindumpInfo & { projects: string[] })[]
   projects: ProjectGround[]
   plans: { name: string; intent: string; entries: number; problem?: string; errors: number; warnings: number }[]
+  index: IndexInfo
+  challenges: ChallengesBrief
   issues: { where: string; issue: Issue }[]
   problems: string[]
+}
+
+// The owner's challenges as the Catalog page lists them; the challenge pages
+// and api/challenges are where a challenge is read and written.
+export interface ChallengeBrief { id: string; title: string; state: string | null; stateKind: string; projects: string[]; trials: number; updated: { at: string; by: string }; published: boolean }
+export interface ChallengesBrief { available: boolean; inCatalog: boolean; reason: string; counts: Record<string, number>; items: ChallengeBrief[] }
+async function challengesBrief(ctx: CatalogContext, s: CatalogSetting, published: Map<string, string>): Promise<ChallengesBrief> {
+  const here = challengesHere(ctx, s)
+  const none = { open: 0, resolved: 0, withdrawn: 0, custom: 0, unspecified: 0 }
+  if (!here.config) return { available: false, inCatalog: false, reason: here.reason, counts: none, items: [] }
+  let store = ctx.challenges, own = false
+  try {
+    if (!store) { const { ChallengeStore } = await import('./challenges.ts'); store = new ChallengeStore({ area: ctx.area, env: async () => ctx.gitea ? ctx.gitea.gitEnv() : {} }); own = true }
+    await store.sync()
+    const l = store.list({ limit: 500 })
+    const isPublished = (id: string) => [...published.keys()].some(p => p.startsWith(`${CHALLENGES_DIR}/${id}/`))
+    return { available: true, inCatalog: here.inCatalog, reason: here.reason, counts: l.counts,
+      items: l.challenges.map(c => ({ id: c.id, title: c.title, state: c.state, stateKind: c.stateKind, projects: c.projects, trials: c.trials.length, updated: { at: c.updated.at, by: c.updated.by }, published: here.inCatalog && isPublished(c.id) })) }
+  } catch (e) { return { available: false, inCatalog: here.inCatalog, reason: (e as Error).message, counts: none, items: [] } } finally { if (own) store?.close() }
 }
 
 async function personOf(area: string): Promise<string | null> {
@@ -261,7 +355,8 @@ export function relate(snap: CatalogSnapshot, reg: Known): Pick<CatalogView, 'br
 
 export async function catalogView(ctx: CatalogContext, o: { maxAgeMs?: number } = {}): Promise<CatalogView | { configured: false; reason: string }> {
   if (!await loadCatalogSetting(ctx.area)) return { configured: false, reason: `no catalog is attached (no ${CATALOG_SETTING}); run wfe catalog init` }
-  const snap = await catalogSnapshot(ctx, { ...o, withText: true })
+  // Excerpts only: a braindump's text and review are read when it is opened (braindump()).
+  const snap = await catalogSnapshot(ctx, o)
   const reg = await loadRegistry(ctx.registryFile)
   const problems: string[] = []
   if (snap.catalog.problem) problems.push(`${CATALOG_FILE}: ${snap.catalog.problem}`)
@@ -279,6 +374,7 @@ export async function catalogView(ctx: CatalogContext, o: { maxAgeMs?: number } 
     title: snap.catalog.doc?.title ?? '', person: await personOf(ctx.area),
     ...relate(snap, reg),
     plans: snap.plans.map(p => ({ name: p.name, intent: p.plan?.intent ?? '', entries: p.plan?.entries.length ?? 0, ...(p.problem ? { problem: p.problem } : {}), errors: p.issues.filter(i => i.severity === 'error').length, warnings: p.issues.filter(i => i.severity === 'warning').length })),
+    index: snap.index, challenges: await challengesBrief(ctx, snap.setting, snap.published),
     issues, problems,
   }
 }
@@ -391,6 +487,76 @@ export async function putPlan(ctx: CatalogContext, o: { text: string; author: st
   return { ok: true, message: r.changed ? `Wrote summonplan ${name} (${r.commit.slice(0, 7)}).` : `Summonplan ${name} is unchanged.`, commit: r.commit, changed: r.changed, issues }
 }
 
+// The index (challenges.md): what is not yet real, braindumps and challenges
+// alike, with a line or two each. An agent writes it whole (the summoner's
+// workflow `index`); nothing here reads meaning from it.
+export async function index(ctx: CatalogContext, o: { maxAgeMs?: number } = {}) {
+  const snap = await catalogSnapshot(ctx, o)
+  return { ...snap.index, head: snap.head, history: snap.index.text === null ? [] : await historyOf(checkoutDir(ctx.area), INDEX_PATH) }
+}
+export async function putIndex(ctx: CatalogContext, o: { text: string; author: string; base?: string; message?: string }) {
+  const s = await needSetting(ctx)
+  if (typeof o.text !== 'string' || !o.text.trim()) throw new RequestError(400, 'the index needs its text')
+  const r = await commitChanges(ctx, s, [{ path: INDEX_PATH, text: o.text.endsWith('\n') ? o.text : `${o.text}\n` }], o.author, o.message?.trim() || 'Write the index of what is not yet real', dir => refuseIfChangedSince(dir, INDEX_PATH, o.base, 'the index'))
+  return { ok: true, message: r.changed ? `Wrote the index ${INDEX_PATH} (${r.commit.slice(0, 7)}).` : 'The index is unchanged.', commit: r.commit, changed: r.changed, path: INDEX_PATH }
+}
+
+// Catalog upkeep is the summoner's (the one project every installation has):
+// its workflows `review` and `index` write through wfe catalog as their own
+// author. What a request for one of them says; the caller queues it.
+export const UPKEEP = { project: 'summoner', review: 'review', index: 'index' } as const
+export async function upkeepRequest(ctx: CatalogContext, o: { kind: 'review' | 'index'; id?: string }) {
+  const snap = await catalogSnapshot(ctx, { maxAgeMs: 0 })
+  if (o.kind === 'review' && o.id) { needId(o.id); if (!snap.braindumps.some(b => b.id === o.id)) throw new RequestError(404, `no braindump "${o.id}" to review`) }
+  const reg = await loadRegistry(ctx.registryFile)
+  const ws = reg.workspaces.find(w => w.id === UPKEEP.project || w.project === UPKEEP.project)
+  if (!ws) throw new RequestError(409, `no ${UPKEEP.project} here to ${o.kind === 'review' ? 'write reviews' : 'write the index'}: run agdevctl bootstrap-projects first (it brings the summoner by the core's reference)`)
+  const repo = `${snap.setting.repository.owner}/${snap.setting.repository.name}`
+  const due = snap.braindumps.filter(b => !b.review || b.changedAfterReview).map(b => b.id)
+  const text = o.kind === 'index'
+    ? `# Rewrite the catalog's index\n\nRewrite ${INDEX_PATH} of the catalog ${repo} (head ${snap.head}): everything that is not yet real, braindumps and challenges, each with its kind, a link and one or two lines on what is missing.\n\n(Requested with wfe catalog index request.)\n`
+    : o.id
+      ? `# Review braindump ${o.id}\n\nWrite or refresh the review of the braindump \`${o.id}\` (${braindumpPath(o.id)}) of the catalog ${repo} (head ${snap.head}).\n\n(Requested with wfe catalog review request ${o.id}.)\n`
+      : `# Review the braindumps that need it\n\nWrite or refresh the review of every braindump of the catalog ${repo} (head ${snap.head}) that has no review or changed after its review.${due.length ? ` At this head: ${due.join(', ')}.` : ' At this head there is none.'}\n\n(Requested with wfe catalog review request.)\n`
+  return { ok: true, kind: o.kind, ...(o.id ? { id: o.id } : {}), head: snap.head, workspace: ws.id, workflow: UPKEEP[o.kind], text, receipt: `catalog-${o.kind}-${(o.id ?? 'all').replace(/[^A-Za-z0-9._-]+/g, '.')}-${snap.head.slice(0, 12)}-${Date.now()}` }
+}
+
+// The published part: the public paths publication/github.toml selects,
+// grouped, and the last public commit the publication journal records. A
+// path not selected is internal.
+export async function publicationStatus(ctx: CatalogContext, o: { maxAgeMs?: number } = {}) {
+  const snap = await catalogSnapshot(ctx, o)
+  const dir = checkoutDir(ctx.area)
+  const p = await withLock(settingFile(ctx.area), () => readPublished(dir), { what: 'the catalog' })
+  const entries = [...p.paths.entries()].map(([from, to]) => ({ from, public: to })).sort((a, b) => a.from.localeCompare(b.from))
+  const braindumps = snap.braindumps.filter(b => b.published).map(b => ({ id: b.id, public: p.paths.get(b.path)! }))
+  const reviews = snap.braindumps.filter(b => b.review?.published).map(b => ({ id: b.id, public: p.paths.get(b.review!.path)! }))
+  const byChallenge = new Map<string, number>()
+  for (const e of entries) { const m = new RegExp(`^${CHALLENGES_DIR}/([^/]+)/`).exec(e.from); if (m) byChallenge.set(m[1], (byChallenge.get(m[1]) ?? 0) + 1) }
+  const grouped = new Set([...snap.braindumps.flatMap(b => [b.path, b.review?.path ?? '']), ...entries.filter(e => e.from.startsWith(`${CHALLENGES_DIR}/`)).map(e => e.from)])
+  const ws = snap.setting.publicationWorkspace ?? null
+  let last: { publicCommit: string; sourceRev: string; at: string } | null = null, journalNote = ws ? '' : `no publication workspace is recorded (wfe catalog publication use <folder>): the last public commit is not known here`
+  if (ws) try {
+    const j = JSON.parse((await readTextOrNull(join(ws, '.agdev', 'publication', 'github.json'))) ?? 'null') as { repositories?: Record<string, { publications?: { status?: string; public_commit?: string; source_rev?: string; published_at?: string }[] }> } | null
+    const pubs = Object.values(j?.repositories ?? {}).flatMap(r => r.publications ?? []).filter(x => x.status === 'published' && x.public_commit)
+    const l = pubs.sort((a, b) => (a.published_at ?? '').localeCompare(b.published_at ?? '')).at(-1)
+    if (l) last = { publicCommit: l.public_commit!, sourceRev: l.source_rev ?? '', at: l.published_at ?? '' }
+    else journalNote = `the journal in ${ws} records no publication`
+  } catch (e) { journalNote = `the journal in ${ws} cannot be read: ${(e as Error).message}` }
+  return { contract: p.contract, destination: p.destination, head: snap.head, braindumps, reviews,
+    challenges: [...byChallenge.entries()].map(([id, files]) => ({ id, files })), rest: entries.filter(e => !grouped.has(e.from)),
+    internal: { braindumps: snap.braindumps.filter(b => !b.published).map(b => b.id) },
+    workspace: ws, last, note: journalNote }
+}
+export async function setPublicationWorkspace(ctx: CatalogContext, folder: string) {
+  const s = await needSetting(ctx)
+  const ws = resolve(folder)
+  if (!await exists(join(ws, '.agdev', 'publication'))) throw new RequestError(400, `${ws} has no .agdev/publication/: it is not a folder agdev-external-publish has worked in`)
+  const next = { ...s, publicationWorkspace: ws }
+  await atomicWrite(settingFile(ctx.area), `${JSON.stringify(next, null, 2)}\n`)
+  return { ok: true, message: `The catalog is published from ${ws}.`, setting: next }
+}
+
 // ---- creation and attachment ---------------------------------------------------
 
 // What a new user sees first: what a catalog is, the recommended layout, and
@@ -408,6 +574,8 @@ each braindump has become real (reviews).
 
 - \`braindumps/episodes/<path>/braindump.md\`: free text: what is wanted and why. Written by the person, or by an agent the person asked, who signs as the Git author.
 - \`braindumps/episodes/<path>/review.md\` (optional): free text about that braindump: what became real, where, what did not.
+- \`challenges/<id>/\`: a problem found during work, with its trials and evidence. Written through agdev (\`wfe challenge\`), by people and agents.
+- \`challenges.md\`: the index of what is not yet real: braindumps that were not carried out and challenges that are not resolved, one or two lines each. An agent writes it (\`wfe catalog index request\`).
 - \`summonplans/<name>.yaml\` (ag.summonplan.v1): which projects make braindumps concrete in one installation, from where, at which commit, filling which roles, and because of which braindumps.
 - \`projects.yaml\` (ag.projects.v1): the projects ${owner} shares with others.
 - \`mycatalog.yaml\` (ag.mycatalog.v1): whose catalog this is.
@@ -415,6 +583,18 @@ each braindump has become real (reviews).
 \`<path>\` is any folder path you like: one folder per thought, or groups with phases below them.
 agdev reads one rule only: a \`braindump.md\` anywhere under \`braindumps/episodes/\` is a braindump,
 its folder path is its name, and a \`review.md\` beside it is its review. Other files there are yours.
+
+What is not yet real comes from two sides and stays two kinds: a braindump is a wish from above, a
+challenge is a problem met from below. Neither is turned into the other; the index lists both.
+
+## What this copy holds, and what is published
+
+This repository, on the cluster's Git service, is the catalog of everything this cluster is meant
+to make real: every braindump, review, challenge and plan. A copy published elsewhere (GitHub,
+\`<user>/mycatalog\`) is the published part of the same catalog: the problems and ideas ${owner}
+judges should be worked on in the open, and the results that may serve others and deserve to be
+kept under version control for long. What is published is chosen per braindump and per challenge
+in \`publication/github.toml\`; everything else is internal.
 
 This layout is advice, not a rule. Free text stays free. The YAML files are checked, because
 agdev acts on them. A catalog written this way, in a repository named \`mycatalog\`, is easy for
@@ -467,6 +647,14 @@ export async function initCatalog(ctx: CatalogContext, o: { title?: string; plan
   const setting: CatalogSetting = { repository: { id: repo.id, owner: repo.owner, name: repo.name }, branch: repo.defaultBranch || 'main', plan }
   await atomicWrite(settingFile(ctx.area), `${JSON.stringify(setting, null, 2)}\n`)
   steps.push({ name: CATALOG_SETTING, status: 'done', detail: `${resolve(settingFile(ctx.area))}${plan ? ` (this installation's plan: ${plan})` : ''}` })
+  // The owner's challenges live in the catalog (user_catalog p2): an area with
+  // no challenge repository gets the catalog as one. A setting that exists is the owner's.
+  const cj = join(ctx.area, 'challenges.json')
+  if (await exists(cj)) steps.push({ name: 'challenges.json', status: 'kept', detail: `${resolve(cj)} exists; challenges stay where it says` })
+  else {
+    await atomicWrite(cj, `${JSON.stringify({ repository: g.cloneUrl(repo.owner, repo.name), branch: setting.branch }, null, 1)}\n`)
+    steps.push({ name: 'challenges.json', status: 'done', detail: `challenges are kept in the catalog (${CHALLENGES_DIR}/<id>/); the running service reads this at its next start` })
+  }
   return { ok: true, message: `This installation's catalog is ${repo.fullName}.`, setting, steps }
 }
 

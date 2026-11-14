@@ -1414,6 +1414,32 @@ html[data-display="detail"] .dash-glance { max-width: none; padding: 0; }
 .catalog-review .stale { color: var(--warn); font-weight: 600; }
 .catalog-bd .entry-head { display: flex; gap: 8px; align-items: baseline; flex-wrap: wrap; }
 .catalog-text { white-space: pre-wrap; font-size: 13px; line-height: 1.5; margin: 8px 0; color: #333a44; max-width: 80ch; }
+.catalog-excerpt { white-space: pre-wrap; font-size: 13px; line-height: 1.5; margin: 6px 0 2px; color: var(--muted); max-width: 80ch; max-height: 4.5em; overflow: hidden; }
+.catalog-bd-title { color: inherit; text-decoration: none; }
+.catalog-bd-title:hover strong { text-decoration: underline; }
+.catalog-ch { display: flex; gap: 8px; align-items: baseline; flex-wrap: wrap; padding: 5px 0; font-size: 13px; }
+.catalog-ch-group { margin: 6px 0; }
+.catalog-ch-group > .catalog-folder-name { font-size: 12px; color: var(--muted); font-family: ui-monospace, SFMono-Regular, Menlo, monospace; padding-top: 4px; }
+/* Rendered Markdown (src/markdown.ts): the catalog's free text */
+.md { font-size: 13.5px; line-height: 1.55; color: #333a44; max-width: 92ch; margin: 8px 0; overflow-wrap: anywhere; }
+.md > :first-child { margin-top: 0; }
+.md > :last-child { margin-bottom: 0; }
+.md h1 { font-size: 17px; margin: 14px 0 6px; }
+.md h2 { font-size: 15px; margin: 14px 0 6px; }
+.md h3, .md h4, .md h5, .md h6 { font-size: 13.5px; margin: 12px 0 4px; }
+.md p { margin: 6px 0; }
+.md ul, .md ol { margin: 6px 0; padding-left: 22px; }
+.md li { margin: 2px 0; }
+.md code { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px; background: #eef0f3; border-radius: 4px; padding: 1px 4px; }
+.md pre { background: #f4f5f7; border-radius: 6px; padding: 8px 10px; overflow-x: auto; }
+.md pre code { background: none; padding: 0; }
+.md blockquote { margin: 6px 0; padding: 2px 12px; border-left: 3px solid var(--line); color: var(--muted); }
+.md hr { border: 0; border-top: 1px solid var(--line); margin: 12px 0; }
+.md-table { overflow-x: auto; margin: 8px 0; }
+.md table { border-collapse: collapse; font-size: 13px; }
+.md th, .md td { border: 1px solid var(--line); padding: 4px 8px; text-align: left; vertical-align: top; }
+.md th { background: #f4f5f7; font-weight: 600; }
+.catalog-review .md { margin: 4px 0; }
 .catalog-editor textarea { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 13px; margin: 6px 0; }
 .catalog-editor label { display: flex; gap: 6px; align-items: center; }
 .catalog-editor label input { max-width: 320px; }

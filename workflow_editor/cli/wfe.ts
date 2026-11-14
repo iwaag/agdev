@@ -2568,6 +2568,13 @@ async function cmdCatalog(p: Parsed): Promise<number> {
     positional: p.positional.slice(0), opt: k => opt(p, k), flag: k => p.flags.has(k), out,
     usage: m => new UsageError(m), refused: m => new Refused(m),
     ctx: async () => { const g = await giteaOf(p); return { registryFile: registryFile(p), area: areaDir(p), gitea: g, giteaProblem: g ? undefined : `no Gitea setting at ${giteaFile(p)}` } },
+    request: async o => {
+      const x = await openExec(p)
+      try {
+        const r = await x.request({ ...o, via: 'cli' })
+        return { message: `${r.duplicate ? 'Already requested (same receipt)' : 'Requested'}: run ${r.ref.workflow}/${r.ref.run} in ${o.workspace}; job ${r.job.id} is ${r.job.state}.`, data: r }
+      } finally { x.close(); execStore = undefined }
+    },
   })
 }
 

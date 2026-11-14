@@ -759,11 +759,29 @@ export function createHandler(config: ServiceConfig) {
       // ---- the catalog (user_catalog p1, docs/mycatalog.md): braindumps, reviews, grounds ----
       if (a === 'catalog') {
         const m = await import('./catalog.ts')
-        const ctx = { registryFile: config.registryFile, area, gitea: config.gitea, giteaProblem: config.giteaProblem }
+        const ctx = { registryFile: config.registryFile, area, gitea: config.gitea, giteaProblem: config.giteaProblem, challenges: await challengeStore() }
         const fresh = url.searchParams.get('refresh') === '1' ? 0 : undefined
         const text = (v: unknown) => typeof v === 'string' ? v : undefined
         // A braindump's identity is its folder path: the rest of the URL.
         const id = parts.slice(3).join('/')
+        // user_catalog p2: asking the summoner for a review or for the index (its workflows review and index).
+        const upkeep = async (kind: 'review' | 'index') => {
+          const input = await body(req) as Record<string, unknown>
+          const author = str(input.author, 'author')
+          const r = await m.upkeepRequest(ctx, { kind, id: text(input.path) || undefined })
+          const q = await needExec().request({ workspace: r.workspace, workflow: r.workflow, text: r.text, author, receipt: r.receipt, via: 'browser' })
+          return send(res, 201, { ...r, request: q, href: `#/ws/${encodeURIComponent(r.workspace)}/run/${encodeURIComponent(q.ref.workflow)}/${encodeURIComponent(q.ref.run)}` })
+        }
+        if (wsId === 'index') {
+          if (!id && method === 'GET') return send(res, 200, await m.index(ctx, { maxAgeMs: fresh }))
+          if (!id && method === 'PUT') {
+            const input = await body(req) as Record<string, unknown>
+            return send(res, 200, await m.putIndex(ctx, { text: str(input.text, 'text'), author: str(input.author, 'author'), base: text(input.base), message: text(input.message) }))
+          }
+          if (id === 'request' && method === 'POST') return await upkeep('index')
+        }
+        if (wsId === 'reviews' && id === 'request' && method === 'POST') return await upkeep('review')
+        if (wsId === 'publication' && !id && method === 'GET') return send(res, 200, await m.publicationStatus(ctx, { maxAgeMs: fresh }))
         if (!wsId && method === 'GET') return send(res, 200, await m.catalogView(ctx, { maxAgeMs: fresh }))
         if (wsId === 'braindumps') {
           if (!id && method === 'POST') {

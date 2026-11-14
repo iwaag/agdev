@@ -17,7 +17,15 @@ HTTP: `api/challenges` (below).
 ## One directory per challenge
 
 Everything the repository holds for a challenge is under its directory in
-**one shared Git repository** (the area's `challenges.json` names it):
+**one Git repository** (the area's `challenges.json` names it). Since
+user_catalog p2 that repository is the **owner's catalog**, `<owner>/mycatalog`
+([mycatalog.md](mycatalog.md)): challenges are one of the two kinds of "not yet
+real" a catalog holds, beside braindumps that were not carried out, and its
+`challenges.md` indexes both. Every installation of one owner on a cluster
+names that catalog, so they share the challenges. Nothing else of this
+contract changed with the move: the layout, the journal, the pins, the pages.
+The earlier repository's history was merged into the catalog with its commit
+ids, so a challenge pinned before the move reads as it did.
 
 ```text
 challenges/
@@ -295,8 +303,11 @@ names are read on the node and `--out` writes on the node.
 `<area>/challenges.json` (ignored with the area):
 
 ```json
-{ "repository": "<clone URL of the shared repository>", "branch": "main" }
+{ "repository": "<clone URL of the owner's catalog>", "branch": "main" }
 ```
+
+`wfe catalog init` writes it for the catalog when the area has none. Any
+repository with `challenges/<id>/…` at its root still works.
 
 Optional: `"mirrors": ["<URL>", …]` — backup copies on other hosts, pushed
 after each publication and by every executor reconcile while behind (state

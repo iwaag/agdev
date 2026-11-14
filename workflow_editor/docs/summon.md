@@ -194,7 +194,14 @@ with no roles and no grounds. It is written as the plan named after the
 installation's slug. The summoner's `propose` workflow then turns the person's
 braindumps into the rest of the plan: it reads catalogs (`<user>/mycatalog`, `projects.yaml`),
 proposes, asks, and only after agreement calls `wfe catalog plan put` and
-`wfe summon apply`. That is the only project the core names. Moving the
+`wfe summon apply`. That is the only project the core names.
+
+The summoner also keeps the catalog's reviews and its index of what is not
+yet real: its workflows `review` and `index`, requested with `wfe catalog
+review request [<path>]` and `wfe catalog index request` or from the Catalog
+page, write `review.md` files and `challenges.md` through `wfe catalog` as
+`summoner-agent` ([mycatalog.md](mycatalog.md#who-keeps-reviews-and-the-index)).
+They ask nobody first and change no braindump, challenge or plan. Moving the
 reference to a newer summoner is a change of that file's `commit`, published
 with the core.
 

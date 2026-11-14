@@ -278,7 +278,7 @@ conversation, its transcript (verbatim messages with authors, ids,
 `re`, runs and attachments' pinned revisions), membership and facilitation
 history, request outcomes, links, overviews, metadata and workflow
 versions. Challenge contents referenced by attachments live in their own
-repository (`pj-challenges`, [challenges.md](challenges.md)), which a
+repository (the owner's catalog, [challenges.md](challenges.md)), which a
 restore needs beside it. Restoring the archive restores records only: it
 never replays delivery or executes historical work (the live store, not the
 archive, starts runs). pj-ponderer `tools/discussions` reads both formats.

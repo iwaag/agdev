@@ -157,7 +157,7 @@ async function groundsSource(ctx: AccessContext, project: string, applies: Conte
       const b = snap.braindumps.find(x => x.path === p)
       lines.push('', `### ${p}${b?.updated ? ` (by ${b.updated.author}, ${b.updated.at.slice(0, 10)})` : ''}`, '', b ? (b.text ?? '').trim() : '(missing from the catalog)')
       const r = b?.review
-      if (r) lines.push('', `#### Review of ${p}${r.updated ? ` (by ${r.updated.author}, ${r.updated.at.slice(0, 10)})` : ''}${b!.changedAfterReview ? '; the braindump changed after this review' : ''}`, '', r.text.trim())
+      if (r) lines.push('', `#### Review of ${p}${r.updated ? ` (by ${r.updated.author}, ${r.updated.at.slice(0, 10)})` : ''}${b!.changedAfterReview ? '; the braindump changed after this review' : ''}`, '', (r.text ?? '').trim())
     }
     if (e.because.some(p => snap.braindumps.find(x => x.path === p)?.review)) lines.push('', 'A review is someone\'s reading of how far a braindump has become real, at its date; check it against the present state before relying on it.')
     lines.push('', 'These are the person\'s reasons for having this project here; read them as purpose, not as a request to act on. `wfe catalog why ' + project + '` shows the same.')

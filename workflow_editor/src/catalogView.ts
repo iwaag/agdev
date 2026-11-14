@@ -3,10 +3,17 @@
 // projects each grounds, a relation diagram, and every project with its
 // grounds (none is said, not hidden). Braindumps and reviews are edited here
 // through api/catalog: each change is one commit authored by the name given.
-import { api, type CatalogView } from './api.ts'
+//
+// user_catalog p2: the page opens with the index (challenges.md: what is not
+// yet real), then braindumps as titles with excerpts (a text and its review
+// are read when it is opened), then the owner's challenges by state, each
+// linking to its challenge page. Free text is rendered as Markdown. Each
+// braindump and challenge says whether it is in the published part.
+import { api, type CatalogBraindump, type CatalogView } from './api.ts'
 import { h, when } from './dom.ts'
 import type { ViewHandle } from './main.ts'
-import { siteLinks } from './site.ts'
+import { renderMarkdown, type LinkResolver } from './markdown.ts'
+import { hangoutHref, siteLinks } from './site.ts'
 
 const SVG = 'http://www.w3.org/2000/svg'
 const AUTHOR_KEY = 'wfe.catalog.author'
@@ -84,6 +91,8 @@ export function relationDiagram(v: CatalogView, onPick: (kind: 'braindump' | 'pr
 }
 
 type Bd = CatalogView['braindumps'][number]
+const challengeHref = (id: string) => `${hangoutHref()}?challenge=${encodeURIComponent(id)}`
+const publishedChip = (published: boolean) => h(`span.chip.${published ? 'ok' : 'muted'}`, { title: published ? 'In the published part of the catalog (publication/github.toml selects it)' : 'Internal: not selected by publication/github.toml' }, published ? 'published' : 'internal')
 type Editing = { kind: 'new' } | { kind: 'braindump' | 'review'; id: string } | null
 
 export function renderCatalogView(root: HTMLElement): ViewHandle {
@@ -94,6 +103,8 @@ export function renderCatalogView(root: HTMLElement): ViewHandle {
   let editing: Editing = null
   let message: HTMLElement | null = null
   const open = new Set<string>() // braindumps shown in full
+  const full = new Map<string, CatalogBraindump>() // texts and reviews, read when a braindump is opened
+  let asked: HTMLElement | null = null // the answer to the last request to the summoner
   const author = h('input', { value: readAuthor(), placeholder: 'your name', 'aria-label': 'Author of changes', size: 14, onchange: () => keepAuthor(author.value.trim()) })
 
   const header = h('header.topbar', h('div.crumbs', h('a', { href: '#/' }, 'agdev'), h('span.sep', '/'), h('span.muted', 'Catalog')),
@@ -107,7 +118,36 @@ export function renderCatalogView(root: HTMLElement): ViewHandle {
     // summoner p2: whether each plan entry is applied here (docs/summon.md); its absence only hides the indicator.
     applied = data?.configured && data.plan ? await api.summon().catch(() => null) : null
     if (data && data.configured && !author.value && data.person) author.value = data.person
+    // What is open is read again; the rest is read when opened.
+    if (refresh) { const ids = [...full.keys()]; full.clear(); await Promise.all(ids.map(id => api.catalogBraindump(id).then(b => { full.set(id, b) }, () => { open.delete(id) }))) }
     if (!disposed) render()
+  }
+  async function need(id: string): Promise<CatalogBraindump | null> {
+    if (!full.has(id)) try { full.set(id, await api.catalogBraindump(id)) } catch (e) { message = h('div.banner.error', (e as Error).message); return null }
+    return full.get(id)!
+  }
+  const toggle = async (id: string, to?: boolean) => {
+    if (to ?? !open.has(id)) { if (await need(id)) open.add(id) } else open.delete(id)
+    render()
+  }
+  // Links inside the catalog's texts: a braindump opens here, a challenge on its page, anything else on Gitea.
+  const linker = (v: CatalogView, base: string): LinkResolver => target => {
+    if (/^[a-z][a-z0-9+.-]*:|^#|^\/\//i.test(target)) return null
+    const segs: string[] = target.startsWith('/') ? [] : base.split('/').filter(Boolean)
+    for (const seg of target.replace(/[#?].*$/, '').split('/')) { if (seg === '..') segs.pop(); else if (seg && seg !== '.') segs.push(seg) }
+    const path = segs.join('/')
+    const bd = /^braindumps\/episodes\/(.+?)(\/(braindump|review)\.md)?$/.exec(path)
+    if (bd && v.braindumps.some(b => b.id === bd[1])) return { href: '#/catalog', onclick: e => { e.preventDefault(); void toggle(bd[1], true).then(() => pick('braindump', bd[1])) } }
+    const ch = /^challenges\/([^/]+)/.exec(path)
+    if (ch) return { href: challengeHref(ch[1]), external: true }
+    return { href: `${v.web}/src/branch/${v.branch}/${path}`, external: true }
+  }
+  const ask = async (what: string, f: () => Promise<{ href: string; workspace: string; workflow: string }>) => {
+    if (!author.value.trim()) { asked = h('div.banner.error', 'Write your name as the author first: the request is made in your name.'); render(); return }
+    keepAuthor(author.value.trim())
+    asked = h('p.muted.small', 'Requesting…'); render()
+    try { const r = await f(); asked = h('div.banner.ok', `Asked the summoner for ${what} (${r.workspace}/${r.workflow}). `, h('a', { href: r.href }, 'Open the run'), ' It writes to the catalog when it is done; refresh then.') } catch (e) { asked = h('div.banner.error', (e as Error).message) }
+    render()
   }
 
   const pick = (kind: 'braindump' | 'project', id: string) => {
@@ -127,7 +167,7 @@ export function renderCatalogView(root: HTMLElement): ViewHandle {
 
   function editor(b?: Bd): HTMLElement {
     const id = h('input', { value: '', placeholder: 'folder path: a-thought, or group/phase', 'aria-label': 'Braindump path', size: 40 })
-    const text = h('textarea', { rows: 16, value: b ? b.text ?? '' : '# Title\n\nWhat I want, and why.\n', 'aria-label': 'Braindump text' })
+    const text = h('textarea', { rows: 16, value: b ? full.get(b.id)?.text ?? '' : '# Title\n\nWhat I want, and why.\n', 'aria-label': 'Braindump text' })
     return h('div.catalog-editor',
       b ? null : h('label.small', 'Path below braindumps/episodes/ (it is the identity) ', id),
       text,
@@ -137,38 +177,79 @@ export function renderCatalogView(root: HTMLElement): ViewHandle {
   }
 
   // The review sits below its braindump and is edited in the same place.
-  function reviewBlock(b: Bd): HTMLElement {
+  function reviewBlock(b: Bd, v: CatalogView): HTMLElement {
     const r = b.review
+    const text = full.get(b.id)?.review?.text ?? ''
+    const askButton = h('button.small', { title: 'The summoner reads the braindump, the projects that name it and their records, and writes review.md as its own author', onclick: () => void ask(`a review of ${b.id}`, () => api.catalogReviewRequest(author.value.trim(), b.id)) }, 'Ask for a review')
     if (editing?.kind === 'review' && editing.id === b.id) {
-      const text = h('textarea', { rows: 10, value: r?.text ?? '', placeholder: 'Free text: what of this became real, where, and what did not.', 'aria-label': 'Review text' })
-      return h('div.catalog-review.catalog-editor', h('strong.small', 'Review'), text,
-        h('div.row', h('button.primary', { onclick: () => void change(() => api.catalogReviewPut(b.id, text.value, author.value.trim(), r?.updated?.commit)) }, 'Commit the review'), cancel(),
+      const area = h('textarea', { rows: 10, value: text, placeholder: 'Free text: what of this became real, where, and what did not.', 'aria-label': 'Review text' })
+      return h('div.catalog-review.catalog-editor', h('strong.small', 'Review'), area,
+        h('div.row', h('button.primary', { onclick: () => void change(() => api.catalogReviewPut(b.id, area.value, author.value.trim(), r?.updated?.commit)) }, 'Commit the review'), cancel(),
           h('span.small.muted', 'Free text about the braindump; no form is required. You sign it as the author.')))
     }
-    if (!r) return h('div.catalog-review.none', h('span.small.muted', 'No review. '), h('button.small', { onclick: () => { editing = { kind: 'review', id: b.id }; render() } }, 'Write a review'))
+    if (!r) return h('div.catalog-review.none', h('span.small.muted', 'No review. '), askButton, h('button.small', { onclick: () => { editing = { kind: 'review', id: b.id }; render() } }, 'Write a review'))
     return h('div.catalog-review',
-      h('div.entry-head', h('strong.small', 'Review'), r.updated ? h('span.muted.small', `${r.updated.author} · ${when(r.updated.at)} · ${r.updated.commit.slice(0, 7)}`) : null,
+      h('div.entry-head', h('strong.small', 'Review'), r.updated ? h('span.muted.small', `${r.updated.author} · ${when(r.updated.at)} · ${r.updated.commit.slice(0, 7)}`) : null, publishedChip(r.published),
         b.changedAfterReview ? h('span.small.stale', { title: `The braindump's last change (${b.updated?.commit.slice(0, 7)}) is newer than this review.` }, 'The braindump changed after this review') : null),
-      h('div.catalog-text', r.text.trim()),
-      h('div.row', h('button.small', { onclick: () => { editing = { kind: 'review', id: b.id }; render() } }, 'Edit review')))
+      renderMarkdown(text, linker(v, `braindumps/episodes/${b.id}`)),
+      h('div.row', askButton, h('button.small', { onclick: () => { editing = { kind: 'review', id: b.id }; render() } }, 'Edit review')))
   }
 
+  // Closed: the title, an excerpt and whether it is reviewed. Opened: the
+  // text and the review, read then (api/catalog/braindumps/<path>).
   function braindumpCard(b: Bd, v: CatalogView): HTMLElement {
     const edit = editing?.kind === 'braindump' && editing.id === b.id
-    const whole = open.has(b.id) || (b.text ?? '').trim().length <= b.excerpt.length + 40
+    const whole = open.has(b.id) && full.has(b.id)
+    const reviewNote = !b.review ? h('span.chip.muted', 'not reviewed') : b.changedAfterReview ? h('span.chip.warn', 'changed after its review') : h('span.chip', { title: b.review.updated ? `${b.review.updated.author} · ${when(b.review.updated.at)}` : '' }, 'reviewed')
     return h('article.catalog-bd', { dataset: { braindump: b.id } },
-      h('div.entry-head', h('strong', b.title), h('code', b.id),
+      h('div.entry-head', h('a.catalog-bd-title', { href: '#/catalog', onclick: (e: Event) => { e.preventDefault(); void toggle(b.id) }, title: whole ? 'Close' : 'Open the text and its review' }, h('strong', `${whole ? '▾' : '▸'} ${b.title}`)), h('code', b.id),
+        reviewNote, publishedChip(b.published),
         b.updated ? h('span.muted.small', `${b.updated.author} · ${when(b.updated.at)} · ${b.updated.commit.slice(0, 7)}`) : null,
         h('a.small', { href: `${v.web}/src/branch/${v.branch}/${b.path}`, target: '_blank', rel: 'noopener' }, 'on Gitea')),
       h('div.chips', h('span.small.muted', 'grounds '), b.projects.length
         ? b.projects.map(id => { const p = v.projects.find(x => x.project === id); const href = p && projectHref(p); return href ? h('a.chip', { href }, id) : h('span.chip', id) })
         : h('span.chip.muted', `no project in ${v.plan || 'the plan'}`)),
-      edit ? editor(b) : h('div.catalog-text', whole ? (b.text ?? b.excerpt).trim() : b.excerpt),
-      edit ? null : h('div.row',
-        (b.text ?? '').trim().length <= b.excerpt.length + 40 ? null : h('button', { onclick: () => { if (!open.delete(b.id)) open.add(b.id); render() } }, whole ? 'Show less' : 'Read in full'),
+      edit ? editor(b) : whole ? renderMarkdown(full.get(b.id)!.text ?? '', linker(v, `braindumps/episodes/${b.id}`)) : h('div.catalog-excerpt', b.excerpt),
+      !whole || edit ? null : h('div.row',
         h('button', { onclick: () => { editing = { kind: 'braindump', id: b.id }; render() } }, 'Edit'),
         h('button.danger', { onclick: () => { if (confirm(`Remove braindump ${b.id}${b.review ? ' and its review' : ''}? They stay in the repository's history.${b.projects.length ? `\nIt grounds ${b.projects.join(', ')}: the plan's because lists must drop it first.` : ''}`)) void change(() => api.catalogRemove(b.id, author.value.trim())) } }, 'Remove')),
-      reviewBlock(b))
+      whole ? reviewBlock(b, v) : null)
+  }
+
+  // The index (challenges.md): what is not yet real, written by the summoner's workflow index.
+  function indexCard(v: CatalogView): HTMLElement {
+    const x = v.index
+    return h('section.card.catalog-index',
+      h('div.card-head', h('h2', 'Not yet real'),
+        h('span.muted.small', x.updated ? `${x.path} · ${x.updated.author} · ${when(x.updated.at)} · ${x.updated.commit.slice(0, 7)}` : x.path)),
+      h('p.muted.small', 'The index of what is not yet real, from both origins: a braindump that was not carried out, and a challenge (a problem found during work) that is not resolved. An agent writes it by reading the braindumps with their reviews and the challenges; it is a reading, not a state kept by hand.'),
+      x.text === null ? h('p.muted', 'No index yet.') : null,
+      x.stale.length ? h('div.banner.warn', x.note) : null,
+      h('div.row', h('button', { title: 'The summoner reads every braindump with its review and every challenge that is not resolved or withdrawn, and rewrites challenges.md', onclick: () => void ask('the index', () => api.catalogIndexRequest(author.value.trim())) }, x.text === null ? 'Write the index' : 'Refresh the index'),
+        h('button', { title: 'The summoner reviews every braindump with no review or changed after its review', onclick: () => void ask('reviews of the braindumps that need one', () => api.catalogReviewRequest(author.value.trim())) }, 'Ask for the reviews that are due')),
+      asked,
+      x.text === null ? null : renderMarkdown(x.text, linker(v, '')))
+  }
+
+  // The owner's challenges, by state; a challenge is read and written on its own page.
+  function challengesCard(v: CatalogView): HTMLElement {
+    const c = v.challenges
+    const order = ['open', 'custom', 'unspecified', 'resolved', 'withdrawn']
+    const groups = order.map(k => ({ kind: k, items: c.items.filter(i => i.stateKind === k) })).filter(g => g.items.length)
+    return h('section.card.catalog-challenges',
+      h('div.card-head', h('h2', 'Challenges'), h('span.muted.small', c.available ? Object.entries(c.counts).filter(([, n]) => n).map(([k, n]) => `${n} ${k}`).join(' · ') || 'none' : '')),
+      h('p.muted.small', 'Problems found during work, with the trials made on them. They stay a kind of their own: a challenge is not turned into a braindump, nor a braindump into a challenge.'),
+      !c.available ? h('p.muted', c.reason) : null,
+      c.available && !c.inCatalog ? h('div.banner.warn', `These challenges are not in this catalog: ${c.reason}.`) : null,
+      groups.map(g => h('div.catalog-ch-group', h('div.catalog-folder-name', g.kind),
+        g.items.map(i => h('div.catalog-ch', { dataset: { challenge: i.id } },
+          h('a', { href: challengeHref(i.id), target: '_blank', rel: 'noopener' }, h('code', i.id), ' ', i.title || '(no summary)'),
+          g.kind === 'custom' && i.state ? h('span.chip', i.state) : null,
+          i.projects.map(p => h('span.chip', p)),
+          i.trials ? h('span.small.muted', `${i.trials} trial${i.trials === 1 ? '' : 's'}`) : null,
+          publishedChip(i.published),
+          h('span.muted.small', `${i.updated.by} · ${when(i.updated.at)}`))))),
+      c.available && !c.items.length ? h('p.muted', 'No challenges yet.') : null)
   }
 
   // Braindumps grouped by their folder paths: a folder that holds several is
@@ -212,14 +293,15 @@ export function renderCatalogView(root: HTMLElement): ViewHandle {
       ...v.problems.map(p => h('div.banner.warn', p)),
       v.issues.length ? h('ul.issues', v.issues.map(x => h(`li.${x.issue.severity}`, `${x.where}: ${x.issue.message}`))) : null))
     if (editing?.kind === 'new') main.append(h('section.card', h('h2', 'New braindump'), editor()))
-    main.append(styleCard())
+    main.append(indexCard(v))
+    const reviewed = v.braindumps.filter(b => b.review).length
+    main.append(h('section.card', h('div.card-head', h('h2', 'Braindumps'), h('span.muted.small', `${reviewed} of ${v.braindumps.length} reviewed · ${v.braindumps.filter(b => b.published).length} published`)), v.braindumps.length ? tree(v.braindumps, v) : h('p.muted', 'No braindumps yet.')))
+    main.append(challengesCard(v))
     const grounded = v.projects.filter(p => p.braindumps.length).length
     main.append(h('section.card.catalog-relations',
       h('div.card-head', h('h2', 'Braindumps and projects'), h('span.muted.small', `${v.braindumps.length} braindumps · ${grounded} of ${v.projects.length} projects grounded`)),
       h('p.muted.small', 'Hover or focus a box to follow its edges; click to jump to it below.'),
       h('div.catalog-diagram-wrap', relationDiagram(v, pick))))
-    const reviewed = v.braindumps.filter(b => b.review).length
-    main.append(h('section.card', h('div.card-head', h('h2', 'Braindumps'), h('span.muted.small', `${reviewed} of ${v.braindumps.length} reviewed`)), v.braindumps.length ? tree(v.braindumps, v) : h('p.muted', 'No braindumps yet.')))
     main.append(h('section.card', h('h2', 'Projects and why they are here'),
       h('table.catalog-projects', h('thead', h('tr', h('th', 'Project'), h('th', 'Grounds'), h('th', 'Roles'), h('th', 'Entry'))),
         h('tbody', v.projects.map(p => h('tr', { dataset: { project: p.project } },
@@ -227,6 +309,7 @@ export function renderCatalogView(root: HTMLElement): ViewHandle {
           h('td', !p.entry ? h('span.muted', 'not in the plan') : p.braindumps.length ? h('div.chips', p.braindumps.map(b => h('a.chip', { href: '#/catalog', onclick: (e: Event) => { e.preventDefault(); pick('braindump', b.id) }, title: b.title }, b.id + (b.missing ? ' (missing)' : '')))) : h('span.chip.warn', 'no ground')),
           h('td.small', p.entry ? roleText(p.entry.roles) : ''),
           h('td.small.muted', appliedChip(p.project), p.entry ? `${p.entry.state} · ${p.entry.commit.slice(0, 7)}${p.entry.note ? ` · ${p.entry.note}` : ''}` : '')))))))
+    main.append(styleCard())
   }
 
   // summoner p5 ex1: naming a GitHub user who publishes <user>/mycatalog is

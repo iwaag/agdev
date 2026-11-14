@@ -1,4 +1,4 @@
-# The catalog: braindumps, reviews, summonplans, shared projects (user_catalog p1)
+# The catalog: braindumps, reviews, challenges, summonplans, shared projects (user_catalog p1, p2)
 
 agdev's core is the workflow and the record of *why* projects exist. The
 projects themselves (warden, ponderer, aghangout and every other) are outside
@@ -17,6 +17,30 @@ thoughts, problems and ideas (**braindumps**), and where the results of that
 development are found. It also holds what lowers the cost for others to use
 those results or learn from them, and an assessment of how far each braindump
 has become real (**reviews**).
+
+It holds what is **not yet real** too, because a record of what one made and
+how is the natural place for what one has not made, and publishing that in
+the right range lets someone who can make it join. What is not yet real has
+two origins, and they stay two kinds:
+
+| Kind | Comes from | Where | Written by |
+| --- | --- | --- | --- |
+| A **braindump** that was not carried out | above: a wish | `braindumps/episodes/<path>/`, with its review saying what is not real | the person, or an agent they asked |
+| A **challenge** | below: a problem met during work | `challenges/<id>/`, with trials and evidence ([challenges.md](challenges.md)) | anyone working, often an agent, through `wfe challenge` |
+
+Neither becomes the other: a challenge is not rewritten as a braindump when
+it grows, and a braindump is not filed as a challenge when it waits. The
+**index** (`challenges.md`) lists both.
+
+By range, the catalog is two things:
+
+- **The cluster's copy** (this repository, on the cluster's Gitea) is the
+  catalog of everything this cluster is meant to make real: every braindump,
+  review, challenge and plan.
+- **The published part** (GitHub, `<user>/mycatalog`) holds the problems and
+  ideas the owner judges should be worked on in the open, and the results
+  that may serve others and deserve to be kept under version control for
+  long. Nothing is public unless the owner lists it.
 
 There is **one catalog per user**. The copy on GitHub is the published part
 of the same repository, not a second catalog. There is no catalog per node or
@@ -51,6 +75,8 @@ mycatalog/
   projects.yaml                               # ag.projects.v1: the projects this user shares
   braindumps/episodes/<path>/braindump.md     # free text
   braindumps/episodes/<path>/review.md        # free text, optional
+  challenges/<id>/…                           # the owner's challenges (challenges.md in these docs)
+  challenges.md                               # the index of what is not yet real: braindumps and challenges
   summonplans/<name>.yaml                     # ag.summonplan.v1; one per installation or style
   publication/                                # what the published part holds (optional)
   README.md
@@ -105,6 +131,59 @@ field and no required structure.
   note. Nothing inside `review.md` is needed for it. A commit that only moves
   a file does not count as a change of what it says.
 - Removing a braindump removes its review with it.
+
+### Challenges
+
+The owner's challenges are in the catalog, under `challenges/<id>/`, in the
+layout and with the contract of [challenges.md](challenges.md): `wfe
+challenge`, `api/challenges` and the challenge pages are unchanged, and
+`<area>/challenges.json` names the catalog as the challenge repository (`wfe
+catalog init` writes it when the area has none). Every installation of one
+owner on a cluster names that owner's catalog; a second user would have their
+own, and sharing challenges between users is not built.
+
+Two writers push to the repository: the catalog's (`server/catalog.ts`,
+braindumps, reviews, plans, the index) and the challenge writer
+(`server/challenges.ts`, through its journal). Each starts again from the new
+head when its push is refused; neither force-pushes. A challenge attached to
+a message or a run is pinned as `{id, commit}`, so the commits that hold
+challenges are never rewritten. Evidence files (images, audio, video) stay in
+Git; the published part leaves files out with `exclude`.
+
+When `challenges.json` lists `mirrors`, the whole catalog is copied there:
+after a challenge publication and after a catalog commit.
+
+### The index: `challenges.md`
+
+`challenges.md` at the root is the index of what is not yet real: for each
+such thing its kind (braindump or challenge), a link, and one or two lines on
+what is missing. A braindump with no review is listed as not reviewed, not
+judged.
+
+- **An agent writes it, not a parser.** Reviews are free text, so "not yet
+  real" is a reading. The summoner's workflow `index` reads every braindump
+  with its review and every challenge whose state is not `resolved` or
+  `withdrawn`, and rewrites the file whole with `wfe catalog index put`, as
+  its own author. Its first line says which catalog commit was read.
+- **The core stores and shows it and reads nothing from it.** It is not a
+  second place to keep state: a challenge's state is in its `summary.md`, a
+  braindump's in its review.
+- **"Changed since the index"** is derived from Git: the newest commit under
+  `braindumps/` or under `challenges/` is newer than the index's last change.
+  A commit that only moves files does not count. It is shown as a note; the
+  index is rewritten on request (`wfe catalog index request`, **Refresh the
+  index** on the Catalog page), not automatically.
+
+### Who keeps reviews and the index
+
+No project owned the catalog's upkeep; the **summoner** does, because it is
+the one project every installation has and it already reads the braindumps.
+Its workflows `review` (one named braindump, or every braindump with no
+review or changed after its review) and `index` are requested with `wfe
+catalog review request [<path>]` and `wfe catalog index request`, or from the
+Catalog page. Both write through `wfe catalog`, as `summoner-agent`. Without
+a summoner the requests are refused with the reason; a person can still write
+either by hand.
 
 ### `ag.mycatalog.v1`
 
@@ -187,10 +266,34 @@ fixed name: `<github user>/mycatalog`. A summoner looks there for a user's
 shared projects. What is public is what `publication/github.toml` lists;
 everything else is private.
 
+**What is public is chosen per braindump and per challenge.** The owner adds
+one `[[tree]]` per folder to the file list:
+
+```toml
+[[tree]]                                   # a braindump with its review
+public = "braindumps/episodes/summoning"
+from = "source:braindumps/episodes/summoning"
+
+[[tree]]                                   # a challenge without its evidence files
+public = "challenges/ch-0004"
+from = "source:challenges/ch-0004"
+exclude = ["*.png", "*.mp4", "*.wav"]
+```
+
+`wfe catalog publication status` shows the public paths the list selects,
+grouped as braindumps, reviews, challenges and the rest, and the last public
+commit (from the journal of the folder the catalog is published from: `wfe
+catalog publication use <folder>` records it in `catalog.json`). The Catalog
+page marks each braindump and challenge **published** or **internal** from
+the same reading. Before a push the publication tool shows the candidate and
+runs the forbidden-word check; nothing else checks a published text for
+private names, so the owner reads it.
+
 The owner of this core publishes `iwaag/mycatalog` with `projects.yaml`,
-`mycatalog.yaml` (its `owner` becomes the public account) and a README.
-Braindumps, reviews and summonplans stay internal in this phase, and an
-entry's `because` then only says that grounds exist. Nothing in the catalog
+`mycatalog.yaml` (its `owner` becomes the public account) and a README, and
+the braindumps and challenges its file list names. Summonplans stay internal.
+An entry's `because` whose braindump is not published only says that grounds
+exist; a published one can be opened. Nothing in the catalog
 may hold host facts, credentials or cluster addresses that are not already in
 a `source` URL. Cluster facts belong to the system context.
 
@@ -202,7 +305,8 @@ a `source` URL. Cluster facts belong to the system context.
 { "repository": { "id": 412, "owner": "developer", "name": "mycatalog" }, "branch": "main", "plan": "my-plan" }
 ```
 
-`plan` names the summonplan that describes this installation. The repository
+`plan` names the summonplan that describes this installation. An optional
+`publicationWorkspace` is the folder the catalog is published from. The repository
 is also in the registry as category `catalog`. The service keeps its own
 clone at `<area>/.local/catalog/`. It reads from that clone, refreshed from
 Gitea at most every 10 s, and writes through it. Before each write the clone
@@ -268,7 +372,7 @@ words, and what of that was already said to be real. `wfe catalog why
 | CLI | API | |
 | --- | --- | --- |
 | `wfe catalog init [--title] [--plan <name>] --author <a>` | | create or attach |
-| `wfe catalog status` | `GET api/catalog` | repository, head, plan, braindumps with their reviews and projects, projects with their grounds, issues |
+| `wfe catalog status` | `GET api/catalog` | repository, head, plan, braindumps (title, excerpt, review author and date, published) and their projects, the index, the challenges by state, projects with their grounds, issues |
 | `wfe catalog braindump list` | (in `GET api/catalog`) | |
 | `wfe catalog braindump show <path>` | `GET api/catalog/braindumps/<path>` | text, review, history, projects, plans |
 | `wfe catalog braindump add <path> --file/--text --author` | `POST api/catalog/braindumps {id, text, author}` | 409 when it exists |
@@ -276,6 +380,12 @@ words, and what of that was already said to be real. `wfe catalog why
 | `wfe catalog braindump remove <path> --author [--force]` | `DELETE api/catalog/braindumps/<path> {author, force?}` | refused while a plan's `because` names it, unless forced; removes its review too |
 | `wfe catalog review show <path>` | `GET api/catalog/reviews/<path>` | the review, its history, whether the braindump changed after it |
 | `wfe catalog review put <path> --file/--text --author [--base <commit>]` | `PUT api/catalog/reviews/<path> {text, author, base?}` | 404 without the braindump; 409 when changed after `base` |
+| `wfe catalog review request [<path>] --author` | `POST api/catalog/reviews/request {path?, author}` | requests the summoner's `review`; 409 without a summoner |
+| `wfe catalog index show` | `GET api/catalog/index` | `challenges.md`, its author and date, what changed since |
+| `wfe catalog index put --file/--text --author [--base <commit>]` | `PUT api/catalog/index {text, author, base?}` | one commit; 409 when changed after `base` |
+| `wfe catalog index request --author` | `POST api/catalog/index/request {author}` | requests the summoner's `index` |
+| `wfe catalog publication status` | `GET api/catalog/publication` | the public paths the file list selects, grouped; the last public commit |
+| `wfe catalog publication use <folder>` | | the folder the catalog is published from |
 | `wfe catalog why <project>` | `GET api/catalog/why/<project>` | entry, braindumps, other plans |
 | `wfe catalog plan show <name>` | `GET api/catalog/plans/<name>` | |
 | `wfe catalog plan put <file> --author` | `PUT api/catalog/plans {text, author}` | validated against the repository; errors refuse |
@@ -284,13 +394,20 @@ words, and what of that was already said to be real. `wfe catalog why
 | `wfe catalog migrate --author <a> [--dry-run]` | | the earlier layout, in one commit |
 
 In JSON a braindump carries `id` (its path), `path` (the file), `title`,
-`updated`, `review` (`path`, `text`, `updated`, or `null`) and
-`changedAfterReview`.
+`excerpt`, `updated`, `published`, `review` (`path`, `updated`, `published`,
+or `null`) and `changedAfterReview`. `GET api/catalog` carries no full text:
+a braindump's `text` and its review's are in `GET
+api/catalog/braindumps/<path>`.
 
 The browser shows the same data under **Catalog** on Home (`#/catalog`;
-`#/mind` redirects): the braindumps grouped by folder path, each with its
-text, its review below it (or "No review"), the note when the braindump
-changed after its review, and its projects; a relation diagram; editing of
-braindumps and of reviews in the same place. Each project page has a "Why
+`#/mind` redirects). The page opens with the index (rendered, with its author
+and date, the note when something changed since, **Refresh the index**).
+Below it are the braindumps grouped by folder path, as titles with excerpts;
+a braindump's text and review are read when it is opened, and edited in the
+same place; **Ask for a review** is on each. Then the challenges by state,
+each linking to its challenge page. Braindumps, reviews and the index are
+rendered as Markdown; HTML in a text is shown, not run. Each braindump and
+challenge is marked published or internal. A relation diagram and the
+projects follow. Each project page has a "Why
 this project exists" section. A project with no ground is shown as having
 none. It is not hidden.
