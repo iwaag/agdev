@@ -59,32 +59,79 @@ environments and `install/` resources. `service/current` selects one for every s
 
 ### From GitHub, on a new Linux host
 
-The shortest path, on the host itself (Ubuntu 24.04, x86-64; a user that can `sudo`). The
-installation's own Gitea then holds the core, and the installation develops it from there:
+The shortest path, on the host itself. The installation's own Gitea then holds the core, and the
+installation develops it from there. Tried once end to end: a Proxmox VM from the
+Ubuntu 24.04 cloud image, 4 vCPU, 8 GiB, 64 GB disk, DHCP on the home LAN; about 5 minutes from
+`apt-get` to a healthy core.
+
+Before you start:
+
+- an Ubuntu 24.04 x86-64 host (a VM is the agents' isolation boundary) with about 4 vCPU, 8 GiB
+  and 60 GB free, and a user that can `sudo`;
+- outbound access to GitHub, the Ubuntu archive, nodejs.org, the npm registry and Docker Hub;
+- a Claude account for the model login (a browser on any machine is enough);
+- a host name that the host itself and your browsers resolve to its LAN address. On a home LAN
+  without your own DNS, mDNS (`<hostname>.local`, avahi, below) does it.
 
 ```sh
-sudo apt-get install -y git python3
+sudo apt-get install -y git python3 avahi-daemon libnss-mdns
+# mDNS on the LAN interface only: otherwise avahi also answers with Docker's bridge address,
+# and the host resolves its own name to 172.17.0.1
+IF=$(ip -o route get 1.1.1.1 | sed -n 's/.* dev \([^ ]*\).*/\1/p')
+sudo sed -i "s/^#\?allow-interfaces=.*/allow-interfaces=$IF/" /etc/avahi/avahi-daemon.conf
+sudo systemctl restart avahi-daemon
+getent ahostsv4 "$(hostname).local"            # must print the LAN address
+
 git clone https://github.com/iwaag/agdev ~/agdev && cd ~/agdev
 sudo install/prepare-host                      # Docker, packages, Node, uv, Claude Code under /opt/agdev-tools
-ROOT=/srv/agdev                                # the installation root; any path
-sudo mkdir -p $ROOT/config
-sudo install/make-bundles --core . --out $ROOT/bundles
-sudo cp install/instance.example.toml $ROOT/config/instance.toml
-sudoedit $ROOT/config/instance.toml
+sudo mkdir -p /srv/agdev/config                # the installation root; any path
+sudo install/make-bundles --core . --out /srv/agdev/bundles
+sudo cp install/instance.example.toml /srv/agdev/config/instance.toml
+sudoedit /srv/agdev/config/instance.toml
 ```
 
-In `instance.toml`: `slug`, `root` (= `$ROOT`), `public_host` (a name the host and your browsers
-resolve; the host's mDNS name `<hostname>.local` works on a home LAN), `[owner]` (your Gitea
-account), and `[tools]` as `prepare-host` printed them. Leave `[source]` out: the core is built from
-`<owner>/agdev` on this installation's Gitea, which `import-sources` fills from the bundle. Leave
-`[alerts]` out unless you have a Slack bot token; without it, owner notices are kept,
-unsent, in the Observer's outbox (its health record counts them). Then continue with `init` below, using `install/agdevctl` of the
-clone (`init` installs its own copy into `$ROOT/config/install/`). `pyagag`, the one external
-dependency, is fetched from GitHub when the release is built.
+In `instance.toml`, change:
 
-The WFE page is then `http://<public_host>:<ports.web>/wfe/`, the conversation page `/hangout/`
-on the same origin, and Gitea `http://<public_host>:<ports.gitea>/` (the owner's password is in
-`$ROOT/config/secrets/`).
+| Key | To |
+| --- | --- |
+| `slug` | a short name, e.g. `g`; it scopes units, containers and volumes |
+| `root` | `/srv/agdev` (the folder above) |
+| `public_host` | the name above, e.g. `<hostname>.local` |
+| `[owner]` `name`, `full_name`, `email` | the Gitea account `provision-gitea` creates for you; it owns the repositories (the email is only Gitea's) |
+| `[execution]` `timezone` | yours, e.g. `Asia/Tokyo` |
+| `[display]` `name` | what the pages call this installation |
+
+Everything else can stay: the ports, the accounts (created by `init`), and `[tools]`, whose paths
+are the versions `prepare-host` installs (its last lines print them; change them only if they
+differ). Leave `[source]` out: the core is built from `<owner>/agdev` on this installation's Gitea,
+which `import-sources` fills from the bundle. Leave `[alerts]` out unless you have a Slack bot
+token; without it, owner notices are kept, unsent, in the Observer's outbox (its health record
+counts them). `pyagag`, the one external dependency, is fetched from GitHub when the release is
+built. Then, still in the clone:
+
+```sh
+C=/srv/agdev/config/instance.toml
+sudo install/agdevctl --config $C init         # installs its own copy into /srv/agdev/config/install/
+A="sudo /srv/agdev/config/install/agdevctl --config $C"
+$A up infra && $A provision-gitea && $A import-sources && $A area-init
+$A activate main                               # builds the release from this Gitea, starts everything
+$A install-lifecycle
+$A status                                      # every service running; urls
+# the model login, once, as the core account (follow the URL it prints in any browser):
+sudo -u agdev-exec -H env PATH=/opt/agdev-tools/claude-2.1.302/bin:/opt/agdev-tools/node-v24.22.2/bin:/usr/bin:/bin claude auth login
+$A bootstrap-projects --dry-run && $A bootstrap-projects      # the summoner arrives
+```
+
+From here everything is in the browser. The WFE page is `http://<public_host>:8082/wfe/`, the
+conversation page `http://<public_host>:8082/hangout/`, and Gitea `http://<public_host>:8080/` (the
+owner's password is in `/srv/agdev/config/secrets/gitea_owner_password`). On the WFE page: write
+what this machine is for in the system context (*Context overview* → *Context for all projects*), then request
+`summoner/propose` with your wish (project **summoner** → *Request a run*), as below. The `wfe` CLI,
+if you want it, is `sudo -u agdev-exec /srv/agdev/data/area/bin/wfe`.
+
+To take a newer public core later: `git pull` in the clone, push it to `<owner>/agdev` on this
+Gitea (`git push http://<owner>@<public_host>:8080/<owner>/agdev.git main`, the owner's password),
+then `$A activate main`.
 
 ### The steps
 
