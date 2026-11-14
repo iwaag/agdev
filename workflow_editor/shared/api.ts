@@ -164,7 +164,7 @@ export interface RunSummary {
   waiting?: { node: string; holder: string }[]
   ready?: string[]
   failed?: string[]
-  input?: 'braindump' | 'request'
+  input?: 'person' | 'agent' // who the run's request is from
   executor?: string // the agent identity
   executorHost?: string // the execution host that launches it (p6)
   pendingInstructions?: number // received and not acknowledged (p6)

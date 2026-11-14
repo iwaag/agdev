@@ -756,12 +756,13 @@ export class ContextSection {
     this.inheritedMore = h('button.link-btn.ctx-inherited-more', { type: 'button', onclick: () => { this.inheritedAll = !this.inheritedAll; this.foldInherited() } }) as HTMLButtonElement
     const localHead = opts.scope === 'system' ? 'For all projects' : opts.scope === 'project' ? 'For this project' : 'For this workflow'
     const localHelp = opts.scope === 'system'
-      ? 'Applies to every project and workflow on this host: your instructions, and environment information agents such as cagent maintain. Kept on this host only, never in Git. Every run of every project is given these, so keep them short. A saved change is used from the next attempt; saving starts nothing.'
+      ? 'Applies to every project and workflow on this host: facts about this environment, and environment information agents such as cagent maintain. How you want work done in general belongs in your catalog (Catalog → Preferences): it is kept in Git and reaches every run as well. Kept on this host only, never in Git. Every run of every project is given these, so keep them short. A saved change is used from the next attempt; saving starts nothing.'
       : `Applies to ${opts.scope === 'project' ? 'every workflow of this project' : 'every run of this workflow'}. Kept on this host only, never in Git. A saved change is used from the next attempt; saving starts nothing.`
     this.body.hidden = true
     append(this.body, [
       opts.shared ? h('div.ctx-group.ctx-shared', h('div.ctx-group-head', h('h3', 'In the repository', h('span.ctx-group-note', ' · travels with the project'))), this.sharedRows) : null,
       h('div.ctx-group.ctx-local', h('div.ctx-group-head', h('div.ctx-group-title', h('h3', localHead, h('span.ctx-group-note', ' · only in this environment')), help('About these blocks', localHelp)), this.local.addControl), this.local.el),
+      opts.scope === 'system' ? h('p.small.muted', 'Your standing preferences (how you want work done, in every project) are in your catalog, not here: ', h('a', { href: '#/catalog' }, 'Catalog → Preferences'), '. Every run is given them with the blocks above.') : null,
       opts.scope === 'system' ? null : h('div.ctx-group.ctx-inherited', h('div.ctx-group-head', h('h3', 'Inherited', h('span.ctx-group-note', ' · from wider scopes; they apply here too'))), this.inheritedBox, this.inheritedMore),
       opts.scope === 'workflow' ? this.previewRows : null])
     this.el = h(`section.ctx-section.ctx-scope-${key}`, { dataset: { contextScope: key }, 'aria-label': 'Context' }, h('div.ctx-head', this.toggle), this.body)

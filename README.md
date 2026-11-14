@@ -34,7 +34,7 @@ has them, live elsewhere.
    one reference, `install/bootstrap/summonplan.yaml`: the summoner
    ([iwaag/pj-summoner](https://github.com/iwaag/pj-summoner)) at an exact commit.
 4. In the WFE page, write what the machine is for in the system context, then say what you
-   want: write a braindump (for example "reproduce iwaag's development style and
+   want: write it down (for example "reproduce iwaag's development style and
    start developing") and request `summoner/propose` with it. It reads catalogs of shared projects
    such as [iwaag/mycatalog](https://github.com/iwaag/mycatalog) (warden, ponderer and
    aghangout, public at `iwaag/pj-warden`, `iwaag/pj-ponderer`, `iwaag/pj-aghangout`), proposes a

@@ -835,7 +835,7 @@ export class PeerStore {
         ref = (await createRunInCopy(ws, {
           workflow: b.target.workflow, receipt, executor: { host: exec.executor }, by: b.requester, via: 'peer', area: this.ctx.area, ...(access ? { access } : {}),
           input: {
-            kind: 'request', text: b.request.text, requester: b.requester, ...(b.onBehalfOf ? { onBehalfOf: b.onBehalfOf } : {}),
+            from: 'agent', text: b.request.text, requester: b.requester, ...(b.onBehalfOf ? { onBehalfOf: b.onBehalfOf } : {}),
             entrustedBy: { kind: 'delegation', delegation: b.delegation, parent: b.parent, accepts: b.accepts, peer: { instance: peer.instance, request: e.request } },
             ...(b.original ? { original: b.original.text } : {}),
             source: { kind: 'peer', route: 'http', peer: row.peer, message: e.id, at: row.at },

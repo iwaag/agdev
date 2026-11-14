@@ -170,12 +170,12 @@ $A bootstrap-projects --dry-run   # no plan yet: the core's reference becomes pl
 $A bootstrap-projects             # the summoner is acquired, registered and obtained; it fills no role
 ```
 
-Then say what you want. Write a braindump, for example "reproduce iwaag's development style
+Then say what you want. Write it down, for example "reproduce iwaag's development style
 and start developing", and request the summoner's `propose` workflow with it, in the WFE page
 (project **summoner** → *Request a run* → `propose`) or:
 
 ```sh
-wfe request propose --workspace summoner --author <you> --braindump <file>
+wfe request propose --workspace summoner --author <you> --request <file>
 ```
 
 To import the development style of a GitHub user who publishes `<user>/mycatalog`, naming the

@@ -273,8 +273,8 @@ directory) and service port.
 ## Runs
 
 A run is one execution of a workflow, recorded in
-`devdocs/runs/<workflow-id>/<run-id>/` (p4): the person's `braindump.md` (or an
-agent's `request.md`), the executor's `plan.md` and reports, a fixed byte copy
+`devdocs/runs/<workflow-id>/<run-id>/` (p4): the run's `request.md` (a person's words or an
+agent's request), the executor's `plan.md` and reports, a fixed byte copy
 of the workflow in `definition/`, and
 `run.json`, whose current state must equal the replay of its history by
 `shared/run.ts`. `wfe run create` makes one; `wfe run start/complete/wait/

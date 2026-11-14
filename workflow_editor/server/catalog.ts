@@ -20,7 +20,7 @@ import { basename, dirname, join, resolve } from 'node:path'
 import type { Issue } from '../shared/model.ts'
 import {
   braindumpExcerpt, braindumpPath, braindumpTitle, BRAINDUMP_DIR, BRAINDUMP_FILE, CATALOG_FILE, CATALOG_REPOSITORY, CHALLENGES_DIR, EPISODES_DIR, INDEX_PATH, isBraindumpId,
-  MAX_BRAINDUMP_DEPTH, MYCATALOG_SCHEMA, OLD_LAYOUT, OLD_LAYOUT_PROBLEM, PLAN_NAME_PATTERN, PROJECTS_PATH, PROJECTS_SCHEMA, PUBLICATION_CONTRACT, publishedPaths, readPublicationContract, reviewPath,
+  isPreferenceName, MAX_BRAINDUMP_DEPTH, MYCATALOG_SCHEMA, OLD_LAYOUT, OLD_LAYOUT_PROBLEM, PLAN_NAME_PATTERN, preferencePath, PREFERENCES_DIR, PROJECTS_PATH, PROJECTS_SCHEMA, PUBLICATION_CONTRACT, publishedPaths, readPublicationContract, reviewPath,
   SEGMENT_PATTERN, summonplanPath, SUMMONPLAN_DIR, validateMycatalog, validateProjects, validateSummonplan,
   type CatalogDoc, type ProjectsDoc, type SummonEntry, type Summonplan,
 } from '../shared/catalog.ts'
@@ -179,6 +179,8 @@ export interface BraindumpInfo {
   // Derived from Git: the braindump's newest change is newer than its review's.
   changedAfterReview: boolean
 }
+// A preference (user_catalog p3): preferences/<name>.md, how the owner wants work done.
+export interface PreferenceInfo { name: string; path: string; title: string; text: string; updated: Change | null; published: boolean }
 export interface PlanInfo { name: string; path: string; plan: Summonplan | null; problem?: string; issues: Issue[] }
 export interface CatalogSnapshot {
   setting: CatalogSetting
@@ -186,6 +188,7 @@ export interface CatalogSnapshot {
   head: string
   catalog: { doc: CatalogDoc | null; problem?: string; issues: Issue[] }
   braindumps: BraindumpInfo[]
+  preferences: PreferenceInfo[]
   plans: PlanInfo[]
   projects: { doc: ProjectsDoc | null; problem?: string; issues: Issue[] }
   index: IndexInfo
@@ -259,6 +262,18 @@ async function readBraindump(dir: string, id: string, withText: boolean, publish
   return { id, path, title: braindumpTitle(id, text), excerpt: braindumpExcerpt(text), ...(withText ? { text } : {}), updated, published: published.has(path), review, changedAfterReview }
 }
 
+// Every preferences/<name>.md, sorted by name. They are few and short, and
+// every run is given them whole, so the text is always read.
+async function readPreferences(dir: string, published: Map<string, string>): Promise<PreferenceInfo[]> {
+  const out: PreferenceInfo[] = []
+  for (const e of (await readdir(join(dir, PREFERENCES_DIR), { withFileTypes: true }).catch(() => [])).filter(e => e.isFile() && e.name.endsWith('.md') && isPreferenceName(e.name.slice(0, -3))).sort((a, b) => a.name.localeCompare(b.name))) {
+    const name = e.name.slice(0, -3), path = preferencePath(name)
+    const text = (await readTextOrNull(join(dir, path))) ?? ''
+    out.push({ name, path, title: braindumpTitle(name, text), text, updated: await lastChange(dir, path), published: published.has(path) })
+  }
+  return out
+}
+
 async function readSnapshot(ctx: CatalogContext, s: CatalogSetting, head: string, withText: boolean): Promise<CatalogSnapshot> {
   const dir = checkoutDir(ctx.area)
   const g = needGitea(ctx)
@@ -280,7 +295,7 @@ async function readSnapshot(ctx: CatalogContext, s: CatalogSetting, head: string
   const ct = await readTextOrNull(join(dir, PROJECTS_PATH))
   const cp = ct === null ? null : parseProjects(ct)
   const projects = ct === null ? { doc: null, problem: `${PROJECTS_PATH} is missing`, issues: [] } : cp!.ok ? { doc: cp!.model, issues: validateProjects(cp!.model, { braindumps: known }) } : { doc: null, problem: cp!.problem.message, issues: [] }
-  return { setting: s, web: g.webUrl(s.repository.owner, s.repository.name), head, catalog, braindumps, plans, projects, index: await readIndex(dir), published }
+  return { setting: s, web: g.webUrl(s.repository.owner, s.repository.name), head, catalog, braindumps, preferences: await readPreferences(dir, published), plans, projects, index: await readIndex(dir), published }
 }
 
 // What the catalog holds now (read from Gitea at most every maxAgeMs).
@@ -304,6 +319,7 @@ export interface CatalogView {
   title: string
   person: string | null
   braindumps: (BraindumpInfo & { projects: string[] })[]
+  preferences: PreferenceInfo[]
   projects: ProjectGround[]
   plans: { name: string; intent: string; entries: number; problem?: string; errors: number; warnings: number }[]
   index: IndexInfo
@@ -373,6 +389,7 @@ export async function catalogView(ctx: CatalogContext, o: { maxAgeMs?: number } 
     repository: `${snap.setting.repository.owner}/${snap.setting.repository.name}`, web: snap.web, branch: snap.setting.branch, head: snap.head, plan: snap.setting.plan,
     title: snap.catalog.doc?.title ?? '', person: await personOf(ctx.area),
     ...relate(snap, reg),
+    preferences: snap.preferences,
     plans: snap.plans.map(p => ({ name: p.name, intent: p.plan?.intent ?? '', entries: p.plan?.entries.length ?? 0, ...(p.problem ? { problem: p.problem } : {}), errors: p.issues.filter(i => i.severity === 'error').length, warnings: p.issues.filter(i => i.severity === 'warning').length })),
     index: snap.index, challenges: await challengesBrief(ctx, snap.setting, snap.published),
     issues, problems,
@@ -448,6 +465,37 @@ export async function changeBraindump(ctx: CatalogContext, o: { op: BraindumpOp;
     }
   })
   return { ok: true, message: r.changed ? `${o.op === 'add' ? 'Added' : o.op === 'edit' ? 'Changed' : 'Removed'} braindump ${o.id} (${r.commit.slice(0, 7)}).` : `Braindump ${o.id} is unchanged.`, commit: r.commit, changed: r.changed, path }
+}
+
+// A preference (user_catalog p3): how the owner wants work done, in
+// preferences/<name>.md. Free Markdown, one file per subject; the Git author
+// is the writer. Who may write is said in the guides, as for braindumps: an
+// agent writes only what the owner said or confirmed.
+const needPreferenceName = (name: string) => {
+  if (!isPreferenceName(name)) throw new RequestError(400, `"${name}" is not a preference name: lower-case letters, digits, "-", "_" and "." (${SEGMENT_PATTERN.source}), without .md`)
+}
+export async function preferences(ctx: CatalogContext, o: { maxAgeMs?: number } = {}) {
+  const snap = await catalogSnapshot(ctx, o)
+  return { head: snap.head, repository: `${snap.setting.repository.owner}/${snap.setting.repository.name}`, preferences: snap.preferences }
+}
+export async function preference(ctx: CatalogContext, name: string) {
+  needPreferenceName(name)
+  const snap = await catalogSnapshot(ctx)
+  const p = snap.preferences.find(x => x.name === name)
+  if (!p) throw new RequestError(404, `no preference "${name}" in the catalog (${preferencePath(name)})`)
+  return { ...p, head: snap.head, web: `${snap.web}/src/branch/${snap.setting.branch}/${p.path}`, history: await historyOf(checkoutDir(ctx.area), p.path) }
+}
+export async function changePreference(ctx: CatalogContext, o: { op: 'put' | 'remove'; name: string; text?: string; author: string; base?: string; message?: string }) {
+  const s = await needSetting(ctx)
+  needPreferenceName(o.name)
+  const path = preferencePath(o.name)
+  if (o.op === 'put' && (typeof o.text !== 'string' || !o.text.trim())) throw new RequestError(400, 'a preference needs its text')
+  const text = o.op === 'remove' ? null : o.text!.endsWith('\n') ? o.text! : `${o.text}\n`
+  const r = await commitChanges(ctx, s, [{ path, text }], o.author, o.message?.trim() || `${o.op === 'put' ? 'Write' : 'Remove'} preference ${o.name}`, async dir => {
+    if (o.op === 'remove' && !await exists(join(dir, path))) throw new RequestError(404, `no preference "${o.name}"`)
+    await refuseIfChangedSince(dir, path, o.base, `preference "${o.name}"`)
+  })
+  return { ok: true, message: r.changed ? `${o.op === 'put' ? 'Wrote' : 'Removed'} preference ${o.name} (${r.commit.slice(0, 7)}).` : `Preference ${o.name} is unchanged.`, commit: r.commit, changed: r.changed, path }
 }
 
 // A review: free text about a braindump (how far it became real, where, what
@@ -576,6 +624,7 @@ each braindump has become real (reviews).
 - \`braindumps/episodes/<path>/review.md\` (optional): free text about that braindump: what became real, where, what did not.
 - \`challenges/<id>/\`: a problem found during work, with its trials and evidence. Written through agdev (\`wfe challenge\`), by people and agents.
 - \`challenges.md\`: the index of what is not yet real: braindumps that were not carried out and challenges that are not resolved, one or two lines each. An agent writes it (\`wfe catalog index request\`).
+- \`preferences/<name>.md\`: free text: how ${owner} wants work done (the language of documents, how results are handed over, …), one file per subject. agdev gives every file here to every run. Not what is wanted (a braindump) and not facts about machines.
 - \`summonplans/<name>.yaml\` (ag.summonplan.v1): which projects make braindumps concrete in one installation, from where, at which commit, filling which roles, and because of which braindumps.
 - \`projects.yaml\` (ag.projects.v1): the projects ${owner} shares with others.
 - \`mycatalog.yaml\` (ag.mycatalog.v1): whose catalog this is.

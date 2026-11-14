@@ -62,16 +62,23 @@ export type EntrustRef =
   // that host's and is never looked up here.
   | { kind: 'delegation'; delegation: string; parent: { project: string; workflow: string; run: string; creation: string; node: string }; accepts: 'person' | 'parent'; peer?: { instance: string; request: string } }
 
+// A run's input is its request, in request.md (user_catalog p3): from a
+// person (their words; `author`, `recordedBy`) or from an agent (`requester`,
+// `entrustedBy`). Records written before that are read as they are and never
+// rewritten: `kind: braindump`, `file: braindump.md` is a person's request,
+// and `kind: request` without `from` an agent's. Read `from` through
+// requestFrom(), never from the fields.
 export interface RunInput {
-  kind: 'braindump' | 'request'
-  file: 'braindump.md' | 'request.md'
-  author?: string // braindump: the person whose words these are
-  recordedBy?: string // braindump: who saved them, when not the author
+  kind: 'request' | 'braindump' // 'braindump': old records only
+  from?: 'person' | 'agent' // absent in old records
+  file: 'request.md' | 'braindump.md' // 'braindump.md': old records only
+  author?: string // from a person: whose words these are
+  recordedBy?: string // from a person: who saved them, when not the author
   requester?: string // request: the agent that constructed it
   onBehalfOf?: string
   entrustedBy?: EntrustRef
   original?: string // run-relative file keeping the input a request was derived from
-  source?: SourceRef // where the person's words were posted (p6: the Zulip post that became the braindump)
+  source?: SourceRef // where the words were said or posted
   sha256?: string // of the input file as written at creation (p7/ex1); what a request-sourced adjustment binds to
   // Shared-area references written in the input (project_migration p6,
   // docs/shares.md), in order: what the person pointed at. Whether a host
@@ -83,6 +90,10 @@ export interface RunInput {
   // message carried (p19, docs/message-files.md) are named by occurrence;
   // their bytes stay on the share (wfe conversation fetch).
   attachments?: InputAttachment[]
+}
+
+export function requestFrom(input: Pick<RunInput, 'kind' | 'from'>): 'person' | 'agent' {
+  return input.from ?? (input.kind === 'braindump' ? 'person' : 'agent')
 }
 export type InputAttachment = (ChallengeAttachmentRef & { file: string }) | FileAttachmentRef
 // `name` is the agent identity the run is performed as (p6: the workflow's
@@ -227,7 +238,7 @@ export type AdjustSource =
   | { kind: 'agreement'; question: string } // the person agreed to this exact proposal (the question's document)
   | { kind: 'agent' } // an agent-selected revision, recorded with its actual actor
   | { kind: 'person'; by?: string } // a person applies it themselves
-  | { kind: 'request'; input: string; sha256: string } // the run's original braindump or entrusted request asks for this work (p7/ex1); by file and hash
+  | { kind: 'request'; input: string; sha256: string } // the run's original request asks for this work (p7/ex1); by file and hash
   | { kind: 'record-done'; node: string } // fix5: the revision of run.record-done, adding work already done
   | { kind: 'wake'; events: string[] } // p18: WFE continues a resting standing run for these events (a new ponder node)
 export interface GroupDiff { added: string[]; removed: string[]; changed: string[]; reordered: string[] }

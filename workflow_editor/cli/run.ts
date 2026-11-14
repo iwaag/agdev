@@ -7,7 +7,7 @@ import type { RunResponse } from '../shared/api.ts'
 import { accessAt } from '../shared/access.ts'
 import { normalizeRepoPath, sessionPolicyOf } from '../shared/model.ts'
 import { docStepsOf, hasDocSteps, splitCounts } from '../shared/compile.ts'
-import { assessmentWords, describeSteps, effectiveOf, EXECUTOR_OPS, expectationStates, holderOf, knowledgeHistory, hostOf, notableEvents, questionState, runKey, type BecauseRef, type Correction, type EntrustRef, type HistoryEntry, type Instruction, type OpInput, type RunRecord, type RunRef } from '../shared/run.ts'
+import { requestFrom, assessmentWords, describeSteps, effectiveOf, EXECUTOR_OPS, expectationStates, holderOf, knowledgeHistory, hostOf, notableEvents, questionState, runKey, type BecauseRef, type Correction, type EntrustRef, type HistoryEntry, type Instruction, type OpInput, type RunRecord, type RunRef } from '../shared/run.ts'
 import {
   adjustRun, checkRun, createRun, listRuns, readRun, recordDone, resolveRef, runDir, runOp, runResponse, usableRun, type AdjustResult, type CreateRunOptions,
 } from '../server/runs.ts'
@@ -57,7 +57,7 @@ const COMMON = `Common options: --by <name> (who records: your own name. An exec
 <run> is <workflow>/<run-id>, or a run id that is unique in the project.`
 
 export const RUN_HELP: Record<string, string> = {
-  create: `wfe run create <workflow> --braindump <file|-> --author <person> --executor <name> [options]
+  create: `wfe run create <workflow> --request <file|-> --author <person> --executor <name> [options]
 wfe run create <workflow> --request <file|-> --requester <agent> --entrusted-by <ref> --executor <name> [options]
 
 Creates devdocs/runs/<workflow>/<run>/ with the input, the fixed definition
@@ -65,8 +65,8 @@ and run.json (docs/runs.md).
   Reads   devdocs/workflows/: the workflow (id or file name); it must validate
           without errors. A delegate node's work is entrusted to another
           workflow during the run (wfe delegate help).
-  Writes  braindump.md (the person's words, author --author) or request.md
-          (an agent's request, --requester, --entrusted-by), definition/<id>.yaml
+  Writes  request.md: a person's words (--author) or an agent's request
+          (--requester, --entrusted-by; run.json says which), definition/<id>.yaml
           (a byte copy), plan.md (--plan <file>), and run.json last.
   --name <run-id>      run-<something>; default the next run-NNN. An existing
                        run is refused and left as it is.
@@ -76,7 +76,7 @@ and run.json (docs/runs.md).
                        note:<text> (for example a conversation reference).
   --on-behalf-of <person>, --original <file> (keeps the input a request was
                        derived from as original-input.md), --predecessor <run>.
-  --recorded-by <name> who saved a braindump (default --by).
+  --recorded-by <name> who saved a person's request (default --by).
 Nothing is committed. Result: the run reference, folder and files written.
 Exit 0 created; 1 refused (an invalid definition, an existing run …).`,
   io: `wfe run io <run> [--attempt <id> --line <n>]
@@ -659,9 +659,9 @@ export function describeRun(r: RunResponse, opts: { history?: boolean; url?: str
   if (!r.revInfo) lines.push(`Status: ${runStatus(rec).text}`)
   if (opts.url) lines.push(`Browser: ${opts.url}`)
   const i = rec.input
-  lines.push(i.kind === 'braindump'
-    ? `Input: ${i.file}, the words of ${i.author}${i.recordedBy ? ` (recorded by ${i.recordedBy})` : ''}`
-    : `Input: ${i.file}, a request by ${i.requester}${i.onBehalfOf ? ` on behalf of ${i.onBehalfOf}` : ''}; entrusted by ${i.entrustedBy?.kind === 'run' ? `run ${runKey(i.entrustedBy)}${i.entrustedBy.node ? ` node ${i.entrustedBy.node}` : ''}` : i.entrustedBy?.kind === 'file' ? `file ${i.entrustedBy.path}` : `note "${i.entrustedBy?.kind === 'note' ? i.entrustedBy.text : ''}"`}${i.original ? `; original input kept in ${i.original}` : ''}`)
+  lines.push(requestFrom(i) === 'person'
+    ? `Request: ${i.file}, the words of ${i.author}${i.recordedBy ? ` (recorded by ${i.recordedBy})` : ''}`
+    : `Request: ${i.file}, by ${i.requester}${i.onBehalfOf ? ` on behalf of ${i.onBehalfOf}` : ''}; entrusted by ${i.entrustedBy?.kind === 'run' ? `run ${runKey(i.entrustedBy)}${i.entrustedBy.node ? ` node ${i.entrustedBy.node}` : ''}` : i.entrustedBy?.kind === 'file' ? `file ${i.entrustedBy.path}` : `note "${i.entrustedBy?.kind === 'note' ? i.entrustedBy.text : ''}"`}${i.original ? `; original input kept in ${i.original}` : ''}`)
   lines.push(`Executor: ${rec.executor.name} (backend: ${rec.executor.backend ?? 'unknown'})`)
   const defs = Object.entries(rec.definition.workflows)
   lines.push(`Project: ${rec.project}`)
@@ -940,12 +940,15 @@ export async function runCommand(c: RunCli): Promise<number> {
     case 'create': {
       const [workflow] = args
       if (!workflow) throw c.usage('<workflow> is required')
-      const braindump = c.opt('braindump'), request = c.opt('request')
-      if (!!braindump === !!request) throw c.usage('give exactly one of --braindump <file|-> or --request <file|->')
+      if (c.opt('braindump') !== undefined) throw c.usage('--braindump is no longer an option: a run has a request. Use --request <file|-> --author <person> for a person\'s words')
+      const request = c.opt('request')
+      if (!request) throw c.usage('--request <file|-> is required: the run\'s request')
+      const person = c.opt('author')
+      if (!!person === !!c.opt('requester')) throw c.usage('give exactly one of --author <person> (a person\'s request) or --requester <agent> with --entrusted-by <ref> (an agent\'s request)')
       const executor = { name: need(c, 'executor', 'who performs the run'), backend: c.opt('backend') ?? null }
-      const input: CreateRunOptions['input'] = braindump
-        ? { kind: 'braindump', text: readInput(c, braindump), author: need(c, 'author', 'the person whose words the braindump holds'), recordedBy: c.opt('recorded-by') ?? by ?? executor.name }
-        : { kind: 'request', text: readInput(c, request!), requester: need(c, 'requester', 'the agent that wrote the request'), entrustedBy: entrust(c, need(c, 'entrusted-by', 'what entrusted the request')), onBehalfOf: c.opt('on-behalf-of'), original: c.opt('original') !== undefined ? readInput(c, c.opt('original')!) : undefined }
+      const input: CreateRunOptions['input'] = person
+        ? { from: 'person', text: readInput(c, request), author: person, recordedBy: c.opt('recorded-by') ?? by ?? executor.name }
+        : { from: 'agent', text: readInput(c, request), requester: need(c, 'requester', 'the agent that wrote the request'), entrustedBy: entrust(c, need(c, 'entrusted-by', 'what entrusted the request')), onBehalfOf: c.opt('on-behalf-of'), original: c.opt('original') !== undefined ? readInput(c, c.opt('original')!) : undefined }
       const predecessor = c.opt('predecessor') ? await wrap(() => resolveRef(ws, c.opt('predecessor')!)) : undefined
       const r = await wrap(() => createRun(ws, {
         workflow, name: c.opt('name'), input, executor, plan: c.opt('plan') !== undefined ? readInput(c, c.opt('plan')!) : undefined,

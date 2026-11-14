@@ -5,6 +5,7 @@
 import { roleOf } from '../shared/reminders.ts'
 import { producerLines, templatesOf, workContext } from '../shared/resultEvidence.ts'
 import { graphOfState, runFolder, type RunRecord, type RunRef } from '../shared/run.ts'
+import { requestFrom } from '../shared/run.ts'
 import { changedPaths } from './reminders.ts'
 import { activeDefinition, readRun } from './runs.ts'
 import { runSpace } from './runspace.ts'
@@ -39,7 +40,7 @@ export async function producerAdvice(ws: Workspace, ref: RunRef, at: { started?:
   // The run's own copy, where its changes are (evidence-fixture/run-003: read
   // against the project workspace, nothing was chosen).
   const space = await runSpace(ws, ref).catch(() => ws)
-  const lines = producerLines({ context: await contextOf(space, r, authored), requester: r.input.kind === 'request' ? r.input.requester ?? null : null, report: finalStep ? `${runFolder(r)}/${graph.nodes[finalStep].step!.output}` : null })
+  const lines = producerLines({ context: await contextOf(space, r, authored), requester: requestFrom(r.input) === 'agent' ? r.input.requester ?? null : null, report: finalStep ? `${runFolder(r)}/${graph.nodes[finalStep].step!.output}` : null })
   return [...lines, ...await changedWorkflowLines(space, r)]
 }
 

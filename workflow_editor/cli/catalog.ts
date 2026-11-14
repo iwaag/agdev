@@ -16,6 +16,10 @@ wfe catalog braindump remove <path> --author <who> [--force]
 wfe catalog review show <path>
 wfe catalog review put <path> (--file <md> | --text <text>) --author <who> [--base <commit>] [--message <m>]
 wfe catalog review request [<path>] --author <who>
+wfe catalog preference list
+wfe catalog preference show <name>
+wfe catalog preference put <name> (--file <md> | --text <text>) --author <who> [--base <commit>] [--message <m>]
+wfe catalog preference remove <name> --author <who>
 wfe catalog index show
 wfe catalog index put (--file <md> | --text <text>) --author <who> [--base <commit>] [--message <m>]
 wfe catalog index request --author <who>
@@ -42,6 +46,15 @@ repository.
 The owner's challenges (problems found during work; wfe challenge) live in the
 same repository under challenges/<id>/; challenges.md beside them is the index
 of what is not yet real.
+
+The owner's standing preferences are preferences/<name>.md: how the owner
+wants work done (the language of documents, how results are handed over, …),
+free Markdown, one file per subject. Every file there is given to every run
+and every authoring session as system context (wfe context show: sources
+system/preference/<name>, with the catalog commit). A preference is not what
+is wanted (a braindump) and not a fact about a machine (the system context's
+local blocks). An agent writes one only with what the owner said or confirmed,
+as its own --author.
 
 The one rule: any braindump.md under braindumps/episodes/, at any depth, is a
 braindump; its folder path below braindumps/episodes/ is its identity (<path>,
@@ -131,6 +144,7 @@ export async function catalogCommand(c: CatalogCli): Promise<number> {
         `this installation's plan: ${v.plan || '(none named; wfe catalog plan use <name>)'}`,
         '', `Braindumps (${v.braindumps.length})`,
         ...v.braindumps.map(b => `  ${b.id.padEnd(32)} ${b.title}${b.published ? '  [published]' : ''}\n  ${''.padEnd(32)} ${b.projects.length ? `grounds: ${b.projects.join(', ')}` : `grounds no project in ${v.plan || 'the plan'}`}\n  ${''.padEnd(32)} ${reviewLine(b)}`),
+        '', `Preferences (${v.preferences.length}): ${v.preferences.map(p => p.name).join(', ') || 'none'}`,
         '', `Challenges: ${v.challenges.available ? `${v.challenges.items.length} (${Object.entries(v.challenges.counts).filter(([, n]) => n).map(([k, n]) => `${k} ${n}`).join(', ') || 'none'})${v.challenges.inCatalog ? '' : `; ${v.challenges.reason}`}` : v.challenges.reason}`,
         `Index (${v.index.path}): ${v.index.updated ? `${v.index.updated.author}, ${v.index.updated.at.slice(0, 10)}, ${short(v.index.updated.commit)}${v.index.note ? `; ${v.index.note}` : ''}` : v.index.note}`,
         '', `Projects (${v.projects.length})`,
@@ -170,6 +184,22 @@ export async function catalogCommand(c: CatalogCli): Promise<number> {
       const r = await m.review(ctx, a2)
       c.out([`${r.id}: ${r.title}`, `braindump: ${r.braindump.updated ? `${r.braindump.updated.author}, ${r.braindump.updated.at.slice(0, 10)}, ${short(r.braindump.updated.commit)}` : '?'}`, reviewLine(r), ...(r.review ? ['', r.review.text ?? ''] : [])].join('\n'), r)
       return 0
+    }
+    if (sub === 'preference' || sub === 'preferences') {
+      if (a1 === 'list' || a1 === undefined) {
+        const r = await m.preferences(ctx, { maxAgeMs: 0 })
+        c.out(r.preferences.map(p => `${p.name.padEnd(32)} ${p.title}  ${short(p.updated?.commit)} ${p.updated?.author ?? ''} ${p.updated?.at.slice(0, 10) ?? ''}${p.published ? '  [published]' : ''}`).join('\n') || 'No preferences yet (preferences/<name>.md).', r)
+        return 0
+      }
+      if (!a2) throw c.usage(`wfe catalog preference ${a1} <name>`)
+      if (a1 === 'show') {
+        const p = await m.preference(ctx, a2)
+        c.out([`${p.path} @ ${short(p.updated?.commit)} (${p.updated?.author ?? '?'}, ${p.updated?.at ?? '?'})  catalog head ${short(p.head)}`, '', p.text].join('\n'), p)
+        return 0
+      }
+      if (a1 === 'put') { const r = await m.changePreference(ctx, { op: 'put', name: a2, text: await textArg(), author: author(), base: c.opt('base'), message: c.opt('message') }); c.out(r.message, r); return 0 }
+      if (a1 === 'remove') { const r = await m.changePreference(ctx, { op: 'remove', name: a2, author: author(), base: c.opt('base'), message: c.opt('message') }); c.out(r.message, r); return 0 }
+      throw c.usage('wfe catalog preference list | show <name> | put <name> (--file <md> | --text <text>) --author <who> [--base <commit>] | remove <name> --author <who>')
     }
     if (sub === 'index') {
       if (a1 === 'put') { const r = await m.putIndex(ctx, { text: await textArg(), author: author(), base: c.opt('base'), message: c.opt('message') }); c.out(r.message, r); return 0 }

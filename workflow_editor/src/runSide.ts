@@ -17,6 +17,7 @@
 // the data it is given and asks the view to act.
 import type { RunOpResponse, RunResponse } from '../shared/api.ts'
 import { assessmentWords, effectiveOf, expectationStates, holderOf, isOpen, knowledgeHistory, questionState, runKey, situation, type Because, type ExpectationState, type Question, type RunRecord } from '../shared/run.ts'
+import { requestFrom } from '../shared/run.ts'
 import { expectationBadge } from './nodeMeaning.ts'
 import { knowledgeSelectionBlock, nodeDecisions, runDecisionsBlock } from './knowledgeUi.ts'
 import { api, type KnowledgeDecisions } from './api.ts'
@@ -1198,7 +1199,7 @@ export class RunSide {
       r.predecessor ? h('div', 'Predecessor: ', h('a', { href: runHash(wsId, r.predecessor.ref) }, r.predecessor.ref)) : null,
       // A delegated child (p10): the run that asked for it.
       parent ? h('div', 'Delegated by: ', parent.workspace ? h('a', { href: runHash(parent.workspace, `${parent.parent.workflow}/${parent.parent.run}`) }, `${parent.parent.project} ${parent.parent.workflow}/${parent.parent.run}`) : `${parent.parent.project} ${parent.parent.workflow}/${parent.parent.run}`, h('span.muted', ` (node ${parent.parent.node})`)) : null,
-      input.kind === 'request' && input.entrustedBy ? h('div.small', 'Entrusted by: ', input.entrustedBy.kind === 'run' ? h('a', { href: runHash(wsId, runKey(input.entrustedBy)) }, `${runKey(input.entrustedBy)}${input.entrustedBy.node ? ` node ${input.entrustedBy.node}` : ''}`) : input.entrustedBy.kind === 'file' ? input.entrustedBy.path : input.entrustedBy.kind === 'delegation' ? `delegation from ${input.entrustedBy.parent.project}/${input.entrustedBy.parent.workflow}/${input.entrustedBy.parent.run} (node ${input.entrustedBy.parent.node})` : input.entrustedBy.text) : null,
+      requestFrom(input) === 'agent' && input.entrustedBy ? h('div.small', 'Entrusted by: ', input.entrustedBy.kind === 'run' ? h('a', { href: runHash(wsId, runKey(input.entrustedBy)) }, `${runKey(input.entrustedBy)}${input.entrustedBy.node ? ` node ${input.entrustedBy.node}` : ''}`) : input.entrustedBy.kind === 'file' ? input.entrustedBy.path : input.entrustedBy.kind === 'delegation' ? `delegation from ${input.entrustedBy.parent.project}/${input.entrustedBy.parent.workflow}/${input.entrustedBy.parent.run} (node ${input.entrustedBy.parent.node})` : input.entrustedBy.text) : null,
     ].filter((x): x is HTMLDivElement => !!x)
     show(this.related.root, rel.length > 0)
     if (!rel.length) return

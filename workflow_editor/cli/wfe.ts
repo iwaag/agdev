@@ -355,7 +355,7 @@ wfe draft show <id> [--workspace <id>]
 wfe draft start <file> --by <name> [--another] [--workspace <id>]
 wfe draft save <id> --file <yaml|-> --revision <n> --by <name> [--workspace <id>]
 wfe draft compare <id> [--workspace <id>]
-wfe draft try <id> --revision <n> --braindump <file|-> --author <person> [--receipt <id>] [--workspace <id>]
+wfe draft try <id> --revision <n> --request <file|-> --author <person> [--receipt <id>] [--workspace <id>]
 wfe draft apply <id> --revision <n> --by <name> [--key <id>] [--workspace <id>]
 wfe draft discard <id> --revision <n> --by <name> [--workspace <id>]
 wfe draft edits [--workspace <id>]
@@ -420,13 +420,14 @@ policy a run plans, reports each node and reports the whole (docs/contract.md,
 "Documentation policy"); manual leaves documents to explicit instructions.
 Refuses an id already used by another workflow file. Writing the file by hand
 is equally valid; see docs/contract.md.`,
-  request: `wfe request <workflow> --braindump <file|-> --author <person> [--predecessor <run>] [--node <worker>] [--receipt <id>] [--editing] [--workspace <id>]
+  request: `wfe request <workflow> --request <file|-> --author <person> [--predecessor <run>] [--node <worker>] [--receipt <id>] [--editing] [--workspace <id>]
 wfe request <workflow> --request <file|-> [--requester <agent>] [--entrusted-by <ref>] [--on-behalf-of <person>] [--original <file>] [--predecessor <run>] [--node <worker>] [--receipt <id>] [--workspace <id>]
 Both take [--challenge <id>[@<commit>]]…: a challenge the work is about (wfe challenge help), given to
 the run as it is at that revision (its file in the run folder, input.attachments in run.json).
 
---request is an agent's request (the run's request.md): what the agent wrote,
-not a person's words. From an executing attempt the requester is that run's
+The text becomes the run's request.md. With --author it is a person's request
+(their words); otherwise an agent's: what the agent wrote, not a person's
+words (run.json input.from says which). From an executing attempt the requester is that run's
 agent, it is entrusted by that run, and the receipt is derived from the
 attempt and the text, so the same command retried finds the same run instead
 of creating a second. --on-behalf-of names the person served; --original
@@ -436,7 +437,7 @@ delegate node instead (wfe run adjust, docs/delegation.md) when your own work
 waits for the result and judges it.
 
 A person's request to the executor (autolab): creates the run, in its own
-working copy, with their words as braindump.md and queues its start. The same
+working copy, with their words as request.md and queues its start. The same
 receipt twice queues once. Other runs of the project — held, waiting or
 working — never refuse it (p9). --predecessor names an earlier run this one
 follows (reusing its plan, repairing or reversing it): the record keeps the
@@ -1891,14 +1892,17 @@ function entrustRef(text: string): import('../shared/run.ts').EntrustRef {
   throw new UsageError(`--entrusted-by "${text}" must be [<project>/]<workflow>/<run>, file:<path> or note:<text>`)
 }
 
-// A person's request: their words become the run's braindump.md, and the
-// executor is queued. An agent's request: its request.md (p8).
+// A request: the text becomes the run's request.md and the executor is
+// queued. From a person (--author) or from an agent (p8; user_catalog p3).
 async function cmdRequest(p: Parsed): Promise<number> {
   const [workflow] = p.positional
   if (!workflow) throw new UsageError('request needs a workflow')
-  const file = opt(p, 'braindump'), requestFile = opt(p, 'request')
-  if (!!file === !!requestFile) throw new UsageError('give exactly one of --braindump <file|-> (a person\'s words) or --request <file|-> (an agent\'s request)')
-  const author = opt(p, 'author'); if (file && !author) throw new UsageError('--author <person> is required: whose words the braindump holds')
+  if (opt(p, 'braindump') !== undefined) throw new UsageError('--braindump is no longer an option: a run has a request. Use --request <file|-> --author <person> for a person\'s words')
+  const source = opt(p, 'request')
+  if (!source) throw new UsageError('--request <file|-> is required: the request text')
+  const author = opt(p, 'author')
+  if (author && opt(p, 'requester')) throw new UsageError('give --author <person> (a person\'s request) or --requester <agent> (an agent\'s request), not both')
+  const file = author ? source : undefined, requestFile = author ? undefined : source
   const ws = await workspace(p)
   const x = await openExec(p)
   try {
@@ -1914,12 +1918,12 @@ async function cmdRequest(p: Parsed): Promise<number> {
     let input: Parameters<ExecStore['request']>[0]['input']
     if (requestFile) {
       const requester = opt(p, 'requester') ?? own?.agent
-      if (!requester) throw new UsageError('--requester <agent> is required outside an executing attempt: the agent that wrote the request')
+      if (!requester) throw new UsageError('say whose request this is: --author <person> for a person\'s words, or --requester <agent> with --entrusted-by <ref> for an agent\'s request')
       const by = opt(p, 'entrusted-by')
       const entrustedBy = by ? entrustRef(by) : own ? { kind: 'run' as const, project: own.project, workflow: row!.workflow, run: row!.run } : undefined
       if (!entrustedBy) throw new UsageError('--entrusted-by is required outside an executing attempt: <project>/<workflow>/<run>, note:<text> or file:<path>')
       const original = opt(p, 'original')
-      input = { kind: 'request', text, requester, entrustedBy, ...(opt(p, 'on-behalf-of') ? { onBehalfOf: opt(p, 'on-behalf-of') } : {}), ...(original ? { original: readFileSync(original === '-' ? 0 : resolve(original), 'utf8') } : {}) }
+      input = { from: 'agent', text, requester, entrustedBy, ...(opt(p, 'on-behalf-of') ? { onBehalfOf: opt(p, 'on-behalf-of') } : {}), ...(original ? { original: readFileSync(original === '-' ? 0 : resolve(original), 'utf8') } : {}) }
     }
     const pred = opt(p, 'predecessor')
     const predecessor = pred ? await (await import('../server/runs.ts')).resolveRef(ws, pred) : undefined
@@ -2410,7 +2414,7 @@ async function cmdDraft(p: Parsed): Promise<number> {
       if (dr.revision !== revision()) throw new Refused(`draft ${dr.id} is at revision ${dr.revision}, not ${opt(p, 'revision')}`)
       const x = await openExec(p)
       try {
-        const r = await x.request({ workspace: ws.reg.id, workflow: dr.file, text: readFileSync(need('braindump') === '-' ? 0 : resolve(need('braindump')), 'utf8'), author: need('author'), receipt: opt(p, 'receipt') ?? `cli-${Date.now()}-${process.pid}`, via: 'cli', trial: { file: dr.file, sha256: dr.sha256, draft: { id: dr.id, revision: dr.revision, author: dr.author, text: dr.text } } })
+        const r = await x.request({ workspace: ws.reg.id, workflow: dr.file, text: readFileSync(need('request') === '-' ? 0 : resolve(need('request')), 'utf8'), author: need('author'), receipt: opt(p, 'receipt') ?? `cli-${Date.now()}-${process.pid}`, via: 'cli', trial: { file: dr.file, sha256: dr.sha256, draft: { id: dr.id, revision: dr.revision, author: dr.author, text: dr.text } } })
         out(`${r.duplicate ? 'Already started' : 'Started'} ${r.ref.workflow}/${r.ref.run}, trying revision ${dr.revision} of ${dr.id} on the published code.`, r)
         return 0
       } finally { x.close() }

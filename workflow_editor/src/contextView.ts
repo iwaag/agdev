@@ -91,7 +91,7 @@ export function renderContextView(root: HTMLElement, wsId: string, workflowId?: 
     const all = new Map<string, ContextSource>()
     for (const s of [...(v.execution?.sources ?? []), ...v.authoring.sources]) if (!all.has(s.key) || s.applies.length > all.get(s.key)!.applies.length) all.set(s.key, s)
     const of = (scope: string, category: string) => [...all.values()].filter(s => s.scope === scope && s.category === category && s.scope !== 'run')
-    const link = (s: ContextSource) => s.scope === 'project' && s.category === 'default' ? projectContextHref(wsId) : s.scope === 'workflow' && s.category === 'default' && v.workflow ? workflowContextHref(wsId, v.workflow) : null
+    const link = (s: ContextSource) => s.kind === 'preference' ? '#/catalog' : s.scope === 'project' && s.category === 'default' ? projectContextHref(wsId) : s.scope === 'workflow' && s.category === 'default' && v.workflow ? workflowContextHref(wsId, v.workflow) : null
     const overrideCell = (s: Scope) => {
       const all = blocksOf(s)
       if (!all) return h('td.ctx-cell.muted', 'choose a workflow')

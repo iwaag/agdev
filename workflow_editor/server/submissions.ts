@@ -62,7 +62,7 @@ export async function submit(exec: ExecStore, o: { requester: string; workflow: 
   const at = new Date().toISOString()
   const r = await exec.request({
     workspace: ws.reg.id, workflow, text: o.text, author: o.requester, receipt, by: o.requester, via: 'submission',
-    input: { kind: 'request', text: o.text, requester: o.requester, entrustedBy: { kind: 'note', text: o.about ? `${o.requester}: ${o.about}` : `${o.requester}'s submission ${receipt}` }, source: { kind: 'submission', requester: o.requester, receipt, at, ...(o.about ? { about: o.about.slice(0, 300) } : {}) } } as never,
+    input: { from: 'agent', text: o.text, requester: o.requester, entrustedBy: { kind: 'note', text: o.about ? `${o.requester}: ${o.about}` : `${o.requester}'s submission ${receipt}` }, source: { kind: 'submission', requester: o.requester, receipt, at, ...(o.about ? { about: o.about.slice(0, 300) } : {}) } } as never,
   })
   return { ...await viewOf(exec, receipt, r.job), duplicate: r.duplicate }
 }

@@ -47,17 +47,24 @@ of the same repository, not a second catalog. There is no catalog per node or
 per installation: `summonplans/<name>.yaml` is the part that belongs to one
 installation.
 
-## One idea, three ranges
+## Three ranges, three words
 
-A **braindump** is a person's free description of what they want and why. It
-is the ground for work and for the resources that work uses. The word is used
-at three ranges:
+What is wanted, and why, is stated at three ranges, each with its own word
+(user_catalog p3):
 
-| Range | Where | Grounds |
-| --- | --- | --- |
-| A run | `devdocs/runs/<workflow>/<run>/braindump.md` (docs/runs.md) | one run's work |
-| A workflow | the workflow's `intent` | every run of that workflow |
-| A user | `braindumps/episodes/<path>/braindump.md` in the catalog | the projects an installation has, and why |
+| Range | Word | Where | Grounds |
+| --- | --- | --- | --- |
+| A run | a **request** | `devdocs/runs/<workflow>/<run>/request.md` ([runs.md](runs.md#input)) | one run's work |
+| A workflow | an **intent** | the workflow's `intent` | every run of that workflow |
+| A user | **braindumps** | `braindumps/episodes/<path>/braindump.md` in the catalog | the projects an installation has, and why |
+
+A **braindump** is a person's free description of what they want and why, kept
+in their catalog (or in a development episode). A run's input was called a
+braindump until user_catalog p3; it is a request, whether a person or an agent
+made it. Beside the braindumps the catalog holds the owner's **preferences**
+(`preferences/<name>.md`): how the owner wants work done, given to every run
+(*Preferences* below). A braindump says what is wanted and why; a preference
+says how; facts about hosts are in neither.
 
 A project's own `intent` (`project.yaml`) still describes the project itself.
 The relation between a user's braindumps and the projects of an installation
@@ -77,6 +84,7 @@ mycatalog/
   braindumps/episodes/<path>/review.md        # free text, optional
   challenges/<id>/…                           # the owner's challenges (challenges.md in these docs)
   challenges.md                               # the index of what is not yet real: braindumps and challenges
+  preferences/<name>.md                       # free text: how the owner wants work done; given to every run
   summonplans/<name>.yaml                     # ag.summonplan.v1; one per installation or style
   publication/                                # what the published part holds (optional)
   README.md
@@ -184,6 +192,35 @@ catalog review request [<path>]` and `wfe catalog index request`, or from the
 Catalog page. Both write through `wfe catalog`, as `summoner-agent`. Without
 a summoner the requests are refused with the reason; a person can still write
 either by hand.
+
+### Preferences
+
+`preferences/<name>.md` holds the owner's standing preferences: how they want
+work done in every project (the language of documents, what a report starts
+with, how a result is handed over). Free Markdown, one file per subject;
+`<name>` follows the pattern of a braindump path segment. No front matter and
+no manager field: the Git author is the writer.
+
+- **Every file is given whole to every run and every authoring session**, as
+  a system-scope context source `system/preference/<name>` whose provenance is
+  the catalog repository, the path and the commit of the file's last change
+  ([context.md](context.md)). A change is used from the next attempt. An
+  installation without a catalog has no such sources; a catalog that cannot
+  be read is noted and never stops an attempt.
+- **What belongs where.** A preference says *how* the owner wants work done.
+  A braindump says *what* is wanted and why. Facts about hosts (addresses,
+  what runs where) are in neither: they stay in the system context's local
+  blocks, which are not in Git.
+- **Who writes.** The owner, on the Catalog page or with `wfe catalog
+  preference put`. An agent may write one as its own author, and only what
+  the owner said or confirmed (a lesson the owner agreed to, a correction the
+  owner gave); it says in the commit message where the owner said it.
+- **Publication** is the owner's choice, by the same file list as braindumps
+  (`[[tree]]` for `preferences`). Nothing publishes them by default.
+
+Until user_catalog p3 these were two local system blocks (`developer`,
+`developer-preferences`). On an installation with a catalog the block store
+refuses to create blocks with those ids and points here.
 
 ### `ag.mycatalog.v1`
 
@@ -381,6 +418,10 @@ words, and what of that was already said to be real. `wfe catalog why
 | `wfe catalog review show <path>` | `GET api/catalog/reviews/<path>` | the review, its history, whether the braindump changed after it |
 | `wfe catalog review put <path> --file/--text --author [--base <commit>]` | `PUT api/catalog/reviews/<path> {text, author, base?}` | 404 without the braindump; 409 when changed after `base` |
 | `wfe catalog review request [<path>] --author` | `POST api/catalog/reviews/request {path?, author}` | requests the summoner's `review`; 409 without a summoner |
+| `wfe catalog preference list` | `GET api/catalog/preferences` | every preference with its text, author and date |
+| `wfe catalog preference show <name>` | `GET api/catalog/preferences/<name>` | the text and its history |
+| `wfe catalog preference put <name> --file/--text --author [--base <commit>]` | `PUT api/catalog/preferences/<name> {text, author, base?}` | creates or replaces; one commit; 409 when changed after `base` |
+| `wfe catalog preference remove <name> --author` | `DELETE api/catalog/preferences/<name> {author}` | one commit |
 | `wfe catalog index show` | `GET api/catalog/index` | `challenges.md`, its author and date, what changed since |
 | `wfe catalog index put --file/--text --author [--base <commit>]` | `PUT api/catalog/index {text, author, base?}` | one commit; 409 when changed after `base` |
 | `wfe catalog index request --author` | `POST api/catalog/index/request {author}` | requests the summoner's `index` |
@@ -404,7 +445,8 @@ The browser shows the same data under **Catalog** on Home (`#/catalog`;
 and date, the note when something changed since, **Refresh the index**).
 Below it are the braindumps grouped by folder path, as titles with excerpts;
 a braindump's text and review are read when it is opened, and edited in the
-same place; **Ask for a review** is on each. Then the challenges by state,
+same place; **Ask for a review** is on each. Then **Preferences**: each file
+rendered, with its author and date, edited in place. Then the challenges by state,
 each linking to its challenge page. Braindumps, reviews and the index are
 rendered as Markdown; HTML in a text is shown, not run. Each braindump and
 challenge is marked published or internal. A relation diagram and the

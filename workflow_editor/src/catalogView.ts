@@ -93,7 +93,7 @@ export function relationDiagram(v: CatalogView, onPick: (kind: 'braindump' | 'pr
 type Bd = CatalogView['braindumps'][number]
 const challengeHref = (id: string) => `${hangoutHref()}?challenge=${encodeURIComponent(id)}`
 const publishedChip = (published: boolean) => h(`span.chip.${published ? 'ok' : 'muted'}`, { title: published ? 'In the published part of the catalog (publication/github.toml selects it)' : 'Internal: not selected by publication/github.toml' }, published ? 'published' : 'internal')
-type Editing = { kind: 'new' } | { kind: 'braindump' | 'review'; id: string } | null
+type Editing = { kind: 'new' } | { kind: 'new-preference' } | { kind: 'braindump' | 'review' | 'preference'; id: string } | null
 
 export function renderCatalogView(root: HTMLElement): ViewHandle {
   let data: Awaited<ReturnType<typeof api.catalog>> | null = null
@@ -231,6 +231,37 @@ export function renderCatalogView(root: HTMLElement): ViewHandle {
       x.text === null ? null : renderMarkdown(x.text, linker(v, '')))
   }
 
+  // Preferences (user_catalog p3): how the owner wants work done; every file
+  // is given to every run as system context (system/preference/<name>).
+  function preferenceEditor(p?: CatalogView['preferences'][number]): HTMLElement {
+    const name = h('input', { value: '', placeholder: 'name: documents, handing-over', 'aria-label': 'Preference name', size: 32 })
+    const text = h('textarea', { rows: 10, value: p ? p.text : '# Subject\n\nHow I want this done, in every project.\n', 'aria-label': 'Preference text' })
+    return h('div.catalog-editor',
+      p ? null : h('label.small', 'File name below preferences/ (without .md) ', name),
+      text,
+      h('div.row', h('button.primary', { onclick: () => void change(() => api.catalogPreferencePut(p ? p.name : name.value.trim().replace(/\.md$/, ''), text.value, author.value.trim(), p?.updated?.commit)) }, p ? 'Commit the change' : 'Add the preference'),
+        cancel(),
+        h('span.small.muted', p ? `Refused if someone changed it after ${p.updated?.commit.slice(0, 7) ?? 'its last commit'}. The next attempt of every run is prepared with the new text.` : 'One commit in the catalog. One file per subject.')))
+  }
+  function preferencesCard(v: CatalogView): HTMLElement {
+    return h('section.card.catalog-preferences',
+      h('div.card-head', h('h2', 'Preferences'), h('span.muted.small', `${v.preferences.length} · preferences/<name>.md`)),
+      h('p.muted.small', 'How you want work done, in every project: the language of documents, how results are handed over, what a report starts with. Every file here is given whole to every run and every authoring session (the context\'s system sources). What you want and why is a braindump; facts about machines stay in the system context.'),
+      h('div.row', h('button', { onclick: () => { editing = { kind: 'new-preference' }; render() } }, 'New preference')),
+      editing?.kind === 'new-preference' ? preferenceEditor() : null,
+      v.preferences.length ? v.preferences.map(p => {
+        const edit = editing?.kind === 'preference' && editing.id === p.name
+        return h('article.catalog-bd', { dataset: { preference: p.name } },
+          h('div.entry-head', h('strong', p.title), h('code', p.name), publishedChip(p.published),
+            p.updated ? h('span.muted.small', `${p.updated.author} · ${when(p.updated.at)} · ${p.updated.commit.slice(0, 7)}`) : null,
+            h('a.small', { href: `${v.web}/src/branch/${v.branch}/${p.path}`, target: '_blank', rel: 'noopener' }, 'on Gitea')),
+          edit ? preferenceEditor(p) : renderMarkdown(p.text, linker(v, 'preferences')),
+          edit ? null : h('div.row',
+            h('button', { onclick: () => { editing = { kind: 'preference', id: p.name }; render() } }, 'Edit'),
+            h('button.danger', { onclick: () => { if (confirm(`Remove preference ${p.name}? It stays in the repository's history; runs are no longer given it.`)) void change(() => api.catalogPreferenceRemove(p.name, author.value.trim())) } }, 'Remove')))
+      }) : h('p.muted', 'No preferences yet.'))
+  }
+
   // The owner's challenges, by state; a challenge is read and written on its own page.
   function challengesCard(v: CatalogView): HTMLElement {
     const c = v.challenges
@@ -296,6 +327,7 @@ export function renderCatalogView(root: HTMLElement): ViewHandle {
     main.append(indexCard(v))
     const reviewed = v.braindumps.filter(b => b.review).length
     main.append(h('section.card', h('div.card-head', h('h2', 'Braindumps'), h('span.muted.small', `${reviewed} of ${v.braindumps.length} reviewed · ${v.braindumps.filter(b => b.published).length} published`)), v.braindumps.length ? tree(v.braindumps, v) : h('p.muted', 'No braindumps yet.')))
+    main.append(preferencesCard(v))
     main.append(challengesCard(v))
     const grounded = v.projects.filter(p => p.braindumps.length).length
     main.append(h('section.card.catalog-relations',

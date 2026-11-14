@@ -17,6 +17,7 @@ import { hostname } from 'node:os'
 import { promisify } from 'node:util'
 import { canonicalJson } from '../shared/canonical.ts'
 import { EXECUTOR_OPS, hostOf, questionState, replay, runKey, runUid, situation, standingEvents, type HoldCause, type RunRecord, type RunRef } from '../shared/run.ts'
+import { requestFrom } from '../shared/run.ts'
 import { hostOwes, openContinuations, reviewStateText } from '../shared/humanReview.ts'
 import { DEFAULT_LANE, sessionPolicyOf } from '../shared/model.ts'
 import { laneOn } from './workers.ts'
@@ -72,7 +73,7 @@ export interface ObservedRun {
   recoveries: { seq: number; at: string; by: string; incident: string; attempt: string; agent: unknown }[]
   publication: { failed: CheckpointFact[]; attention: CheckpointFact[]; pending: CheckpointFact[] }
   integration: Record<'queued' | 'running' | 'failed' | 'refused' | 'attention', { id: number; decision: number; error: string | null; updated: string }[]>
-  input: { kind: string; requester: string | null; source: unknown }
+  input: { kind: string; from?: 'person' | 'agent'; requester: string | null; source: unknown }
   executor: { name: string; host: string; node: string | null; lane: string } | null // node (p7): the worker that performs it; lane (p8): the lane its record names (`default` when none)
   problems: { code: string; message: string }[]
   unavailable: Record<string, string>
@@ -443,7 +444,7 @@ export class Observer {
       recoveries: r.history.filter(e => (e.op as string) === 'run.recover').map(e => { const x = e as unknown as { seq: number; at: string; by: string; incident: string; attempt: string; agent?: unknown }; return { seq: x.seq, at: x.at, by: x.by, incident: x.incident, attempt: x.attempt, agent: x.agent ?? null } }),
       publication: { failed: [], attention: [], pending: [] },
       integration: { queued: [], running: [], failed: [], refused: [], attention: [] },
-      input: { kind: r.input.kind, requester: r.input.requester ?? null, source: r.input.source ?? null },
+      input: { kind: r.input.kind, from: requestFrom(r.input), requester: r.input.requester ?? null, source: r.input.source ?? null },
       executor: { name: r.executor.name, host: hostOf(r.executor), node: this.exec ? this.exec.nodeOf(r) : r.executor.node ?? null, lane: r.executor.lane ?? DEFAULT_LANE },
       problems, unavailable,
     }

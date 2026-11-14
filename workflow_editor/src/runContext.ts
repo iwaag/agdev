@@ -14,6 +14,7 @@
 //   nothing to the run; the next-attempt comparison is read again after it
 //   and names each block that differs.
 import type { RunRecord } from '../shared/run.ts'
+import { requestFrom } from '../shared/run.ts'
 import type { ContextSource } from '../shared/context.ts'
 import { api, type RunContextView } from './api.ts'
 import { append, h, when } from './dom.ts'
@@ -38,7 +39,7 @@ const scopeLabel = (s: Pick<ContextSource, 'scope' | 'category' | 'kind' | 'titl
   : s.kind === 'override' ? (s.scope === 'system' ? 'Instructions for all projects' : s.scope === 'project' ? 'Instructions for the project' : 'Instructions for the workflow')
     : s.kind === 'intent' ? (s.scope === 'project' ? 'Project purpose and goals' : 'Workflow purpose')
       : s.kind === 'guide' ? `${s.scope === 'project' ? 'Project' : 'Workflow'} guide ${s.origin.file ?? s.title.replace(/^guide /, '')}`
-        : s.kind === 'contract' ? 'Common execution contract' : s.title
+        : s.kind === 'contract' ? 'Common execution contract' : s.kind === 'preference' ? `The owner's preference ${s.origin.file ?? s.title}` : s.title
 
 export class RunContextCard {
   readonly el: HTMLElement
@@ -136,7 +137,7 @@ export class RunContextCard {
   private renderRequest() {
     const rec = this.rec
     if (!rec) return
-    const who = rec.input.kind === 'braindump' ? `${rec.input.author}'s words` : `request by ${rec.input.requester}${rec.input.onBehalfOf ? ` on behalf of ${rec.input.onBehalfOf}` : ''}`
+    const who = requestFrom(rec.input) === 'person' ? `${rec.input.author}'s words` : `request by ${rec.input.requester}${rec.input.onBehalfOf ? ` on behalf of ${rec.input.onBehalfOf}` : ''}`
     const r = this.request
     const text = r?.text?.trim() ?? ''
     const lines = text.split('\n')
@@ -279,7 +280,7 @@ export class RunContextCard {
     const att = v?.attempts.at(-1)
     const ch = v?.changes.filter(c => !c.key.startsWith('run/') && c.key !== 'system/contract') ?? []
     const bits = [
-      rec.input.kind === 'braindump' ? 'braindump' : 'request',
+      requestFrom(rec.input) === 'person' ? 'a person\'s request' : 'an agent\'s request',
       ins.length ? `${ins.length} instruction${ins.length === 1 ? '' : 's'}${pending ? ` (${pending} not acknowledged)` : ''}` : 'no instructions',
       this.deps.historical ? null : !v ? null : !att ? 'no attempt yet' : att.snapshot ? `attempt ${att.attempt}: context recorded` : `attempt ${att.attempt}: context unavailable`,
       this.deps.historical || !v || !att ? null : ch.length ? `${ch.length} change${ch.length === 1 ? '' : 's'} for the next attempt` : 'next attempt: same',

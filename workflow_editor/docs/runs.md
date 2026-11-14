@@ -35,7 +35,7 @@ integration) is a snapshot; the copy's `run.json` stays the live record.
 
 ```text
 devdocs/runs/<workflow-id>/<run-id>/
-  braindump.md          the person's own input (or request.md, see Input)
+  request.md            the run's request, from a person or an agent (see Input)
   plan.md               the agreed plan (default policy: the _plan step's document)
   report-<node>.md      a report per authored node (default policy)
   report.md             the final report (default policy)
@@ -54,8 +54,8 @@ new layout is shown as an unsupported schema, never as an empty listing.
 
 | Information | Authority |
 | --- | --- |
-| The person's words | `braindump.md` |
-| A request an agent constructed | `request.md` (+ `original-input.md` when given) |
+| The run's request: a person's words, or what an agent wrote | `request.md` (+ `original-input.md` when an agent's request kept the words it was derived from) |
+| Whose request it is | `run.json` `input.from`, with `author` or `requester` |
 | How the work is approached | `plan.md` and reports — prose; the tools never parse it |
 | The executed definitions | `definition/*.yaml`, fixed for the run's lifetime |
 | Node states, questions, answers, relations, artifact references, acceptance, history | `run.json` |
@@ -101,18 +101,28 @@ is written.
 
 ## Input
 
-| Kind | File | Who wrote the words | Required facts |
-| --- | --- | --- | --- |
-| `braindump` | `braindump.md` | the person | `author` (the person's name) |
-| `request` | `request.md` | an agent, on someone's behalf | `requester` (the agent), `entrustedBy` (reference), optional `onBehalfOf` |
+A run has one request, in `request.md`. `input.kind` is `request`; `input.from`
+says who made it (user_catalog p3):
 
-`braindump.md` holds the person's own words. An agent that saves them is
+| `from` | Who wrote the words | Required facts |
+| --- | --- | --- |
+| `person` | the person | `author` (the person's name) |
+| `agent` | an agent, on someone's behalf | `requester` (the agent), `entrustedBy` (reference), optional `onBehalfOf` |
+
+A person's request holds their own words. An agent that saves them is
 recorded as `recordedBy`; that does not make them an agent's request. An agent
-that writes its own request — rewording a person's input, or delegating — uses
-`request.md` and records the reference to what entrusted it: a run and node
+that writes its own request — rewording a person's input, or delegating — is
+the `requester` and records the reference to what entrusted it: a run and node
 (`{kind: "run", workflow, run, node}`), a project file (`{kind: "file",
 path}`), or a free reference such as a conversation (`{kind: "note", text}`).
 An entrance for requests from external agents is not part of p4.
+
+Runs created before this rename are read as they are and never rewritten:
+`{kind: braindump, file: braindump.md}` is a person's request, and `{kind:
+request}` without `from` an agent's (`requestFrom` in `shared/run.ts`). The
+run view shows their file under the same label, *Request*. "Braindump" now
+means the free text in a catalog ([mycatalog.md](mycatalog.md)) or in a
+development episode, and nothing in a run.
 A run records where its words were said as `input.source` (a conversation
 message, a submission, a delegation item, another installation's message)
 and `run.create` carries that entrance's receipt: the same input never
@@ -217,7 +227,7 @@ repository contents, and a commit hash does not include uncommitted files.
   "workflow": "build-game",
   "run": "run-001",
   "created": "2026-10-10T12:00:00.000Z",
-  "input": { "kind": "braindump", "file": "braindump.md", "author": "A. Person", "recordedBy": "Omni Agent" },
+  "input": { "kind": "request", "from": "person", "file": "request.md", "author": "A. Person", "recordedBy": "Omni Agent" },
   "executor": { "name": "Omni Agent", "backend": "claude-code / claude-opus-5-5" },
   "predecessor": null,
   "definition": {
@@ -1036,7 +1046,7 @@ HTTP routes call them; neither needs the other running.
 
 | Operation | `wfe run` | HTTP (`/api/workspaces/<ws>/…`) | Browser |
 | --- | --- | --- | --- |
-| Create a run (snapshot, input) | `create <workflow> --braindump <file>` / `--request <file> --entrusted-by …` | — | — (input comes through the IDE; see below) |
+| Create a run (snapshot, input) | `create <workflow> --request <file> --author <person>` / `--request <file> --requester <agent> --entrusted-by …` | — | — (input comes through the IDE; see below) |
 | List runs | `list [<workflow>]` | `GET runs` | project view → Runs |
 | Inspect a run, its definition, ready nodes, history | `show <run> [--history] [--rev [root:]<commit>]`, `check` | `GET runs/<wf>/<run>[?rev=]` | run view |
 | The current state and pending input only (agent_session p1 ex2) | `state <run> [--since <seq>]` | — | — |

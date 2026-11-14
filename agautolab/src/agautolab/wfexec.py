@@ -156,7 +156,10 @@ def request_intro(claim: dict) -> str:
     if not path.is_relative_to(folder.resolve()):
         raise ValueError("run input leaves its run folder")
     text = path.read_text()
-    if given.get("kind") == "request":
+    # user_catalog p3: every input is a request; `from` says whose. Records
+    # written before that have no `from`: kind braindump is a person's.
+    origin = given.get("from") or ("person" if given.get("kind") == "braindump" else "agent")
+    if origin == "agent":
         destination = "The requesting agent receives your run's recorded outcome and artifacts and relays them to the person. The brief below identifies that requester."
     elif source.get("kind") == "conversation":
         destination = f"Conversation {source['conversation']}, message #{source['message']}. Read it with wfe conversation show; reply using wfe conversation reply --re {source['message']} (see reference/delivery.md)."

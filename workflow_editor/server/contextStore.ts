@@ -27,6 +27,7 @@
 // Developer-managed block `developer` of the same scope and moved to
 // contexts/archive/p13/; nothing reads or writes them after that.
 import { createHash } from 'node:crypto'
+import { existsSync } from 'node:fs'
 import { appendFile, mkdir, readdir, rename, rm, stat } from 'node:fs/promises'
 import { hostname } from 'node:os'
 import { dirname, join } from 'node:path'
@@ -38,6 +39,9 @@ import {
 import { atomicWrite, readTextOrNull } from './files.ts'
 import { withLock } from './lock.ts'
 import { RequestError } from './workspace.ts'
+
+// System block ids whose content is now the catalog's (user_catalog p3).
+const MOVED_TO_CATALOG = ['developer', 'developer-preferences']
 
 export const MAX_BODY_BYTES = 64 * 1024
 export const MAX_DETAIL_BYTES = 1024 * 1024
@@ -226,6 +230,10 @@ export class ContextStore {
     return this.locked(t, id, async cur => {
       t = cur.target
       const was = cur.block
+      // user_catalog p3: the owner's standing preferences are in the catalog
+      // (preferences/<name>.md). The two blocks that held them are not made
+      // again, so that an older guide does not quietly recreate them.
+      if (!was && t.scope === 'system' && MOVED_TO_CATALOG.includes(id) && existsSync(join(dirname(this.root), 'catalog.json'))) throw new RequestError(409, `the system block "${id}" moved to the owner's catalog: preferences are preferences/<name>.md there (wfe catalog preference list | show <name> | put <name> --file <md> --author <who>; the Catalog page, Preferences). Facts about hosts stay in system blocks under another id.`)
       if (!was && (input.title === undefined || input.kind === undefined || input.body === undefined)) throw new RequestError(400, `${cur.file} does not exist${cur.base ? ' (removed)' : ''}: a new block needs a title, a kind and a body`)
       const kind = input.kind ?? was!.kind
       if (!BLOCK_KINDS.includes(kind)) throw new RequestError(400, `kind is ${BLOCK_KINDS.join(' or ')}`)

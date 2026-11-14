@@ -871,7 +871,7 @@ export class ConversationService {
   }
 
   // Starts a request's run: one run of its recorded workflow with the words
-  // as its braindump; or delivers it to the run it names. The receipt finds
+  // as its request; or delivers it to the run it names. The receipt finds
   // the same run again. A target that cannot take it leaves the request
   // `failed` with the reason; it is never sent to anyone else. A closed
   // conversation starts nothing: the request is withdrawn.
@@ -921,7 +921,7 @@ export class ConversationService {
   }
 
   // Starts the request's run (one run of its recorded workflow with the
-  // words as its braindump), by receipt; a conductor's run stands (p18).
+  // words as its request), by receipt; a conductor's run stands (p18).
   private async startRun(i: InvitationRow, standing?: { conversation: string; replaces?: string }): Promise<void> {
     const id = i.id
     const named = JSON.parse(i.source) as number[]

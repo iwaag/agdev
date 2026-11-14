@@ -17,7 +17,7 @@ slash) a folder, `shared://<share>/` the share's root. `<share>` matches the
 project id pattern; `<path>` is a normalized relative path (no `..`, no
 leading slash). A reference never contains a host path.
 
-References written in the **words** of the input (a braindump, a request,
+References written in the **words** of the input (a person's or an agent's request,
 a conversation message that became one, a delegation's request) are recorded by
 `run.create` once each, in order, in `input.references`. No upload form
 exists.

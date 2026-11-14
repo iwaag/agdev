@@ -798,6 +798,19 @@ export function createHandler(config: ServiceConfig) {
             return send(res, 200, await m.changeBraindump(ctx, { op: 'remove', id, author: str(input.author, 'author'), force: input.force === true }))
           }
         }
+        // user_catalog p3: the owner's standing preferences (preferences/<name>.md).
+        if (wsId === 'preferences') {
+          if (!id && method === 'GET') return send(res, 200, await m.preferences(ctx, { maxAgeMs: fresh }))
+          if (id && method === 'GET') return send(res, 200, await m.preference(ctx, id))
+          if (id && method === 'PUT') {
+            const input = await body(req) as Record<string, unknown>
+            return send(res, 200, await m.changePreference(ctx, { op: 'put', name: id, text: str(input.text, 'text'), author: str(input.author, 'author'), base: text(input.base), message: text(input.message) }))
+          }
+          if (id && method === 'DELETE') {
+            const input = await body(req) as Record<string, unknown>
+            return send(res, 200, await m.changePreference(ctx, { op: 'remove', name: id, author: str(input.author, 'author'), base: text(input.base) }))
+          }
+        }
         if (wsId === 'reviews' && id && method === 'GET') return send(res, 200, await m.review(ctx, id))
         if (wsId === 'reviews' && id && method === 'PUT') {
           const input = await body(req) as Record<string, unknown>

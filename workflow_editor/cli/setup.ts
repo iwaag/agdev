@@ -27,7 +27,7 @@ export interface SetupResult {
 }
 
 export const FIRST_PROMPT = 'Create a project in this authoring area for <purpose>. Clarify its intent and goals, establish the repositories it needs, and create one workflow. Make the result available in the editor for me to review and adjust.'
-export const RUN_PROMPT = 'Execute workflow <workflow id> of project <project id> with the braindump below. Save my words as the run\'s braindump with me as the author, record the run with wfe as you work, and write your plan and reports in the run folder. Ask me here or as a run question when you need me.'
+export const RUN_PROMPT = 'Execute workflow <workflow id> of project <project id> with the request below. Save my words as the run\'s request with me as the author, record the run with wfe as you work, and write your plan and reports in the run folder. Ask me here or as a run question when you need me.'
 
 const fill = (text: string, vars: Record<string, string>) => text.replace(/\{\{([A-Z_]+)\}\}/g, (_, k: string) => vars[k] ?? `{{${k}}}`)
 const sh = (s: string) => `'${s.replace(/'/g, `'\\''`)}'`
@@ -104,7 +104,7 @@ export async function setupArea(area: string, opts: { port: number; installed?: 
     `IDE:      open ${area} in VS Code and start the agent there (it reads AGENTS.md; Claude Code via CLAUDE.md)`,
     'Prompt (authoring):',
     `  ${FIRST_PROMPT}`,
-    'Prompt (executing a workflow; add the braindump after it):',
+    'Prompt (executing a workflow; add your request after it):',
     `  ${RUN_PROMPT}`,
     `Runs:     ${url}#/ws/<project id> → Runs; folders devdocs/runs/<workflow id>/<run id>/; ${launcher} run help`,
     '',

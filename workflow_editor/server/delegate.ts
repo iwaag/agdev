@@ -33,6 +33,7 @@ import {
 } from '../shared/delegation.ts'
 import { acceptsRequests, normalizeRepoPath } from '../shared/model.ts'
 import { graphOfState, hostOf, questionState, replay, runKey, runUid, standingHold, type BecauseRef, type DocumentEvidence, type RunRecord, type RunRef } from '../shared/run.ts'
+import { requestFrom } from '../shared/run.ts'
 import { assessResult, assessmentReminders, type Assessment, type ChildEvidence } from '../shared/assessment.ts'
 import { latestResult, openRevision as openRevisionOf } from '../shared/delegation.ts'
 import { assertWorkspaceAllowed, loadBoundary } from './boundary.ts'
@@ -308,9 +309,9 @@ export class DelegateStore {
   }
 
   // The person's words a run's request ultimately comes from: the parent's
-  // braindump, or the original its own request kept (docs/delegation.md).
+  // own request, or the original its agent's request kept (docs/delegation.md).
   private async humanOriginal(space: Workspace, ref: RunRef, rec: RunRecord): Promise<string | null> {
-    const file = rec.input.kind === 'braindump' ? rec.input.file : rec.input.original
+    const file = requestFrom(rec.input) === 'person' ? rec.input.file : rec.input.original
     if (!file) return null
     return readFile(join(await inside(space.root, runDir(ref)), file), 'utf8').catch(() => null)
   }
@@ -418,7 +419,7 @@ export class DelegateStore {
             // The child follows the revision the parent dispatched to.
             ...(d.target.source?.commit ? { rev: d.target.source.commit } : {}),
             input: {
-              kind: 'request', text: request, requester: record.executor.name, ...(d.onBehalfOf ? { onBehalfOf: d.onBehalfOf } : {}),
+              from: 'agent', text: request, requester: record.executor.name, ...(d.onBehalfOf ? { onBehalfOf: d.onBehalfOf } : {}),
               entrustedBy: { kind: 'delegation', delegation: d.uid, parent: { project: record.project, workflow: record.workflow, run: record.run, creation: creationOf(record), node: d.node }, accepts: d.accepts },
               ...(original !== null ? { original } : {}), source: { kind: 'delegation', route: 'direct', delegation: d.uid, item: 'request', at: now() },
             },

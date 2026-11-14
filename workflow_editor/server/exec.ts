@@ -30,6 +30,7 @@ import { attemptContext, renderContext, type AttemptContext } from '../shared/co
 import { contextErrors, resolveContext } from './context.ts'
 import { ContextStore } from './contextStore.ts'
 import { configChanges, currentSession, definitionMeaningBrief, unverifiedReason, unverifiedSession, describeSteps, effectiveOf, holderOf, hostOf, openCorrections, pendingInstructions, runKey, sameConfig, sessionConfig, situation, standingEvents, type AttemptSession, type AttemptSettings, type BecauseRef, type RecoveryAgent, type RunRecord, type RunRef } from '../shared/run.ts'
+import { requestFrom } from '../shared/run.ts'
 import { wake } from './standing.ts'
 import { git } from './git.ts'
 import { docStepsOf } from '../shared/compile.ts'
@@ -159,7 +160,7 @@ export function attachmentBrief(r: RunRecord, dir: string): string[] {
   const all = r.input.attachments ?? []
   if (!all.length) return []
   const challenges = all.filter(a => a.kind === 'challenge'), files = all.filter(a => a.kind === 'file')
-  const words = r.input.kind === 'request' ? 'request' : 'person\'s words'
+  const words = requestFrom(r.input) === 'agent' ? 'request' : 'person\'s words'
   return [
     ...(challenges.length ? [`Attached to the ${words} (${challenges.length}): durable challenges, each as it was when attached (wfe challenge help):`,
       ...challenges.map(a => `- ${a.id} "${a.title}" at ${a.commit.slice(0, 12)}: ${dir}/${a.file}; its files and trials then: wfe challenge show ${a.id} --at ${a.commit.slice(0, 12)}; its latest revision: wfe challenge show ${a.id}`)] : []),
@@ -558,7 +559,7 @@ export class ExecStore {
 
   // ---- requests and the queue ------------------------------------------------------
 
-  // A person's request: create the run (their words as braindump.md) in its
+  // A person's request: create the run (their words as request.md) in its
   // own working copy and queue its start. The receipt makes a retransmitted
   // request a no-op. No other run reserves the project (p9): a held, waiting
   // or working run keeps its own copy; the execution slots (one per worker,
@@ -571,7 +572,7 @@ export class ExecStore {
   // `attachments` (challenge p1): challenges the words carried, each with its
   // file's text at the attached commit, written into the new run's folder.
   // `standing` (p18): the run is created as a conversation's standing conductor.
-  async request(o: { workspace: string; workflow: string; text: string; author: string; receipt: string; by?: string; via: string; predecessor?: RunRef; node?: string; source?: import('../shared/intake.ts').SourceRef; input?: Extract<import('./runs.ts').CreateRunOptions['input'], { kind: 'request' }>; attachments?: import('./runs.ts').PinnedAttachment[]; standing?: { conversation: string; replaces?: string }; trial?: import('./runs.ts').CreateRunOptions['trial'] }): Promise<{ job: JobRow; ref: RunRef; duplicate: boolean }> {
+  async request(o: { workspace: string; workflow: string; text: string; author: string; receipt: string; by?: string; via: string; predecessor?: RunRef; node?: string; source?: import('../shared/intake.ts').SourceRef; input?: Extract<import('./runs.ts').CreateRunOptions['input'], { from: 'agent' }>; attachments?: import('./runs.ts').PinnedAttachment[]; standing?: { conversation: string; replaces?: string }; trial?: import('./runs.ts').CreateRunOptions['trial'] }): Promise<{ job: JobRow; ref: RunRef; duplicate: boolean }> {
     if (!/^[A-Za-z0-9:._/#-]{8,200}$/.test(o.receipt)) throw new RequestError(400, 'a request needs a receipt id (8–200 of A-Z a-z 0-9 : . _ / # -)')
     const seen = this.one<JobRow>('SELECT * FROM jobs WHERE receipt = ?', `request:${o.receipt}`)
     if (seen) return { job: seen, ref: { workflow: seen.workflow, run: seen.run }, duplicate: true }
@@ -579,7 +580,7 @@ export class ExecStore {
     // The run gets its own working copy (p9); the same receipt finds it again.
     const env = this.ctx.gitea ? await this.ctx.gitea.gitEnv() : {}
     const attachments = o.attachments?.length ? { attachments: o.attachments } : {}
-    const created = await createRunInCopy(ws, { workflow: o.workflow, input: o.input ? { ...o.input, ...attachments } : { kind: 'braindump', text: o.text, author: o.author, recordedBy: o.by, ...(o.source ? { source: o.source } : {}), ...attachments }, executor: { host: this.executor, ...(o.node ? { node: o.node } : {}) }, by: o.by ?? o.author, via: o.via, area: this.ctx.area, receipt: `request:${o.receipt}`, ...(o.predecessor ? { predecessor: o.predecessor } : {}), ...(o.standing ? { standing: o.standing } : {}), ...(this.ctx.gitea ? { access: this.accessContext() } : {}), ...(o.trial ? { trial: o.trial } : {}) }, env)
+    const created = await createRunInCopy(ws, { workflow: o.workflow, input: o.input ? { ...o.input, ...attachments } : { from: 'person', text: o.text, author: o.author, recordedBy: o.by, ...(o.source ? { source: o.source } : {}), ...attachments }, executor: { host: this.executor, ...(o.node ? { node: o.node } : {}) }, by: o.by ?? o.author, via: o.via, area: this.ctx.area, receipt: `request:${o.receipt}`, ...(o.predecessor ? { predecessor: o.predecessor } : {}), ...(o.standing ? { standing: o.standing } : {}), ...(this.ctx.gitea ? { access: this.accessContext() } : {}), ...(o.trial ? { trial: o.trial } : {}) }, env)
     // cluster_teamwork p5: the receipt found a run made before (its first start may have been queued under
     // another receipt, e.g. a reconcile's `start:`): a run that has started is not started again (PC
     // warden/recover/run-004 was relaunched after it had completed by a repeated submission).
@@ -1078,7 +1079,7 @@ export class ExecStore {
     // The original requirement and the current plan, on every attempt of a
     // new session (agent_session p1 ex2): a replacement or a fresh session
     // reconstructs from them, not only the run's first attempt.
-    lines.push(`The ${r.input.kind === 'request' ? 'request' : 'person\'s request'} is ${runDir(ref)}/${r.input.file} (${r.input.kind === 'request' ? `requester ${r.input.requester}` : `author ${r.input.author}`})${r.input.original ? `; the person's own words are ${runDir(ref)}/${r.input.original}` : ''}.`)
+    lines.push(`The ${requestFrom(r.input) === 'agent' ? 'request' : 'person\'s request'} is ${runDir(ref)}/${r.input.file} (${requestFrom(r.input) === 'agent' ? `requester ${r.input.requester}` : `author ${r.input.author}`})${r.input.original ? `; the person's own words are ${runDir(ref)}/${r.input.original}` : ''}.`)
     lines.push(...attachmentBrief(r, runDir(ref)))
     if (job.kind !== 'start' && existsSync(join(ws.root, runDir(ref), 'plan.md'))) lines.push(`The current plan is ${runDir(ref)}/plan.md${r.nodes._plan?.agreement ? ` (agreed in ${r.nodes._plan.agreement.question})` : ''}.`)
     // The run this one follows (p9): its records and saved work, to reuse,
@@ -1939,7 +1940,7 @@ export class ExecStore {
       'Look at the queue and the workers (wfe coordinate view), take the pending events (wfe coordinate events --take), decide what starts, moves or waits, apply it (wfe coordinate start|defer|assign|note), and end. wfe coordinate --help explains the operations.'].join('\n')
     try {
       const r = await this.request({ workspace: c.workspace, workflow: c.workflow, text, author: 'WFE', receipt: `coordinate:turn-${id}`, via: 'coordination', node: c.worker,
-        input: { kind: 'request', text, requester: 'WFE', entrustedBy: { kind: 'note', text: `coordination turn ${id}: ${need.why.join('; ') || 'requested explicitly'}` } } })
+        input: { from: 'agent', text, requester: 'WFE', entrustedBy: { kind: 'note', text: `coordination turn ${id}: ${need.why.join('; ') || 'requested explicitly'}` } } })
       // The claim may already have linked it, or the turn may even have ended.
       this.run('UPDATE coordination_batches SET state = CASE WHEN state = \'creating\' THEN \'open\' ELSE state END, run = ?, job = ? WHERE id = ?', r.ref.run, r.job.id, id)
       return this.one<CoordinationBatchRow>('SELECT * FROM coordination_batches WHERE id = ?', id)!

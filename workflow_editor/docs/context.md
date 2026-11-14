@@ -9,12 +9,12 @@ a run's claim, the "next attempt" preview, the browser's editors and Context ove
 
 | Scope | Default (in the project's repositories) | Local (this WFE area, not in Git) |
 | --- | --- | --- |
-| System | the common execution contract (the execution host's, by hash at claim); for authoring, the authoring area's `AGENTS.md` and `docs/contract.md` (a reference) | blocks in `<area>/.local/contexts/system/`: e.g. the Developer's instructions and cagent's cluster summary |
+| System | the common execution contract (the execution host's, by hash at claim); for authoring, the authoring area's `AGENTS.md` and `docs/contract.md` (a reference); the owner's standing preferences, `preferences/<name>.md` of the catalog ([mycatalog.md](mycatalog.md#preferences)) | blocks in `<area>/.local/contexts/system/`: facts about this environment, e.g. cagent's cluster summary |
 | Project | `project.yaml` intent and goals; why the project is here (the catalog's plan entry, its braindumps and their reviews, [mycatalog.md](mycatalog.md#why-a-project-is-here-in-its-runs)); `project.yaml` `guides` | blocks in `<area>/.local/contexts/projects/<project>/project/` |
 | Workflow | the workflow's intent; its `execution.guides` | blocks in `<area>/.local/contexts/projects/<project>/workflows/<workflow>/` |
 | Run | none: a run is created, not pre-authored | the run's input — its request, answers and instructions (run.json, `wfe run`) |
 
-Run input keeps its own contract: `braindump.md` is the person's original
+Run input keeps its own contract: `request.md` is the run's original
 request and may be committed with the run; it is not a preference store, and
 there is no run-level block editor.
 
@@ -34,10 +34,10 @@ A bundle (`shared/context.ts`, `ag.wfe-context.v1`) lists sources, each with:
 
 | Field | Meaning |
 | --- | --- |
-| `key` | `system/contract`, `system/authoring`, `system/block/<id>`, `project/intent`, `guide/<path or project:path>`, `project/block/<id>`, `workflow/intent`, `workflow/block/<id>`, `run/input`, `run/record` (p13 snapshots: `<scope>/override`) |
+| `key` | `system/contract`, `system/authoring`, `system/preference/<name>`, `system/block/<id>`, `project/intent`, `guide/<path or project:path>`, `project/block/<id>`, `workflow/intent`, `workflow/block/<id>`, `run/input`, `run/record` (p13 snapshots: `<scope>/override`) |
 | `scope`, `category` | system/project/workflow/run; default/override (a local block)/input |
 | `applies` | `execution`, `authoring`: the execution contract is for run executors only, the authoring entry for IDE sessions only; everything else applies to both |
-| `origin`, `provenance` | file, project and commit (a cross-project guide), the store's logical file (a block); every declaration naming it |
+| `origin`, `provenance` | file, project and commit (a cross-project guide; the catalog, for a preference and for the grounds), the store's logical file (a block); every declaration naming it |
 | `delivery` | `body` (in the text), `reference` (named, not included — "reference supplied" does not mean "agent read it"), `absent` (nothing configured), `error` (configured but unreadable) |
 | `sha256` | of the delivered body (a block: its rendered section) or the referenced file |
 | `block` | a block's id, kind, manager, last editor, revision, evidence, check, failed refresh, details and consultation workflow |
@@ -75,8 +75,9 @@ A bundle (`shared/context.ts`, `ag.wfe-context.v1`) lists sources, each with:
 ## Local context blocks (p14)
 
 Each scope holds any number of **independently managed blocks**. The system
-scope is this one WFE area. Examples: a Developer instruction block and a
-cagent cluster summary in the system scope; the forge project's human
+scope is this one WFE area. Examples: a cagent cluster summary in the system
+scope (the owner's standing preferences are not blocks: they are in the
+catalog, user_catalog p3); the forge project's human
 guidance and a separate cagent resource-advice block in its project scope.
 Any agent can use the same model.
 
@@ -317,7 +318,7 @@ saved body, no delivery and no fingerprint.
 
 | Editor | Context section |
 | --- | --- |
-| Home (`#/home/context`) | *For all projects · only in this environment*: the system blocks (the Developer's instructions, cagent's cluster summary, …) and *Add* |
+| Home (`#/home/context`) | *For all projects · only in this environment*: the system blocks (cagent's cluster summary, …) and *Add*, with a link to the catalog's preferences |
 | Project (`#/ws/<ws>/context`) | *In the repository*: one row for purpose, goals and `guides` of `project.yaml` (opens the editor's one draft and *Save project.yaml* in the panel) and one per guide's content; *For this project · only in this environment* (the project's blocks, *Add*); *Inherited*: the system blocks, each naming its scope, editable in place |
 | Workflow (`#/ws/<ws>/wf/<file>/context`) | *In the repository*: the intent and `execution.guides` (edited in a draft, [drafts.md](drafts.md); read-only on the published view) and the workflow's guides, read at the published revision; the workflow's blocks; *Inherited*: project purpose and goals, project guides, the project's blocks and the system blocks in one list — more than five fold behind *Show all*, keeping short instructions and drafts; *What a new run is given* (saved settings, in the panel) |
 | Run (the *Context* card) | the original request (read only); *Instructions for this run* with *Add an instruction* (`instruction.receive`); *Used for this attempt* (each block by kind, title and manager); *Changes for the next attempt* (the blocks added, changed or removed, by title); *Settings for future attempts* (*Workflow context*, *Project context*, *Context for all projects*: the block rows in place, opening beside the run); Detail: every attempt |

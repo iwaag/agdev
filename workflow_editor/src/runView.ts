@@ -19,6 +19,7 @@
 import { backendFact } from '../shared/backend.ts'
 import type { RunOpResponse, RunResponse } from '../shared/api.ts'
 import { describeSteps, effectiveOf, holderOf, situation, type RunRecord } from '../shared/run.ts'
+import { requestFrom } from '../shared/run.ts'
 import { api, ApiError, type AdjustView, type DelegationsView, type PresentationView, type RunExecView, type RunStorageView } from './api.ts'
 import { Canvas, STATE_GLYPH } from './canvas.ts'
 import { openFindingReadonly, openKnowledgePicker } from './knowledgeUi.ts'
@@ -469,7 +470,7 @@ export function renderRunView(root: HTMLElement, wsId: string, workflow: string,
     const last = rec.decisions.at(-1)
     patchContent(details,
       h('div.run-facts',
-        fact('Input', input.kind === 'braindump' ? `braindump.md — the words of ${input.author}${input.recordedBy ? `, recorded by ${input.recordedBy}` : ''}` : `request.md — by ${input.requester}${input.onBehalfOf ? ` on behalf of ${input.onBehalfOf}` : ''}`),
+        fact('Request', requestFrom(input) === 'person' ? `${input.file} — the words of ${input.author}${input.recordedBy ? `, recorded by ${input.recordedBy}` : ''}` : `${input.file} — by ${input.requester}${input.onBehalfOf ? ` on behalf of ${input.onBehalfOf}` : ''}`),
         fact('Executor', `${rec.executor.name} · ${backendFact(rec.executor.backend, rev || !execView ? null : execView.attempts)}`, 'executor'),
         // improve_wfrun p4: where the node came from, and who moved it since.
         rec.executor.node || execView?.workers?.length ? fact('Execution node', `${rec.executor.node ?? `${execView?.workers?.find(w => w.default)?.id ?? '—'} (the area's default)`}${rec.executor.placed ? ` — ${rec.executor.placed === 'request' ? 'named by the request (a placement constraint)' : `the ${rec.executor.placed}'s choice`}` : ''}${rec.assignments?.length ? ` — ${rec.assignments.map(a => `moved ${a.previous ?? '?'} → ${a.node} by ${a.by} (seq ${a.seq}): ${a.reason}`).join('; ')}` : ''}`, 'node') : null,

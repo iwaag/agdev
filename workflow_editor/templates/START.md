@@ -29,12 +29,12 @@ A first prompt:
 Pick the project and the workflow in the browser (project view →
 Workflows). Then, in VS Code:
 
-> Execute workflow <workflow id> of project <project id> with the braindump
-> below. Save my words as the run's braindump with me as the author, record
+> Execute workflow <workflow id> of project <project id> with the request
+> below. Save my words as the run's request with me as the author, record
 > the run with wfe as you work, and write your plan and reports in the run
 > folder. Ask me here or as a run question when you need me.
 >
-> <your braindump>
+> <your request>
 
 - The run appears in the project view under **Runs**, at
   `{{URL}}#/ws/<project id>/run/<workflow id>/<run id>`; its folder is

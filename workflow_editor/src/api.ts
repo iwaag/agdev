@@ -126,6 +126,8 @@ export const api = {
   catalogBraindump: (id: string) => call<CatalogBraindump>('GET', `api/catalog/braindumps/${bd(id)}`),
   catalogAdd: (id: string, text: string, author: string) => call<CatalogChange>('POST', 'api/catalog/braindumps', { id, text, author }),
   catalogEdit: (id: string, text: string, author: string, base?: string) => call<CatalogChange>('PUT', `api/catalog/braindumps/${bd(id)}`, { text, author, base }),
+  catalogPreferencePut: (name: string, text: string, author: string, base?: string) => call<CatalogChange>('PUT', `api/catalog/preferences/${encodeURIComponent(name)}`, { text, author, base }),
+  catalogPreferenceRemove: (name: string, author: string) => call<CatalogChange>('DELETE', `api/catalog/preferences/${encodeURIComponent(name)}`, { author }),
   catalogRemove: (id: string, author: string, force = false) => call<CatalogChange>('DELETE', `api/catalog/braindumps/${bd(id)}`, { author, force }),
   // user_catalog p2: the summoner writes reviews and the index on request (its workflows review and index).
   catalogReviewRequest: (author: string, path?: string) => call<CatalogUpkeep>('POST', 'api/catalog/reviews/request', { author, path }),

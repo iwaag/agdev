@@ -16,6 +16,7 @@ import {
   type BundleEntry, type DefinitionRef, type DefinitionSource, type DocumentEvidence, type EntrustRef, type Executor, type OpInput, type RepoContext, type RunGraph,
   type EntryMeta, type EvidenceClaims, type RetroEvidence, type RunInput, type RunRecord, type RunRef, type RunState, type RunStorage,
 } from '../shared/run.ts'
+import { requestFrom } from '../shared/run.ts'
 import { runStatus } from '../shared/status.ts'
 import type { SourceRef } from '../shared/intake.ts'
 import { atomicWrite, inside, readTextOrNull, withinRoot } from './files.ts'
@@ -336,7 +337,7 @@ export function summaryOf(ref: RunRef, reading: Pick<Reading, 'record' | 'proble
     title: runDisplayTitle(r, workflowName), workflowName,
     ...base, created: r.created, updated: r.updated, seq: r.seq, execution: r.execution.state, counts: r.execution.counts,
     waiting: r.execution.waiting.map(w => ({ node: w.node, holder: holderText(r, w.node) })), ready: r.execution.ready, failed: r.execution.failed,
-    input: r.input.kind, executor: r.executor.name, executorHost: hostOf(r.executor), pendingInstructions: Object.values(r.instructions ?? {}).filter(i => !i.ack).length,
+    input: requestFrom(r.input), executor: r.executor.name, executorHost: hostOf(r.executor), pendingInstructions: Object.values(r.instructions ?? {}).filter(i => !i.ack).length,
     decision: r.decisions.at(-1)?.decision,
     hold: r.control.hold ? { kind: r.control.hold.kind, by: r.control.hold.by } : undefined,
     status: runStatus(r, { names: nodeNames(reading.bundle, r), ...(job !== undefined ? { job: job && { state: job.state as 'queued' | 'claimed', reason: job.reason } } : {}) }),
@@ -505,8 +506,9 @@ export interface CreateRunOptions {
   workflow: string // id or file name in devdocs/workflows
   name?: string // run id; default the next run-NNN
   input:
-    | { kind: 'braindump'; text: string; author: string; recordedBy?: string; source?: SourceRef; attachments?: PinnedAttachment[] }
-    | { kind: 'request'; text: string; requester: string; entrustedBy: EntrustRef; onBehalfOf?: string; original?: string; source?: SourceRef; attachments?: PinnedAttachment[] }
+    // The run's request (user_catalog p3): a person's words, or what an agent wrote.
+    | { from: 'person'; text: string; author: string; recordedBy?: string; source?: SourceRef; attachments?: PinnedAttachment[] }
+    | { from: 'agent'; text: string; requester: string; entrustedBy: EntrustRef; onBehalfOf?: string; original?: string; source?: SourceRef; attachments?: PinnedAttachment[] }
   // The agent identity. With `host`, the run is performed as the
   // definition's execution.agent (or as the host itself when none is
   // declared) and the host is recorded beside it (p6).
@@ -644,20 +646,20 @@ async function writeRun(ws: Workspace, ref: RunRef, files: Record<string, string
 
 function inputOf(o: CreateRunOptions['input']): { input: RunInput; files: Record<string, string> } {
   // p19: a message of files alone is the person's words as they were.
-  if (!o.text.trim() && !o.attachments?.some(a => a.kind === 'file')) throw new RequestError(400, `the ${o.kind} text is empty`)
-  if (o.kind === 'braindump') {
-    if (!o.author?.trim()) throw new RequestError(400, 'a braindump needs its author: the person whose words it holds (--author)')
-    const input: RunInput = { kind: 'braindump', file: 'braindump.md', author: o.author.trim() }
+  if (!o.text.trim() && !o.attachments?.some(a => a.kind === 'file')) throw new RequestError(400, 'the request text is empty')
+  if (o.from === 'person') {
+    if (!o.author?.trim()) throw new RequestError(400, 'a person\'s request needs its author: the person whose words it holds (--author)')
+    const input: RunInput = { kind: 'request', from: 'person', file: 'request.md', author: o.author.trim() }
     if (o.recordedBy?.trim() && o.recordedBy.trim() !== input.author) input.recordedBy = o.recordedBy.trim()
     if (o.source) input.source = o.source
     input.sha256 = sha256(o.text) // what a request-sourced adjustment binds to (p7/ex1)
     withReferences(input, o.text)
-    const files: Record<string, string> = { 'braindump.md': o.text }
+    const files: Record<string, string> = { 'request.md': o.text }
     withAttachments(input, files, o.attachments)
     return { input, files }
   }
-  if (!o.requester?.trim()) throw new RequestError(400, 'a request needs its requester: the agent that wrote it (--requester)')
-  const input: RunInput = { kind: 'request', file: 'request.md', requester: o.requester.trim(), entrustedBy: validEntrust(o.entrustedBy), sha256: sha256(o.text) }
+  if (!o.requester?.trim()) throw new RequestError(400, 'an agent\'s request needs its requester: the agent that wrote it (--requester)')
+  const input: RunInput = { kind: 'request', from: 'agent', file: 'request.md', requester: o.requester.trim(), entrustedBy: validEntrust(o.entrustedBy), sha256: sha256(o.text) }
   if (o.onBehalfOf?.trim()) input.onBehalfOf = o.onBehalfOf.trim()
   if (o.source) input.source = o.source // where the request was said (shared/intake.ts SourceRef)
   const files: Record<string, string> = { 'request.md': o.text }

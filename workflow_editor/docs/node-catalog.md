@@ -13,7 +13,7 @@ Origin: the RTS `improve-game/run-004` trial (2026-10-12). The person asked
 for Web research before the implementation. The agent did one search,
 summarized it in `plan.md` without a study node and kept no sources, and the
 implementation report it pointed to did not contain the research. Asking for
-research once in a braindump did not tell the agent that this person expects
+research once in a request did not tell the agent that this person expects
 research to be a visible step.
 
 ## Where it lives

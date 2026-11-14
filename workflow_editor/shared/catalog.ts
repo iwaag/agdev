@@ -31,6 +31,13 @@ export const SUMMONPLAN_DIR = 'summonplans'
 export const CHALLENGES_DIR = 'challenges'
 export const INDEX_PATH = 'challenges.md'
 export const PUBLICATION_CONTRACT = 'publication/github.toml'
+// user_catalog p3: the owner's standing preferences, preferences/<name>.md: how
+// the owner wants work done, free Markdown, one file per subject, the Git
+// author is the writer. Every file is given to every run as a system-scope
+// context source (server/context.ts). A braindump says what is wanted and
+// why; facts about hosts are in neither.
+export const PREFERENCES_DIR = 'preferences'
+export const preferencePath = (name: string) => `${PREFERENCES_DIR}/${name}.md`
 // The layout before user_catalog p1; never read, only recognized (wfe catalog migrate).
 export const OLD_LAYOUT = { marker: 'mind.yaml', schema: 'ag.mind.v1', projects: 'catalog.yaml', projectsSchema: 'ag.catalog.v1' } as const
 export const OLD_LAYOUT_PROBLEM = 'an old layout (mind.yaml, catalog.yaml, braindumps/<slug>.md): run `wfe catalog migrate`'
@@ -47,6 +54,7 @@ export const isBraindumpId = (id: string): boolean => {
   const segs = id.split('/')
   return segs.length <= MAX_BRAINDUMP_DEPTH && segs.every(s => SEGMENT_PATTERN.test(s))
 }
+export const isPreferenceName = (name: string): boolean => SEGMENT_PATTERN.test(name) && !name.endsWith('.md')
 export const braindumpPath = (id: string) => `${EPISODES_DIR}/${id}/${BRAINDUMP_FILE}`
 export const reviewPath = (id: string) => `${EPISODES_DIR}/${id}/${REVIEW_FILE}`
 export const summonplanPath = (name: string) => `${SUMMONPLAN_DIR}/${name}.yaml`

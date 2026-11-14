@@ -92,7 +92,7 @@ is recorded):
 | `id`, `uid`, `node` | the delegation's identity and the delegate node it serves |
 | `target` | `{project, workflow, workspace, source?}` — the workspace resolved at dispatch; `source` (improve_wfrun p1): `{kind: published, repository, branch, commit, definitions}`, the target's published revision dispatched to |
 | `request` | `{path, sha256, bytes}` of `delegations/<d>/request.md` in the run folder: the parent agent's constructed request, exactly as delivered |
-| `original` | `{path, sha256, bytes}` of `delegations/<d>/original-input.md`: the human input the request was derived from (the parent's `braindump.md`, or the parent's own original), kept separately |
+| `original` | `{path, sha256, bytes}` of `delegations/<d>/original-input.md`: the human input the request was derived from (the parent's `request.md` when a person wrote it, or the parent's own original), kept separately |
 | `requester`, `onBehalfOf` | the parent's agent, and the person the parent run serves |
 | `accepts` | the node's `accepts`, frozen at dispatch |
 | `dispatched` | `{at, by, attempt, seq}` |

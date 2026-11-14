@@ -46,7 +46,7 @@ export interface BasicSettings {
 export function freeworkWorkflow(settings: Pick<BasicSettings, 'repositories' | 'execution'>, id = FREEWORK, name = 'Free work'): Workflow {
   const w = emptyWorkflow(id, name)
   w.intent = [
-    'Serve the person\'s request starting from their braindump and one conversation.',
+    'Serve the person\'s request starting from their words and one conversation.',
     'Present the actual run graph in workflow__talk, ask the requester for agreement,',
     'and do the work on its own nodes, added before execution,',
     'and talk with the person whenever that helps, until the request is served.',

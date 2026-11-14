@@ -235,7 +235,7 @@ edges:
   - {from: talk, to: workflow__talk}
 ```
 
-— with the braindump as its input. Its run grows its work in that
+— with the person's request as its input. Its run grows its work in that
 conversation through ordinary adjustments ([adjustments.md](adjustments.md),
 *Growing a run's work*); the final report marks the end and keeps the run
 from ending with the talk before any work is added. Nothing in the editor

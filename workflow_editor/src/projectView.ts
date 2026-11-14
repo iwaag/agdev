@@ -543,7 +543,7 @@ export function renderProjectView(root: HTMLElement, wsId: string, opts: { conte
 
   // A person's request to the executor (autolab). The receipt is kept until
   // the service confirms, so a retry after a lost response is not a second run.
-  const reqText = h('textarea', { rows: 4, 'aria-label': 'Request text', placeholder: 'Your words: what you want done. They are kept as the run\'s braindump.md.' })
+  const reqText = h('textarea', { rows: 4, 'aria-label': 'Request text', placeholder: 'Your words: what you want done. They are kept as the run\'s request.md.' })
   const reqWorkflow = h('select', { 'aria-label': 'Request workflow', onchange: () => renderRuns() })
   // A request runs the applied workflow; a draft is tried from the draft (Try draft).
   const reqAuthor = h('input', { 'aria-label': 'Request author', placeholder: 'your name' })
@@ -625,7 +625,7 @@ export function renderProjectView(root: HTMLElement, wsId: string, opts: { conte
           h('span.muted.small.d-only', r.ref),
           r.status && r.status.state !== 'done' ? h(`p.run-status.tone-${r.status.tone}`, { title: r.status.detail ?? r.status.text, dataset: { status: r.status.state } }, r.status.text) : null,
           h('span.muted.small.s-only', `updated ${ago(r.updated)}`),
-          h('span.muted.small.d-only', r.problem ? r.dir : `${r.input === 'request' ? 'request' : 'braindump'} · ${r.executor} · updated ${ago(r.updated)}`),
+          h('span.muted.small.d-only', r.problem ? r.dir : `request from ${r.input === 'agent' ? 'an agent' : 'a person'} · ${r.executor} · updated ${ago(r.updated)}`),
           h('div.chips.d-only',
             r.problem ? h('span.chip.error', `cannot be used — ${r.problem.code ?? r.problem.kind}: ${r.problem.message}`) : h(`span.state-chip.state-${state}`, STATE_LABEL[state] ?? state),
             ...Object.entries(r.counts ?? {}).filter(([, n]) => n).map(([k, n]) => h('span.chip', `${n} ${k}`)),

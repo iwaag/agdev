@@ -73,11 +73,14 @@ What you have:
   `devdocs/runs/<workflow-id>/<run-id>/` in the project. It holds the input,
   your `plan.md` and reports, `definition/` and `run.json`. The run contract
   is `{{RUN_CONTRACT}}`.
-- The person's own words are the run's `braindump.md`, kept as they gave
-  them, with them as author; saving them does not make you the author. A
-  request you write yourself — rewording their input, or delegating — is
-  `request.md`, recorded as yours, with what entrusted you.
-  `--braindump -` reads the words from standard input, so they need no
+- A run has one request, `request.md`; `run.json` says whether it is from a
+  person or an agent. The person's own words are kept as they gave them,
+  with them as author (`--request <file|-> --author <person>`); saving them
+  does not make you the author. A request you write yourself — rewording
+  their input, or delegating — is recorded as yours (`--requester`), with
+  what entrusted you (`--entrusted-by`). Runs made before this rename keep
+  their `braindump.md`.
+  `--request -` reads the words from standard input, so they need no
   temporary file. `--executor` is the name you go by with the person;
   `--backend` is what serves you (model, harness) when you know it.
   (p3/pre1 rehearsal: where to put the person's chat text and what to name

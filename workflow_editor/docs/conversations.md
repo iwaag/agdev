@@ -128,7 +128,7 @@ conductor issues (`wfe conversation invite`, `ask`), each awaited result.
 | `withdrawn` | not started, and withdrawn by hand or by closing |
 
 Its run gets `input.source = {kind: conversation, conversation, message,
-author, at, invitation: <request>}` and the words as its braindump, with the
+author, at, invitation: <request>}` and the words as its request (`request.md`), with the
 attached challenges' revisions (`input.attachments`). Every transition is a
 request event (archived).
 
