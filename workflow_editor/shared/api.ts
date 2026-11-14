@@ -4,7 +4,7 @@ import type { ApprovalState } from './canonical.ts'
 import type { ApprovalKind, Issue, Project, Workflow } from './model.ts'
 import type { RepositoryInfo } from './validate.ts'
 import type { ExecutionState, RunRecord } from './run.ts'
-import type { RunCatalog } from './catalog.ts'
+import type { RunCatalog } from './nodeCatalog.ts'
 
 export interface FileProblem {
   kind: 'malformed' | 'unsupported' | 'shape' | 'missing' | 'unreadable'
@@ -59,7 +59,7 @@ export interface RegisterResponse {
   diagnostics: Diagnostic[]
 }
 
-export type RepoCategory = 'root' | 'devdocs' | 'study' | 'wedo' | 'mind' | 'other'
+export type RepoCategory = 'root' | 'devdocs' | 'study' | 'wedo' | 'catalog' | 'other'
 
 export interface RepositoryStatus extends RepositoryInfo {
   name: string
@@ -255,7 +255,7 @@ export interface RepositoryUse { project: string; path: string; source: string; 
 
 export interface DashboardRepository {
   key: string
-  category: 'root' | 'devdocs' | 'study' | 'wedo' | 'mind' | 'other'
+  category: 'root' | 'devdocs' | 'study' | 'wedo' | 'catalog' | 'other'
   description: string
   registered: { owner: string; name: string }
   gitea: { state: 'ok' | 'renamed' | 'missing' | 'unknown'; fullName?: string; htmlUrl?: string; description?: string; empty?: boolean; error?: string; at: string }

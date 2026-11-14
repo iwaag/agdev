@@ -1,5 +1,5 @@
 // Project editor: metadata, sub-repositories, workspaces and workflows.
-import { whySection } from './mindView.ts'
+import { whySection } from './catalogView.ts'
 import type { DraftMeta, LocalEditsView } from '../shared/drafts.ts'
 import type { DashboardResponse, ProjectResponse, PublishedResponse, RepositoryStatus, RunSummary, WorkflowResponse, WorkspaceSummary } from '../shared/api.ts'
 import { PROJECT_SCHEMA, type Project } from '../shared/model.ts'
@@ -126,7 +126,7 @@ export function renderProjectView(root: HTMLElement, wsId: string, opts: { conte
   // What this project has learned (improve_workflow p2): derived, read-only.
   const knowledgeCard = h('section.card.knowledge-card')
   let knowledgeOf = ''
-  // Why this project exists (summoner p1): its grounds in the mind repository.
+  // Why this project exists (summoner p1): its grounds in the catalog.
   let whyCard: HTMLElement = h('span')
   let whyOf = ''
   const loadKnowledge = async (project: string) => {

@@ -73,7 +73,7 @@ export async function registerSharedRepository(ctx: AgdevContext, owner: string,
 export async function createSharedRepository(ctx: AgdevContext, name: string, category: RepoCategory, description: string, env: Record<string, string> = {}): Promise<AgdevResult> {
   const g = needGitea(ctx)
   if (category === 'root' || category === 'devdocs') throw new RequestError(400, `${category} repositories are created with their project`)
-  if (category === 'mind') throw new RequestError(400, 'the mind repository is created with wfe mind init')
+  if (category === 'catalog') throw new RequestError(400, 'the catalog is created with wfe catalog init')
   if (!/^[A-Za-z0-9][A-Za-z0-9_.-]{0,99}$/.test(name)) throw new RequestError(400, `"${name}" is not a repository name`)
   const steps: AgdevStep[] = []
   const existing = await wrapGitea(() => g.repo(g.owner, name))

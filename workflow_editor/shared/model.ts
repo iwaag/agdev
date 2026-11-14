@@ -95,7 +95,7 @@ export const APPEARANCE_ICONS = ['study', 'do', 'delegate', 'talk', 'present', '
 export const APPEARANCE_COLORS = ['blue', 'amber', 'violet', 'teal', 'green', 'rose', 'slate', 'orange'] as const
 export interface Appearance { icon: string; color: string } // '' = the type's default
 // Node presets moved into the person's node catalog in p7/ex1
-// (shared/catalog.ts SEEDS, docs/catalog.md).
+// (shared/nodeCatalog.ts SEEDS, docs/node-catalog.md).
 export type ApprovalKind = typeof APPROVAL_KINDS[number]
 
 // Stable identifiers: workflow IDs, node IDs and repository binding keys.
@@ -147,7 +147,7 @@ export interface Specializes { examples: string[]; revision: string }
 export const GROUP_KINDS = ['list'] as const
 export const GROUP_CARDINALITIES = ['variable'] as const
 export interface WorkflowGroup { name: string; kind: string; cardinality: string; description: string; members: string[]; appearance?: { color: string } }
-// Where a node came from (p7/ex1, docs/catalog.md): the template's id and
+// Where a node came from (p7/ex1, docs/node-catalog.md): the template's id and
 // revision, and its expectation at that revision.
 export interface TemplateRef { id: string; revision: number; expectation: string }
 export interface Edge { from: string; to: string }

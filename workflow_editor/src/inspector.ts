@@ -6,7 +6,7 @@
 // rebuilds (p8): a rebuild after a checkbox never folds what the person opened.
 import type { PeerProject, RepositoryStatus, WorkflowSummary } from '../shared/api.ts'
 import type { EffectiveGraph } from '../shared/compile.ts'
-import type { NodeTemplate } from '../shared/catalog.ts'
+import type { NodeTemplate } from '../shared/nodeCatalog.ts'
 import { GROUP_CARDINALITIES, GROUP_KINDS, ACCESS_LEVELS, APPEARANCE_COLORS, APPEARANCE_ICONS, ID_PATTERN, NODE_TYPES, normalizeRepoPath, SESSION_POLICIES, type Issue, type Workflow } from '../shared/model.ts'
 import { bindingCategory, iconOf, TYPE_LABEL, type Selection } from './canvas.ts'
 import { WORKFLOW_TALK, WORKFLOW_TALK_INSTRUCTIONS } from '../shared/workflowTalk.ts'

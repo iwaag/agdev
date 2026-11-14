@@ -8,7 +8,7 @@
 //   system    default   the common execution contract (the execution host's, by hash at claim)
 //                       or, for authoring, the authoring area's entry documents (a reference)
 //             local     the blocks of <area>/.local/contexts/system/
-//   project   default   project.yaml intent and goals; why the project is here (the mind's plan entry
+//   project   default   project.yaml intent and goals; why the project is here (the catalog's plan entry
 //                       and the braindumps behind it, summoner p5); project.yaml guides
 //             local     the blocks of …/projects/<project>/project/
 //   workflow  default   the workflow's intent; its execution.guides
@@ -125,26 +125,28 @@ export async function resolveContext(ctx: AccessContext, i: ResolveInput): Promi
   return bundle
 }
 
-// Why this project is here (summoner p5, docs/mind.md): its entry in the plan
-// the installation's mind names, and the braindumps that entry gives as its
-// grounds, in full. An installation without a mind repository, or a project
-// outside the plan, has nothing here (absent). A mind that cannot be read is
-// said so but never stops an attempt: the grounds are information.
+// Why this project is here (summoner p5, docs/mycatalog.md): its entry in the
+// plan the installation's catalog.json names, and the braindumps that entry
+// gives as its grounds, in full, each followed by its review when it has one
+// (user_catalog p1): what was already said to be real. An installation
+// without a catalog, or a project outside the plan, has nothing here
+// (absent). A catalog that cannot be read is said so but never stops an
+// attempt: the grounds are information.
 async function groundsSource(ctx: AccessContext, project: string, applies: ContextSource['applies']): Promise<ContextSource> {
-  const base = { key: 'project/grounds', scope: 'project' as const, category: 'default' as const, kind: 'grounds' as const, applies, provenance: ['the mind repository'] }
+  const base = { key: 'project/grounds', scope: 'project' as const, category: 'default' as const, kind: 'grounds' as const, applies, provenance: ['the catalog'] }
   try {
-    const m = await import('./mind.ts')
-    if (!await m.loadMindSetting(ctx.area)) return { ...base, title: 'why this project is here', origin: {}, delivery: 'absent', note: 'this installation has no mind repository' }
+    const m = await import('./catalog.ts')
+    if (!await m.loadCatalogSetting(ctx.area)) return { ...base, title: 'why this project is here', origin: {}, delivery: 'absent', note: 'this installation has no catalog' }
     const mctx = { area: ctx.area, registryFile: ctx.registryFile, gitea: ctx.gitea as unknown as import('./gitea.ts').Gitea, giteaProblem: ctx.giteaProblem }
-    const snap = await m.mindSnapshot(mctx, { maxAgeMs: 300_000, withText: true })
+    const snap = await m.catalogSnapshot(mctx, { maxAgeMs: 300_000, withText: true })
     const plan = snap.plans.find(p => p.name === snap.setting.plan)?.plan ?? null
     const e = plan?.entries.find(x => x.project === project) ?? null
     const repo = `${snap.setting.repository.owner}/${snap.setting.repository.name}`
     const origin = { project: repo, file: `summonplans/${snap.setting.plan}.yaml`, commit: snap.head }
-    if (!e) return { ...base, title: 'why this project is here', origin, delivery: 'absent', note: plan ? `plan ${snap.setting.plan} has no entry for ${project}` : `the mind names plan ${snap.setting.plan || '(none)'}, which cannot be read` }
+    if (!e) return { ...base, title: 'why this project is here', origin, delivery: 'absent', note: plan ? `plan ${snap.setting.plan} has no entry for ${project}` : `catalog.json names plan ${snap.setting.plan || '(none)'}, which cannot be read` }
     const roles = Object.entries(e.roles ?? {}).map(([r, v]) => (v === true ? r : `${r} (workflow ${v})`))
     const lines = [
-      `This installation has ${project} because its plan \`${snap.setting.plan}\` in the mind repository ${repo} names it${plan!.intent ? ` (plan intent: ${plan!.intent})` : ''}.`,
+      `This installation has ${project} because its plan \`${snap.setting.plan}\` in the catalog ${repo} names it${plan!.intent ? ` (plan intent: ${plan!.intent})` : ''}.`,
       '',
       `- State: ${e.state}${e.state === 'summoned' ? ` (obtained from ${e.source} at ${e.commit ?? '?'})` : ` (present before the plan described it; source ${e.source})`}`,
       `- Core roles it fills here: ${roles.length ? roles.join(', ') : 'none'}`,
@@ -153,13 +155,16 @@ async function groundsSource(ctx: AccessContext, project: string, applies: Conte
     ]
     for (const p of e.because) {
       const b = snap.braindumps.find(x => x.path === p)
-      lines.push('', `### ${p}${b?.updated ? ` (by ${b.updated.author}, ${b.updated.at.slice(0, 10)})` : ''}`, '', b ? (b.text ?? '').trim() : '(missing from the mind repository)')
+      lines.push('', `### ${p}${b?.updated ? ` (by ${b.updated.author}, ${b.updated.at.slice(0, 10)})` : ''}`, '', b ? (b.text ?? '').trim() : '(missing from the catalog)')
+      const r = b?.review
+      if (r) lines.push('', `#### Review of ${p}${r.updated ? ` (by ${r.updated.author}, ${r.updated.at.slice(0, 10)})` : ''}${b!.changedAfterReview ? '; the braindump changed after this review' : ''}`, '', r.text.trim())
     }
-    lines.push('', 'These are the person\'s reasons for having this project here; read them as purpose, not as a request to act on. `wfe mind why ' + project + '` shows the same.')
+    if (e.because.some(p => snap.braindumps.find(x => x.path === p)?.review)) lines.push('', 'A review is someone\'s reading of how far a braindump has become real, at its date; check it against the present state before relying on it.')
+    lines.push('', 'These are the person\'s reasons for having this project here; read them as purpose, not as a request to act on. `wfe catalog why ' + project + '` shows the same.')
     const text = lines.join('\n')
     return { ...base, title: `why ${project} is here`, origin, delivery: 'body', text, sha256: sha256(text) }
   } catch (err) {
-    return { ...base, title: 'why this project is here', origin: {}, delivery: 'absent', note: `the mind repository could not be read: ${(err as Error).message}` }
+    return { ...base, title: 'why this project is here', origin: {}, delivery: 'absent', note: `the catalog could not be read: ${(err as Error).message}` }
   }
 }
 

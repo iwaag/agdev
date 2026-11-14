@@ -521,7 +521,7 @@ changed.
   validation knows the registry's projects (`delegate-project-unknown`,
   `delegate-target-unknown`, `delegate-no-intake`, `delegate-recursive`).
   A delegation task can also be a node-catalog template of type `delegate`
-  with an optional `target` ([catalog.md](catalog.md)).
+  with an optional `target` ([node-catalog.md](node-catalog.md)).
 - **Run view**: the delegate node's card says where its child stands; the
   selected node and Detail's *Delegations* show each child, its links
   (run view, conversation, progress, detailed IO), the next move, what it

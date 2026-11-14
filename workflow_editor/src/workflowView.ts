@@ -14,7 +14,7 @@ import { approvalStates, canonicalJson, type ApprovalState } from '../shared/can
 import { compile, hasDocSteps } from '../shared/compile.ts'
 import { policySummary } from './docPolicy.ts'
 import { NODE_TYPES, cloneWorkflow, docSteps, type ApprovalKind, type Issue, type NodeType, type Workflow } from '../shared/model.ts'
-import { instantiate, type NodeTemplate } from '../shared/catalog.ts'
+import { instantiate, type NodeTemplate } from '../shared/nodeCatalog.ts'
 import { WORKFLOW_TALK, workflowTalkNode } from '../shared/workflowTalk.ts'
 import { hasErrors, validateWorkflow, type ValidationContext } from '../shared/validate.ts'
 import { api, ApiError } from './api.ts'
@@ -293,14 +293,14 @@ export function renderWorkflowView(root: HTMLElement, wsId: string, fileName: st
 
   const typeItems = NODE_TYPES.map(t => h(`button.add-node.type-${t}`, { role: 'menuitem', onclick: () => { closePalette(); addNode(t) }, 'aria-label': `Add ${TYPE_LABEL[t]} node` },
     icon(t, 'icon small'), h('span.item-main', h('strong', TYPE_LABEL[t]), h('span.item-hint', TYPE_HINT[t] ?? ''))))
-  // The person's templates (p7/ex1, docs/catalog.md): each adds an ordinary
+  // The person's templates (p7/ex1, docs/node-catalog.md): each adds an ordinary
   // node with the template's copy, appearance and provenance.
   const templateBar = h('div.palette-templates', { 'aria-label': 'Your node templates' })
   palette.append(h('div.palette-head', 'Basic types'), h('div.palette-group', ...typeItems), h('div.palette-head', 'Your templates'), templateBar)
   let templates: NodeTemplate[] = []
   async function loadTemplates() {
     try {
-      const c = await api.catalog()
+      const c = await api.nodeCatalog()
       if (c.state !== 'ok') { templates = []; templateBar.replaceChildren(h('p.chip.error', { title: c.problem }, 'Your node catalog is unavailable'), h('a.small.palette-link', { href: '#/nodes' }, 'Open User nodes')); return }
       templates = c.catalog.templates
       templateBar.replaceChildren(

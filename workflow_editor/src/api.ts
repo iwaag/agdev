@@ -7,7 +7,7 @@ import type { ApplyResult, CompareResponse, DraftMeta, DraftResponse, LocalEdits
 import type { RoundView } from '../shared/humanReview.ts'
 import type { BudgetBoard, Period, SourceState, UsageResponse } from '../shared/usage.ts'
 import type { ApprovalKind, Documentation, Project, Workflow } from '../shared/model.ts'
-import type { Catalog, NodeTemplate, TemplateContent } from '../shared/catalog.ts'
+import type { Catalog, NodeTemplate, TemplateContent } from '../shared/nodeCatalog.ts'
 import type { ContextBundle, ContextChange, AttemptContext, BlockKind, BlockRevision, BlockState, EvidenceRef, ScopeTarget } from '../shared/context.ts'
 
 // What a project's knowledge areas hold (improve_workflow p2, docs/knowledge.md).
@@ -72,8 +72,8 @@ export interface AdjustView {
   notes?: string[] // p8/ex2: an added node nothing leads to, an unknown node field
 }
 
-// The person's node catalog (p7/ex1, server/catalog.ts readCatalog).
-export type CatalogView = ({ state: 'ok'; file: string; catalog: Catalog; initializedNow?: boolean } | { state: 'unavailable'; file: string; problem: string }) & { examples: (TemplateContent & { id: string })[] }
+// The person's node catalog (p7/ex1, server/nodeCatalog.ts readCatalog).
+export type NodeCatalogView = ({ state: 'ok'; file: string; catalog: Catalog; initializedNow?: boolean } | { state: 'unavailable'; file: string; problem: string }) & { examples: (TemplateContent & { id: string })[] }
 type TemplateBody = TemplateContent & { by: string }
 
 export class ApiError extends Error {
@@ -105,25 +105,28 @@ const ws = (id: string) => `api/workspaces/${encodeURIComponent(id)}`
 const wf = (id: string, file: string) => `${ws(id)}/workflows/${encodeURIComponent(file)}`
 const drafts = (id: string) => `${ws(id)}/drafts`
 
-// The mind repository (summoner p1, docs/mind.md): types of server/mind.ts.
-export type MindViewResponse = Awaited<ReturnType<typeof import('../server/mind.ts').mindView>>
+// The user's catalog (user_catalog p1, docs/mycatalog.md): types of server/catalog.ts.
+export type CatalogViewResponse = Awaited<ReturnType<typeof import('../server/catalog.ts').catalogView>>
 export type SummonStatusResponse = Awaited<ReturnType<typeof import('../server/summon.ts').status>>
 export type SummonStyle = Awaited<ReturnType<typeof import('../server/summon.ts').styleRequest>>
-export type MindView = import('../server/mind.ts').MindView
-export type MindWhy = Awaited<ReturnType<typeof import('../server/mind.ts').why>>
-export type MindBraindump = Awaited<ReturnType<typeof import('../server/mind.ts').braindump>>
-type MindChange = { ok: boolean; message: string; commit: string; changed: boolean }
+export type CatalogView = import('../server/catalog.ts').CatalogView
+export type CatalogWhy = Awaited<ReturnType<typeof import('../server/catalog.ts').why>>
+export type CatalogBraindump = Awaited<ReturnType<typeof import('../server/catalog.ts').braindump>>
+type CatalogChange = { ok: boolean; message: string; commit: string; changed: boolean }
+// A braindump's identity is a folder path: each segment is encoded, the slashes are kept.
+const bd = (id: string) => id.split('/').map(encodeURIComponent).join('/')
 
 export const api = {
-  mind: (refresh = false) => call<MindViewResponse>('GET', `api/mind${refresh ? '?refresh=1' : ''}`),
+  catalog: (refresh = false) => call<CatalogViewResponse>('GET', `api/catalog${refresh ? '?refresh=1' : ''}`),
   summon: () => call<SummonStatusResponse>('GET', 'api/summon'),
   // summoner p5 ex1: a GitHub user's development style, from <user>/mycatalog.
   summonStyle: (user: string, author: string, dryRun = false) => call<SummonStyle & { href?: string }>('POST', 'api/summon/style', { user, author, dryRun }),
-  mindWhy: (project: string) => call<MindWhy>('GET', `api/mind/why/${encodeURIComponent(project)}`),
-  mindBraindump: (slug: string) => call<MindBraindump>('GET', `api/mind/braindumps/${encodeURIComponent(slug)}`),
-  mindAdd: (slug: string, text: string, author: string) => call<MindChange>('POST', 'api/mind/braindumps', { slug, text, author }),
-  mindEdit: (slug: string, text: string, author: string, base?: string) => call<MindChange>('PUT', `api/mind/braindumps/${encodeURIComponent(slug)}`, { text, author, base }),
-  mindRemove: (slug: string, author: string, force = false) => call<MindChange>('DELETE', `api/mind/braindumps/${encodeURIComponent(slug)}`, { author, force }),
+  catalogWhy: (project: string) => call<CatalogWhy>('GET', `api/catalog/why/${encodeURIComponent(project)}`),
+  catalogBraindump: (id: string) => call<CatalogBraindump>('GET', `api/catalog/braindumps/${bd(id)}`),
+  catalogAdd: (id: string, text: string, author: string) => call<CatalogChange>('POST', 'api/catalog/braindumps', { id, text, author }),
+  catalogEdit: (id: string, text: string, author: string, base?: string) => call<CatalogChange>('PUT', `api/catalog/braindumps/${bd(id)}`, { text, author, base }),
+  catalogRemove: (id: string, author: string, force = false) => call<CatalogChange>('DELETE', `api/catalog/braindumps/${bd(id)}`, { author, force }),
+  catalogReviewPut: (id: string, text: string, author: string, base?: string) => call<CatalogChange>('PUT', `api/catalog/reviews/${bd(id)}`, { text, author, base }),
   workspaces: () => call<WorkspacesResponse>('GET', 'api/workspaces'),
   // What a shared:// reference is on this host (p12, server/boast.ts resolveShared).
   shareRef: (ref: string) => call<{ ref: string; state: string; detail: string; url: string | null; download: string | null; host: string; path: string | null; folder: boolean }>('GET', `api/share-ref?ref=${encodeURIComponent(ref)}`),
@@ -205,7 +208,7 @@ export const api = {
   syncWorkspace: (id: string, dryRun = false) => call<SyncResultView>('POST', `${ws(id)}/sync`, { dryRun }, [409]),
   requestRun: (id: string, input: { workflow: string; text: string; author: string; receipt: string }) =>
     call<{ ok: true; duplicate: boolean; ref: { workflow: string; run: string }; job: { id: number; state: string } }>('POST', `${ws(id)}/runs`, input),
-  catalog: () => call<CatalogView>('GET', 'api/nodes'),
+  nodeCatalog: () => call<NodeCatalogView>('GET', 'api/nodes'),
   createTemplate: (body: TemplateBody & { id: string }) => call<{ template: NodeTemplate }>('POST', 'api/nodes', body),
   updateTemplate: (id: string, body: TemplateBody & { expectRevision: number }) => call<{ template: NodeTemplate; changed: boolean }>('PUT', `api/nodes/${encodeURIComponent(id)}`, body),
   deleteTemplate: (id: string, revision: number, by: string) => call<{ ok: true }>('DELETE', `api/nodes/${encodeURIComponent(id)}?revision=${revision}&by=${encodeURIComponent(by)}`),

@@ -1,6 +1,6 @@
 # Summoning: a plan's projects arrive in an installation (summoner p2)
 
-A summonplan (`ag.summonplan.v1`, [mind.md](mind.md)) says which projects an
+A summonplan (`ag.summonplan.v1`, [mycatalog.md](mycatalog.md)) says which projects an
 installation has, from which Git URL, at which commit, and which roles of the
 core each fills. `wfe summon apply` makes the installation match it: it
 acquires what is missing into the local Gitea, registers it, obtains a
@@ -73,7 +73,7 @@ writes it from the plan (adopted and summoned entries alike):
 ```json
 {
   "schema": "ag.roles.v1",
-  "plan": "my-plan", "mind": "<mind head the plan was read at>", "applied": "<time>",
+  "plan": "my-plan", "catalog": "<catalog head the plan was read at>", "applied": "<time>",
   "roles": {
     "recovery":     { "project": "warden", "workspace": "warden", "workflow": "recover" },
     "coordination": { "project": "warden", "workspace": "warden", "workflow": "coordinate" },
@@ -150,7 +150,7 @@ The core assumes roles are filled. When one is not:
 
 ## The journal
 
-`<area>/.local/summon/journal.json` holds one apply: the plan, the mind commit
+`<area>/.local/summon/journal.json` holds one apply: the plan, the catalog commit
 it was read at, its start, and for each entry the outcome so far (`done`,
 `nothing`, `refused`, `failed`) with its steps. An entry an interrupted apply
 finished stays `done` when the continuation finds nothing left. The journal is written after every
@@ -173,7 +173,7 @@ into the mirror for that, never the source) and gives one indicator:
 | `absent` | not on this Gitea, not registered, or no workspace |
 | `unwired` | the roles in effect (`roles.json`) are not the planned ones |
 
-Without a mind repository or a plan, status lists every role as not filled.
+Without a catalog or a plan, status lists every role as not filled.
 An installation's own runs make its entries `ahead` quickly. A plan revision can
 then only fast-forward to a commit that contains that local work; otherwise
 apply refuses and someone merges first (summoner p2, step 7).
@@ -181,19 +181,19 @@ apply refuses and someone merges first (summoner p2, step 7).
 ## Bootstrap
 
 `agdevctl bootstrap-projects --plan <file> [--dry-run]` is how a new
-installation receives its projects: `wfe mind init` when there is no mind
-repository, `wfe mind plan put` and `plan use` for the file, the dry run, then
+installation receives its projects: `wfe catalog init` when there is no
+catalog, `wfe catalog plan put` and `plan use` for the file, the dry run, then
 `wfe summon apply --yes`, and the observer's settings rendered from
-`roles.json` (the observer follows the file itself). Without `--plan` it applies the plan the mind
-repository names, and continues an interrupted apply ([install.md](../../docs/install.md)).
+`roles.json` (the observer follows the file itself). Without `--plan` it applies the plan `catalog.json`
+names, and continues an interrupted apply ([install.md](../../docs/install.md)).
 
-When the mind names no plan yet, `bootstrap-projects` without `--plan` uses the
+When `catalog.json` names no plan yet, `bootstrap-projects` without `--plan` uses the
 core's one reference, `install/bootstrap/summonplan.yaml`: one `summoned` entry,
 the **summoner** (`https://github.com/iwaag/pj-summoner`), at an exact commit,
 with no roles and no grounds. It is written as the plan named after the
 installation's slug. The summoner's `propose` workflow then turns the person's
-braindumps into the rest of the plan: it reads catalogs (`<user>/mycatalog`),
-proposes, asks, and only after agreement calls `wfe mind plan put` and
+braindumps into the rest of the plan: it reads catalogs (`<user>/mycatalog`, `projects.yaml`),
+proposes, asks, and only after agreement calls `wfe catalog plan put` and
 `wfe summon apply`. That is the only project the core names. Moving the
 reference to a newer summoner is a change of that file's `commit`, published
 with the core.
@@ -202,12 +202,12 @@ with the core.
 
 | CLI | API | |
 | --- | --- | --- |
-| `wfe summon apply [<plan>] [--dry-run] [--yes]` | `POST api/summon/apply {plan?, dryRun?}` | default plan: `mind.json` `plan`. The CLI always shows the dry run first; without `--yes` it asks, and without a terminal it does not apply. |
+| `wfe summon apply [<plan>] [--dry-run] [--yes]` | `POST api/summon/apply {plan?, dryRun?}` | default plan: `catalog.json` `plan`. The CLI always shows the dry run first; without `--yes` it asks, and without a terminal it does not apply. |
 | `wfe summon status [<plan>]` | `GET api/summon` | as above |
 | `wfe summon acquire <source> <commit> [--name] [--project --register] [--dry-run]` | | one repository and its submodules, without a plan |
-| `wfe summon style <github user> --author <who> [--dry-run]` | `POST api/summon/style {user, author, dryRun?}` | reads `github.com/<user>/mycatalog` and requests `summoner/propose` with it ([mind.md](mind.md#importing-a-development-style)) |
+| `wfe summon style <github user> --author <who> [--dry-run]` | `POST api/summon/style {user, author, dryRun?}` | reads `projects.yaml` of `github.com/<user>/mycatalog` and requests `summoner/propose` with it ([mycatalog.md](mycatalog.md#importing-a-development-style)) |
 
-The Mind page shows the indicator as a chip in the Entry column of "Projects and
+The Catalog page shows the indicator as a chip in the Entry column of "Projects and
 why they are here", with the detail, upstream and roles in its tooltip.
 `/hangout/` answers 503 naming the conversation-page role while nothing is
 deployed.

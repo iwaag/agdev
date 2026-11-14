@@ -1,12 +1,12 @@
-// User nodes (p7/ex1, docs/catalog.md): the person's node catalog — the
+// User nodes (p7/ex1, docs/node-catalog.md): the person's node catalog — the
 // activities they recognize as distinct workflow steps, each a reusable
 // template over an existing node type. A list of card previews, an editor
 // for one template at a time, and the examples on offer. The service's
 // catalog operations do the validation and the stale-edit check; a catalog
 // that cannot be read is shown as such and nothing is written over it.
-import { contentProblems, TEMPLATE_TYPES, type NodeTemplate, type TemplateContent } from '../shared/catalog.ts'
+import { contentProblems, TEMPLATE_TYPES, type NodeTemplate, type TemplateContent } from '../shared/nodeCatalog.ts'
 import { APPEARANCE_COLORS, APPEARANCE_ICONS, ID_PATTERN } from '../shared/model.ts'
-import { api, type CatalogView } from './api.ts'
+import { api, type NodeCatalogView } from './api.ts'
 import { colorOf, iconOf, TYPE_LABEL } from './canvas.ts'
 import { categoryLabel, KNOWLEDGE_CATEGORIES, withCategory, withoutCategory } from '../shared/knowledge.ts'
 import { append, h, when } from './dom.ts'
@@ -32,7 +32,7 @@ export function templateCard(t: Pick<TemplateContent, 'type' | 'name' | 'descrip
 interface Draft { id: string; content: TemplateContent; revision: number | null } // revision null: a new template
 
 export function renderNodesView(root: HTMLElement): ViewHandle {
-  let view: CatalogView | null = null
+  let view: NodeCatalogView | null = null
   let loadError = ''
   let draft: Draft | null = null
   let saved = '' // canonical text of the draft as last loaded or saved
@@ -51,7 +51,7 @@ export function renderNodesView(root: HTMLElement): ViewHandle {
   const templates = () => (view?.state === 'ok' ? view.catalog.templates : [])
 
   async function load(keep?: string) {
-    try { view = await api.catalog(); loadError = '' } catch (e) { loadError = (e as Error).message }
+    try { view = await api.nodeCatalog(); loadError = '' } catch (e) { loadError = (e as Error).message }
     if (keep !== undefined) {
       const t = templates().find(x => x.id === keep)
       draft = t ? { id: t.id, content: contentFrom(t), revision: t.revision } : null

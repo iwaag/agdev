@@ -1,5 +1,5 @@
 # The core's one reference to a project (workflow_editor/docs/summon.md, "Bootstrap").
-# `agdevctl bootstrap-projects` without --plan, on an installation whose mind names no plan yet,
+# `agdevctl bootstrap-projects` without --plan, on an installation whose catalog.json names no plan yet,
 # writes this plan under the installation's slug and applies it: the summoner arrives, by URL and
 # exact commit, and fills no role. Everything else an installation has comes from a person's
 # braindump through `summoner/propose`. Moving to a newer summoner is a change of `commit` here.
@@ -9,7 +9,7 @@ intent: "The summoner first: it proposes this installation's other projects from
 entries:
   - project: summoner
     source: https://github.com/iwaag/pj-summoner.git
-    commit: 538abeeb103c9555ad38343951b37440d135aa00
+    commit: 9699cbd23cfac9c72c24c88d064311b1158f0817
     because: []
     state: summoned
     note: "The core's reference (install/bootstrap/summonplan.yaml)."

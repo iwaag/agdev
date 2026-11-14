@@ -129,13 +129,15 @@ for talking with the project agents; workflow_editor p15).
   read failure is shown as such, never as an empty list. The Project Editor's
   "Add existing repository" searches the registry and adds one as a submodule
   of that project only; other projects keep their gitlinks.
-- **Mind (summoner p1).** `<owner>/mycatalog` on Gitea (`<area>/mind.json`,
-  registry category `mind`) holds the user's braindumps (`braindumps/<slug>.md`):
-  the grounds of this installation's projects. Summonplans
+- **Catalog (user_catalog p1).** `<owner>/mycatalog` on Gitea (`<area>/catalog.json`,
+  registry category `catalog`) is the user's catalog. It holds braindumps
+  (`braindumps/episodes/<path>/braindump.md`, free text: the grounds of this
+  installation's projects), a free-text `review.md` beside each, and
+  `projects.yaml` (the projects the user shares). Summonplans
   (`summonplans/<name>.yaml`, `ag.summonplan.v1`) say which projects make them
-  concrete, from which Git URL at which commit, filling which roles. `wfe mind`,
-  `api/mind`, the **Mind** page (`#/mind`) and each project's "Why this project
-  exists". [docs/mind.md](docs/mind.md).
+  concrete, from which Git URL at which commit, filling which roles. `wfe catalog`,
+  `api/catalog`, the **Catalog** page (`#/catalog`) and each project's "Why this project
+  exists". [docs/mycatalog.md](docs/mycatalog.md).
 
 ### Execution by autolab
 

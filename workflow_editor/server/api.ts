@@ -756,32 +756,40 @@ export function createHandler(config: ServiceConfig) {
         throw new RequestError(404, 'not found')
       }
 
-      // ---- the mind repository (summoner p1, docs/mind.md): braindumps as grounds ----
-      if (a === 'mind') {
-        const m = await import('./mind.ts')
+      // ---- the catalog (user_catalog p1, docs/mycatalog.md): braindumps, reviews, grounds ----
+      if (a === 'catalog') {
+        const m = await import('./catalog.ts')
         const ctx = { registryFile: config.registryFile, area, gitea: config.gitea, giteaProblem: config.giteaProblem }
         const fresh = url.searchParams.get('refresh') === '1' ? 0 : undefined
-        if (!wsId && method === 'GET') return send(res, 200, await m.mindView(ctx, { maxAgeMs: fresh }))
+        const text = (v: unknown) => typeof v === 'string' ? v : undefined
+        // A braindump's identity is its folder path: the rest of the URL.
+        const id = parts.slice(3).join('/')
+        if (!wsId && method === 'GET') return send(res, 200, await m.catalogView(ctx, { maxAgeMs: fresh }))
         if (wsId === 'braindumps') {
-          if (!b && method === 'POST') {
+          if (!id && method === 'POST') {
             const input = await body(req) as Record<string, unknown>
-            return send(res, 200, await m.changeBraindump(ctx, { op: 'add', slug: str(input.slug, 'slug'), text: str(input.text, 'text'), author: str(input.author, 'author'), message: typeof input.message === 'string' ? input.message : undefined }))
+            return send(res, 200, await m.changeBraindump(ctx, { op: 'add', id: str(input.id, 'id'), text: str(input.text, 'text'), author: str(input.author, 'author'), message: text(input.message) }))
           }
-          if (b && !file && method === 'GET') return send(res, 200, await m.braindump(ctx, b))
-          if (b && !file && method === 'PUT') {
+          if (id && method === 'GET') return send(res, 200, await m.braindump(ctx, id))
+          if (id && method === 'PUT') {
             const input = await body(req) as Record<string, unknown>
-            return send(res, 200, await m.changeBraindump(ctx, { op: 'edit', slug: b, text: str(input.text, 'text'), author: str(input.author, 'author'), base: typeof input.base === 'string' ? input.base : undefined, message: typeof input.message === 'string' ? input.message : undefined }))
+            return send(res, 200, await m.changeBraindump(ctx, { op: 'edit', id, text: str(input.text, 'text'), author: str(input.author, 'author'), base: text(input.base), message: text(input.message) }))
           }
-          if (b && !file && method === 'DELETE') {
+          if (id && method === 'DELETE') {
             const input = await body(req) as Record<string, unknown>
-            return send(res, 200, await m.changeBraindump(ctx, { op: 'remove', slug: b, author: str(input.author, 'author'), force: input.force === true }))
+            return send(res, 200, await m.changeBraindump(ctx, { op: 'remove', id, author: str(input.author, 'author'), force: input.force === true }))
           }
+        }
+        if (wsId === 'reviews' && id && method === 'GET') return send(res, 200, await m.review(ctx, id))
+        if (wsId === 'reviews' && id && method === 'PUT') {
+          const input = await body(req) as Record<string, unknown>
+          return send(res, 200, await m.putReview(ctx, { id, text: str(input.text, 'text'), author: str(input.author, 'author'), base: text(input.base), message: text(input.message) }))
         }
         if (wsId === 'why' && b && !file && method === 'GET') return send(res, 200, await m.why(ctx, b))
         if (wsId === 'plans' && b && !file && method === 'GET') return send(res, 200, await m.plan(ctx, b))
         if (wsId === 'plans' && !b && method === 'PUT') {
           const input = await body(req) as Record<string, unknown>
-          return send(res, 200, await m.putPlan(ctx, { text: str(input.text, 'text'), author: str(input.author, 'author'), message: typeof input.message === 'string' ? input.message : undefined }))
+          return send(res, 200, await m.putPlan(ctx, { text: str(input.text, 'text'), author: str(input.author, 'author'), message: text(input.message) }))
         }
         throw new RequestError(404, `no route for ${method} ${url.pathname}`)
       }
@@ -890,10 +898,10 @@ export function createHandler(config: ServiceConfig) {
         throw new RequestError(404, `no route for ${method} ${url.pathname}`)
       }
 
-      // ---- the person's node catalog (p7/ex1, docs/catalog.md) ----
+      // ---- the person's node catalog (p7/ex1, docs/node-catalog.md) ----
       if (a === 'nodes') {
-        const { addExample, createTemplate, deleteTemplate, readCatalog, updateTemplate } = await import('./catalog.ts')
-        const { EXAMPLES } = await import('../shared/catalog.ts')
+        const { addExample, createTemplate, deleteTemplate, readCatalog, updateTemplate } = await import('./nodeCatalog.ts')
+        const { EXAMPLES } = await import('../shared/nodeCatalog.ts')
         const content = (input: Record<string, unknown>) => ({
           name: typeof input.name === 'string' ? input.name : '', type: typeof input.type === 'string' ? input.type : '',
           description: typeof input.description === 'string' ? input.description : '', expectation: typeof input.expectation === 'string' ? input.expectation : '',
@@ -1303,7 +1311,7 @@ export function createHandler(config: ServiceConfig) {
       if (b === 'workflows' && file && action === 'instantiate' && method === 'POST') {
         const input = await body(req) as Record<string, unknown>
         const list = (v: unknown, what: string) => { if (v === undefined) return undefined; if (!texts(v)) throw new RequestError(400, `${what} must be a list of text`); return v as string[] }
-        const { instantiateIntoWorkflow } = await import('./catalog.ts')
+        const { instantiateIntoWorkflow } = await import('./nodeCatalog.ts')
         const r = await instantiateIntoWorkflow(area, ws, file, str(input.template, 'template'), { id: typeof input.id === 'string' && input.id.trim() ? input.id.trim() : undefined, repositories: list(input.repositories, 'repositories'), after: list(input.after, 'after'), before: list(input.before, 'before') })
         config.watcher?.noteOwnWrite(ws, `devdocs/workflows/${file}`, r.rev)
         return send(res, 200, { ok: true, ...r })

@@ -9,7 +9,7 @@
 // and #/cluster (the management relationships this installation knows, improve_multinodes p4)
 // and #/usage (subscription windows and what executions used, retire_old_ui p1)
 // and #/ws/<workspace>/review/<workflow>/<run>/<rv> (a human review round, p17)
-// and #/mind (braindumps and the projects they ground, summoner p1).
+// and #/catalog (the user's catalog: braindumps, reviews and the projects they ground, user_catalog p1).
 // A trailing /context on Home (#/home/context), a project or a workflow opens
 // that editor's Context section (p13 ex1).
 import './styles.css'
@@ -23,7 +23,7 @@ import { renderWorkflowView } from './workflowView.ts'
 import { renderContextChooser, renderContextView } from './contextView.ts'
 import { renderUsageView } from './usageView.ts'
 import { renderClusterView } from './clusterView.ts'
-import { renderMindView } from './mindView.ts'
+import { renderCatalogView } from './catalogView.ts'
 import { closeReader } from './contextParts.ts'
 import { loadSite, setWebOrigin } from './site.ts'
 
@@ -62,7 +62,10 @@ function route() {
   } else if (parts[0] === 'cluster') {
     current = renderClusterView(app)
   } else if (parts[0] === 'mind') {
-    current = renderMindView(app)
+    location.replace('#/catalog') // the page's name before user_catalog p1
+    return
+  } else if (parts[0] === 'catalog') {
+    current = renderCatalogView(app)
   } else if (parts[0] === 'usage') {
     current = renderUsageView(app)
   } else if (parts[0] === 'nodes') {

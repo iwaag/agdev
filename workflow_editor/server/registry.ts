@@ -27,9 +27,10 @@ import { Workspace } from './workspace.ts'
 // formerly (rename/warden): the names this workspace and its project had. It resolves what
 // existing records stored; routing, publication and new requests never consult it.
 export interface Registration { id: string; label: string; host: string; path: string; project?: string; formerly?: string[] }
-// mind (summoner p1, docs/mind.md): the user's mind repository; recorded by `wfe mind init`.
-export type RepoCategory = 'root' | 'devdocs' | 'study' | 'wedo' | 'mind' | 'other'
-export const REPO_CATEGORIES: RepoCategory[] = ['root', 'devdocs', 'study', 'wedo', 'mind', 'other']
+// catalog (user_catalog p1, docs/mycatalog.md): the user's catalog; recorded by `wfe catalog init`.
+// A registry written before that names the category "mind"; it is read as "catalog".
+export type RepoCategory = 'root' | 'devdocs' | 'study' | 'wedo' | 'catalog' | 'other'
+export const REPO_CATEGORIES: RepoCategory[] = ['root', 'devdocs', 'study', 'wedo', 'catalog', 'other']
 // A Gitea repository, identified by its Gitea id; owner/name are as registered.
 // upstream (summoner p2, docs/summon.md): where an acquired repository came from and at which commit.
 export interface Upstream { url: string; commit: string; at?: string }
@@ -80,6 +81,7 @@ export async function loadRegistry(file: string): Promise<Registry> {
   for (const k of ['projects', 'repositories']) if (raw[k] !== undefined && !Array.isArray(raw[k])) throw new RegistryError(`registry ${file}: "${k}" must be a list. Fix the file; nothing was changed.`)
   const repositories = ((raw.repositories ?? []) as unknown[]).map((r, i): RepoEntry => {
     const g = isObj(r) && isObj(r.gitea) ? r.gitea : null
+    if (isObj(r) && r.category === 'mind') r.category = 'catalog'
     if (!isObj(r) || !g || typeof g.id !== 'number' || typeof g.owner !== 'string' || typeof g.name !== 'string' || !REPO_CATEGORIES.includes(r.category as RepoCategory)) {
       throw new RegistryError(`registry ${file}: repositories[${i}] needs gitea {id, owner, name} and a category (${REPO_CATEGORIES.join(', ')}). Fix the file; nothing was changed.`)
     }

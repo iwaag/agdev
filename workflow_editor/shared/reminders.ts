@@ -12,7 +12,7 @@
 // experiment as nodes and completed with no presentation; run-011 presented
 // it only because a separate request asked (fix4's report). run-001…008 did
 // their work inside the talk.
-import type { RunCatalog } from './catalog.ts'
+import type { RunCatalog } from './nodeCatalog.ts'
 import { isTalkType, type Workflow, type WorkflowNode } from './model.ts'
 import { endsWork, isOpen, questionState, runFolder, runKey, type Presentation, type RunGraph, type RunRecord } from './run.ts'
 import { roundsUsing } from './humanReview.ts'

@@ -355,7 +355,7 @@ nodes:
 ### Template provenance (p7/ex1)
 
 A node made from a template of the person's node catalog
-([catalog.md](catalog.md)) records where it came from:
+([node-catalog.md](node-catalog.md)) records where it came from:
 
 ```yaml
 nodes:
@@ -541,7 +541,7 @@ establishes nothing. A run's records say whether each expectation was met
 endpoints stay environment facts, resolved through scoped context and configuration.
 A key provisions nothing: `native` starts no process and `s3` creates no bucket.
 
-The catalog's singular `expectation` text ([catalog.md](catalog.md)) is a different
+The catalog's singular `expectation` text ([node-catalog.md](node-catalog.md)) is a different
 thing: it tells the designer of a workflow how the person expects an activity to
 appear.
 

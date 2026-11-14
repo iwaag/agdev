@@ -21,7 +21,7 @@ import type { SourceRef } from '../shared/intake.ts'
 import { atomicWrite, inside, readTextOrNull, withinRoot } from './files.ts'
 import { MANIFEST_KIND } from '../shared/review.ts'
 import { refsIn } from '../shared/shares.ts'
-import { parseSnapshot, type CatalogContext, type CatalogSnapshot, type RunCatalog } from '../shared/catalog.ts'
+import { parseSnapshot, type CatalogContext, type CatalogSnapshot, type RunCatalog } from '../shared/nodeCatalog.ts'
 import { withLock } from './lock.ts'
 import { blobSizeAt, listAt, resolveRev, RevError, showAt, type DevdocsInfo, type DevdocsRev } from './devdocs.ts'
 import { RequestError, WORKFLOWS_DIR, type Workspace } from './workspace.ts'
@@ -30,13 +30,13 @@ import { linkRecord } from './runrecord.ts'
 import type { AccessContext } from './access.ts'
 import { parseWorkflow, renderWorkflow } from './yamlDoc.ts'
 import { git } from './git.ts'
-import { CatalogError, instantiate } from '../shared/catalog.ts'
+import { CatalogError, instantiate } from '../shared/nodeCatalog.ts'
 import { adviseOrRefuse, type Advice } from './reminders.ts'
 import type { Boundary } from '../shared/reminders.ts'
 
 export const RUN_FILE = 'run.json'
 export const DEFINITION_DIR = 'definition'
-// The person's node catalog as a run was given it (p7/ex1, docs/catalog.md).
+// The person's node catalog as a run was given it (p7/ex1, docs/node-catalog.md).
 export const CATALOG_SNAPSHOT = 'context/node-catalog.json'
 const MAX_RUNS = 500
 const MAX_FILES = 200
@@ -808,7 +808,7 @@ async function createRunUnlocked(ws: Workspace, o: CreateRunOptions): Promise<Cr
   definition.source = o.definitionSource ?? await workspaceSource(ws, 'created in the workspace (wfe run create)')
   const context: { repositories: RepoContext[]; catalog?: CatalogContext } = await repoContext(dest, src.files)
   if (o.area) {
-    const { snapshotForRun } = await import('./catalog.ts')
+    const { snapshotForRun } = await import('./nodeCatalog.ts')
     const snap = await snapshotForRun(o.area)
     if (snap.state === 'supplied') {
       files[CATALOG_SNAPSHOT] = snap.text

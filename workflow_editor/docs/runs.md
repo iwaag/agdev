@@ -41,7 +41,7 @@ devdocs/runs/<workflow-id>/<run-id>/
   report.md             the final report (default policy)
   run.json              the record: current state and its history
   context/
-    node-catalog.json   the person's node catalog as the run was given it (p7/ex1, catalog.md)
+    node-catalog.json   the person's node catalog as the run was given it (p7/ex1, node-catalog.md)
   definition/
     <workflow-id>.yaml  the run's workflow, copied byte for byte
   …                     anything else the executor writes (manual policy: names are its choice)
@@ -201,7 +201,7 @@ snapshot. Reading checks the file by hash, like the bundle. Each attempt is
 given this snapshot in its brief and records it in `attempt.begin`'s
 `settings.catalog`; a later catalog edit reaches new runs only. The input's
 `sha256` is recorded with it (what a request-sourced adjustment binds to).
-See [catalog.md](catalog.md).
+See [node-catalog.md](node-catalog.md).
 
 Repository context: at creation the record keeps, for the project root and
 each repository the bundled workflows bind, the checked-out commit, the branch

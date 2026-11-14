@@ -7,7 +7,7 @@ import { knowledgeSemantic, type KnowledgeAttachment } from './knowledge.ts'
 import { contextChanges, changeWords, type AttemptContext, type ContextDelivery } from './context.ts'
 import { docStepsOf, type EffectiveGraph, type EffectiveGroup, type EffectiveNode, type StepSpec } from './compile.ts'
 import type { DocSteps } from './model.ts'
-import type { AttemptCatalog, CatalogContext } from './catalog.ts'
+import type { AttemptCatalog, CatalogContext } from './nodeCatalog.ts'
 import { INSTRUCTION_RESPONSES, sourceLabel, type AttachmentRef, type ChallengeAttachmentRef, type FileAttachmentRef, type SourceRef } from './intake.ts'
 import {
   CANDIDATE, INPUT_ID, OUTPUT_ID, SET_OBSERVATIONS, STAGINGS, outputNumber, parseRef,

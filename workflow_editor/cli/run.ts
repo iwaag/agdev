@@ -474,7 +474,7 @@ permits and proves nothing, and a statement never made reads as unverified.
 A required expectation that is unmet stays visible on the finished run. Writes run.json.`,
   nodes: `wfe run nodes <run> [--show <template>]
 
-The person's node catalog as this run was given it at creation (docs/catalog.md):
+The person's node catalog as this run was given it at creation (docs/node-catalog.md):
 the activities they recognize as distinct workflow steps, each with how they
 expect it to appear (expectation) and what the agent performing it does
 (description). A catalog edit after the run was created does not change it.
@@ -1329,7 +1329,7 @@ export async function runCommand(c: RunCli): Promise<number> {
         c.out(full(t), t)
         return 0
       }
-      const { CATALOG_MEANING } = await import('../shared/catalog.ts')
+      const { CATALOG_MEANING } = await import('../shared/nodeCatalog.ts')
       c.out(cat.snapshot.templates.length
         ? [`Node catalog of ${runKey(r)}, frozen at creation (${cat.snapshot.taken}; ${cat.file}):`, CATALOG_MEANING, '', ...cat.snapshot.templates.map(t => full(t)).join('\n\n').split('\n')].join('\n')
         : `The person's node catalog was empty when ${runKey(r)} was created: no activity is named as one they expect as its own node.`, cat)

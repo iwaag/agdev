@@ -8,7 +8,7 @@ import {
 import {
   acceptsRequests, projectFromData, workflowFromData, type Project, type ShapeIssue, type Workflow,
 } from '../shared/model.ts'
-import { catalogFromData, mindFromData, summonplanFromData, type MindDoc, type ProjectCatalog, type Summonplan } from '../shared/mind.ts'
+import { mycatalogFromData, projectsFromData, summonplanFromData, type CatalogDoc, type ProjectsDoc, type Summonplan } from '../shared/catalog.ts'
 
 export const STRINGIFY: ToStringOptions = { lineWidth: 0, minContentWidth: 0, flowCollectionPadding: false }
 
@@ -80,7 +80,7 @@ export function parseProject(text: string): Parsed<Project> {
   return { ok: true, doc: r.doc, model: project }
 }
 
-// The mind repository's documents (summoner p1, docs/mind.md): read only;
+// The catalog's documents (user_catalog p1, docs/mycatalog.md): read only;
 // they are written whole by people and agents, never round-tripped here.
 function parseWith<T>(text: string, read: (raw: unknown) => { issues: ShapeIssue[] } & Record<string, unknown>, key: string): Parsed<T> {
   const r = parseSubset(text)
@@ -89,9 +89,9 @@ function parseWith<T>(text: string, read: (raw: unknown) => { issues: ShapeIssue
   if (out.issues.length) return { ok: false, doc: r.doc, problem: { kind: 'shape', message: out.issues.map(i => `${i.path}: ${i.message}`).join('; '), issues: out.issues } }
   return { ok: true, doc: r.doc, model: out[key] as T }
 }
-export const parseMind = (text: string) => parseWith<MindDoc>(text, mindFromData, 'mind')
+export const parseMycatalog = (text: string) => parseWith<CatalogDoc>(text, mycatalogFromData, 'catalog')
 export const parseSummonplan = (text: string) => parseWith<Summonplan>(text, summonplanFromData, 'plan')
-export const parseProjectCatalog = (text: string) => parseWith<ProjectCatalog>(text, catalogFromData, 'catalog')
+export const parseProjects = (text: string) => parseWith<ProjectsDoc>(text, projectsFromData, 'projects')
 
 // ---- applying a model onto a document ------------------------------------
 

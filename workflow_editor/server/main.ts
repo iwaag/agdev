@@ -80,6 +80,9 @@ const handler = createHandler({
   peerLoop,
 })
 
+// An area written before user_catalog p1 (mind.json, .local/mind/) is renamed once.
+await (await import('./catalog.ts')).adoptOldArea(area, line => console.log(line))
+
 // Old-layout workspaces are converted before anything is served (docs/storage.md).
 await (await import('./layoutMigrate.ts')).convertAtStart({ registryFile, area }, line => console.log(line))
 

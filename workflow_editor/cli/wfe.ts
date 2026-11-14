@@ -26,7 +26,7 @@ import { runCommand, runIndex } from './run.ts'
 import { NODES_HELP, nodesCommand } from './nodes.ts'
 import { PROJECTS_HELP, projectsCommand } from './projects.ts'
 import { KNOWLEDGE_HELP, knowledgeCommand } from './knowledge.ts'
-import { MIND_HELP, mindCommand } from './mind.ts'
+import { CATALOG_HELP, catalogCommand } from './catalog.ts'
 import { SUMMON_HELP, summonCommand } from './summon.ts'
 import { CONTEXT_HELP, contextCommand } from './context.ts'
 import { CHALLENGE_HELP, challengeCommand } from './challenge.ts'
@@ -191,7 +191,7 @@ reference  the optional technical reference (docs/boast.md): paths,
   coordinate: COORDINATE_HELP,
   projects: PROJECTS_HELP,
   knowledge: KNOWLEDGE_HELP,
-  mind: MIND_HELP,
+  catalog: CATALOG_HELP,
   summon: SUMMON_HELP,
   create: `wfe create <dir> --name <name> [--id <id>] [--intent <text>] [--goal <text>]... [--devdocs directory|submodule] [--devdocs-source <path|url>] [--resume]
 
@@ -885,7 +885,7 @@ Projects and workspaces
   dashboard               every project and shared repository, with where each fact was read
   projects <subcommand>     read any managed project: list, show, tree, read, search, runs, run
   knowledge <subcommand>    findings projects keep from practice: collections, list, show, check, cite, ref, decisions
-  mind <subcommand>         the mind repository: braindumps as grounds of projects, summonplans, why a project exists
+  catalog <subcommand>      the user's catalog: braindumps and their reviews, summonplans, why a project exists
   summon apply|status|acquire  a summonplan's projects arrive here: acquired, registered, obtained, wired to roles
                             (committed by default, at a revision, with provenance; docs/access.md)
   request <workflow> …      a person's request to the executor (autolab): a run of the published
@@ -2308,7 +2308,7 @@ async function cmdBackup(p: Parsed): Promise<number> {
 
 const COMMANDS: Record<string, (p: Parsed) => Promise<number>> = {
   backup: cmdBackup, branches: cmdBranches,
-  runs: cmdRuns, 'rename-project': cmdRenameProject, observe: cmdObserve, projects: cmdProjects, knowledge: cmdKnowledge, mind: cmdMind, summon: cmdSummon, run: cmdRun, delegate: cmdDelegate, review: cmdReview, present: cmdPresent, share: cmdShare, project: cmdProject, repo: cmdRepo, gitea: cmdGitea, dashboard: cmdDashboard, exec: cmdExec, request: cmdRequest, peer: cmdPeer, teamwork: cmdTeamwork, cluster: cmdCluster, manage: cmdManage, submit: cmdSubmit,
+  runs: cmdRuns, 'rename-project': cmdRenameProject, observe: cmdObserve, projects: cmdProjects, knowledge: cmdKnowledge, catalog: cmdCatalog, summon: cmdSummon, run: cmdRun, delegate: cmdDelegate, review: cmdReview, present: cmdPresent, share: cmdShare, project: cmdProject, repo: cmdRepo, gitea: cmdGitea, dashboard: cmdDashboard, exec: cmdExec, request: cmdRequest, peer: cmdPeer, teamwork: cmdTeamwork, cluster: cmdCluster, manage: cmdManage, submit: cmdSubmit,
   create: cmdCreate, placement: cmdPlacement, register: cmdRegister, list: cmdList, status: cmdStatus, validate: cmdValidate,
   approve: cmdApprove, arrange: cmdArrange, 'add-repo': cmdAddRepo, workflow: cmdWorkflow, serve: cmdServe, setup: cmdSetup,
   version: cmdVersion, nodes: cmdNodes, workspace: cmdWorkspace, draft: cmdDraft, boast: cmdBoast, context: cmdContext, challenge: cmdChallenge, conversation: cmdConversation, discussion: cmdConversation, dialogue: cmdDialogue, coordinate: cmdCoordinate,
@@ -2562,9 +2562,9 @@ async function cmdKnowledge(p: Parsed): Promise<number> {
   })
 }
 
-// The mind repository (summoner p1, docs/mind.md).
-async function cmdMind(p: Parsed): Promise<number> {
-  return mindCommand({
+// The user's catalog (user_catalog p1, docs/mycatalog.md).
+async function cmdCatalog(p: Parsed): Promise<number> {
+  return catalogCommand({
     positional: p.positional.slice(0), opt: k => opt(p, k), flag: k => p.flags.has(k), out,
     usage: m => new UsageError(m), refused: m => new Refused(m),
     ctx: async () => { const g = await giteaOf(p); return { registryFile: registryFile(p), area: areaDir(p), gitea: g, giteaProblem: g ? undefined : `no Gitea setting at ${giteaFile(p)}` } },

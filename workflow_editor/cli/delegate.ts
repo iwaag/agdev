@@ -558,7 +558,7 @@ export async function delegateCommand(c: RunCli): Promise<number> {
 // the target's catalog expectations now (a preview: the child freezes its own
 // at creation), who accepts its result, and the parent's relay role.
 async function dispatchContext(store: { ctx: { area: string } }, d: Delegation): Promise<string[]> {
-  const { snapshotForRun } = await import('../server/catalog.ts')
+  const { snapshotForRun } = await import('../server/nodeCatalog.ts')
   const snap = await snapshotForRun(store.ctx.area).catch(() => null)
   const out = [`For ${d.onBehalfOf ?? 'the person this run serves'}: ${d.accepts === 'person' ? `the child's result is theirs to accept (accepts: person) — relay their own answer, not yours` : 'this run\'s agent may accept the child\'s result (accepts: parent)'}. The child asks you, and presents to you; you relay its questions and presentations to them.`]
   if (snap?.state === 'supplied' && snap.snapshot.templates.length) {

@@ -106,7 +106,7 @@ its type-specific fields come from the target workflow:
 ## Reading and writing
 
 The browser (HTTP), the CLI (`wfe nodes`) and run creation all call the same
-operations (`server/catalog.ts`), with the same validation.
+operations (`server/nodeCatalog.ts`), with the same validation.
 
 | State of the file | Read result | Writes |
 | --- | --- | --- |
@@ -138,7 +138,7 @@ operations (`server/catalog.ts`), with the same validation.
 
 ## Instantiation
 
-`instantiate(workflow, template, options)` (`shared/catalog.ts`) is a pure
+`instantiate(workflow, template, options)` (`shared/nodeCatalog.ts`) is a pure
 function. The browser applies it to its draft, and the CLI and HTTP route
 apply it to a saved file or to a draft of a run revision. It produces an
 ordinary node:

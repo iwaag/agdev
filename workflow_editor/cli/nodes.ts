@@ -1,10 +1,10 @@
-// `wfe nodes …`: the person's node catalog (p7/ex1, docs/catalog.md) from the
+// `wfe nodes …`: the person's node catalog (p7/ex1, docs/node-catalog.md) from the
 // command line — the same operations as the dashboard's "User nodes"
-// (server/catalog.ts) — and instantiation of a template into a workflow or a
+// (server/nodeCatalog.ts) — and instantiation of a template into a workflow or a
 // draft of a run's definition.
 import { readFileSync, writeFileSync } from 'node:fs'
 import { resolve } from 'node:path'
-import { EXAMPLES, TEMPLATE_TYPES, type NodeTemplate, type TemplateContent } from '../shared/catalog.ts'
+import { EXAMPLES, TEMPLATE_TYPES, type NodeTemplate, type TemplateContent } from '../shared/nodeCatalog.ts'
 import { APPEARANCE_COLORS, APPEARANCE_ICONS } from '../shared/model.ts'
 import type { Workspace } from '../server/workspace.ts'
 
@@ -22,7 +22,7 @@ export interface NodesCli {
   refused: (m: string, detail?: unknown) => Error
 }
 
-export const NODES_HELP = `wfe nodes <subcommand> …   (the person's node catalog; docs/catalog.md)
+export const NODES_HELP = `wfe nodes <subcommand> …   (the person's node catalog; docs/node-catalog.md)
 
 The catalog lists activities the person recognizes as distinct workflow
 steps. Each template is a reusable node over an existing type. It states how
@@ -104,7 +104,7 @@ export const full = (t: Pick<NodeTemplate, 'id' | 'revision' | 'type' | 'name' |
 ].join('\n')
 
 export async function nodesCommand(c: NodesCli): Promise<number> {
-  const { addExample, createTemplate, deleteTemplate, instantiateIntoWorkflow, instantiateText, readCatalog, templateIn, updateTemplate } = await import('../server/catalog.ts')
+  const { addExample, createTemplate, deleteTemplate, instantiateIntoWorkflow, instantiateText, readCatalog, templateIn, updateTemplate } = await import('../server/nodeCatalog.ts')
   const [sub, arg] = c.positional
   const text = (k: string) => { const f = c.opt(`${k}-file`); return f !== undefined ? readFileSync(resolve(f), 'utf8') : c.opt(k) }
   const by = () => { const b = c.opt('by') ?? c.by(); if (!b?.trim()) throw c.usage('--by <name> is required: who makes the change'); return b }

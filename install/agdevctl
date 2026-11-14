@@ -1494,10 +1494,10 @@ def cmd_storage(i: Instance, args) -> None:
 
 def cmd_bootstrap_projects(i: Instance, args) -> None:
     """Summon this installation's projects from a summonplan (workflow_editor docs/summon.md). With --plan <file>:
-    the mind repository is created or attached (`wfe mind init`), the plan is written there as
+    the catalog is created or attached (`wfe catalog init`), the plan is written there as
     summonplans/<name>.yaml and named in mind.json; without it, the plan the mind repository already names is
     applied. Then `wfe summon apply` (shown as a dry run first), and the Observer's settings follow roles.json.
-    Without --plan on an installation whose mind names no plan yet, the core's reference is used:
+    Without --plan on an installation whose catalog.json names no plan yet, the core's reference is used:
     install/bootstrap/summonplan.yaml (the summoner, by URL and commit), named after this installation's slug."""
     author = person_name(i)
     name = None
@@ -1512,15 +1512,15 @@ def cmd_bootstrap_projects(i: Instance, args) -> None:
         if not m:
             raise SystemExit(f"{args.plan} has no summonplan name (name: <name>)")
         name = m.group(1)
-    if not (i.area / "mind.json").exists():
-        say(wfe(i, "mind", "init", "--author", author, *(["--plan", name] if name else [])).strip())
+    if not (i.area / "catalog.json").exists() and not (i.area / "mind.json").exists():  # mind.json: an area before user_catalog p1; wfe renames it
+        say(wfe(i, "catalog", "init", "--author", author, *(["--plan", name] if name else [])).strip())
     if args.plan:
         copy = i.area / ".local" / f"summonplan-{name}.yaml"
         copy.parent.mkdir(parents=True, exist_ok=True)
         copy.write_text(text)
         own(copy, i.core_account)
-        say(wfe(i, "mind", "plan", "put", str(copy), "--author", author, "--message", f"Summonplan {name} for {i.id} (agdevctl bootstrap-projects)").strip())
-        say(wfe(i, "mind", "plan", "use", name).strip())
+        say(wfe(i, "catalog", "plan", "put", str(copy), "--author", author, "--message", f"Summonplan {name} for {i.id} (agdevctl bootstrap-projects)").strip())
+        say(wfe(i, "catalog", "plan", "use", name).strip())
     print(wfe(i, "summon", "apply", "--dry-run", check=False))
     if args.dry_run:
         return
@@ -1537,8 +1537,8 @@ def cmd_bootstrap_projects(i: Instance, args) -> None:
 
 
 def current_plan(i: Instance) -> str | None:
-    """The summonplan mind.json names, if any."""
-    return (read_json(i.area / "mind.json", None) or {}).get("plan") or None
+    """The summonplan catalog.json names, if any (mind.json: an area before user_catalog p1)."""
+    return (read_json(i.area / "catalog.json", None) or read_json(i.area / "mind.json", None) or {}).get("plan") or None
 
 
 def bootstrap_plan(i: Instance) -> Path:
@@ -2617,7 +2617,7 @@ def main() -> None:
     add("export-sources", cmd_export_sources, "bundle Gitea's current main of every manifest source")
     add("area-init", cmd_area_init, "write the operating area's configuration from this installation's inputs")
     projects = add("bootstrap-projects", cmd_bootstrap_projects, "summon the projects of a summonplan (wfe summon apply)")
-    projects.add_argument("--plan", help="a summonplan file to put in the mind repository and apply; default: the plan mind.json names, or with none the core's install/bootstrap/summonplan.yaml (the summoner)")
+    projects.add_argument("--plan", help="a summonplan file to put in the catalog and apply; default: the plan catalog.json names, or with none the core's install/bootstrap/summonplan.yaml (the summoner)")
     projects.add_argument("--dry-run", action="store_true", help="show what apply would change, change nothing")
     build = add("release-build", cmd_release_build, "build and check a release of a core revision")
     build.add_argument("commit")

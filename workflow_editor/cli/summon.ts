@@ -7,8 +7,8 @@ wfe summon status [<plan>]
 wfe summon acquire <source> <commit> [--name <local name>] [--project <id> --register] [--dry-run]
 wfe summon style <github user> --author <who> [--dry-run]
 
-apply      make this installation match a summonplan of its mind repository
-           (default: the plan mind.json names). Shows per entry what will
+apply      make this installation match a summonplan of its catalog
+           (default: the plan catalog.json names). Shows per entry what will
            change (acquire, move, register, obtain, role, deploy, nothing),
            then with --yes (or an answer at the prompt) performs it: summoned
            entries are acquired from their source into this Gitea at their
@@ -24,7 +24,7 @@ acquire    one repository (and its submodules) into this Gitea, without a
            plan: <owner>/<name from the URL, or --name>; --register also
            registers it as project --project
 style      import a user's development style: read github.com/<user>/mycatalog
-           (catalog.yaml on main, pinned to its commit) and request
+           (projects.yaml on main, pinned to its commit) and request
            summoner/propose with the wish to reproduce that style. The
            summoner proposes; nothing arrives before a person agrees in its
            run. --dry-run shows the catalog and the request without making it.`
@@ -97,7 +97,7 @@ export async function summonCommand(c: SummonCli): Promise<number> {
     if (sub === 'status' || sub === undefined) {
       const r = await s.status(ctx, { plan: a1 })
       const lines = [
-        r.plan ? `summonplan ${r.plan} (mind ${short(r.mind)}); roles.json: ${r.rolesFile ? `plan ${r.rolesFile.plan}, applied ${r.rolesFile.applied}` : 'none (no plan applied here)'}` : r.note,
+        r.plan ? `summonplan ${r.plan} (catalog ${short(r.catalog)}); roles.json: ${r.rolesFile ? `plan ${r.rolesFile.plan}, applied ${r.rolesFile.applied}` : 'none (no plan applied here)'}` : r.note,
         '', 'Roles',
         ...Object.entries(r.roles).map(([k, h]) => `  ${k.padEnd(22)} ${h ? `${h.project} (workspace ${h.workspace}${h.workflow ? `, workflow ${h.workflow}` : ''})` : 'not filled'}`),
         '', `Entries${r.entries.length ? '' : ': none'}`,

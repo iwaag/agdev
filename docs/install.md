@@ -37,7 +37,7 @@ macOS: see [macOS](#macos-launchd); the tools are the user's own and `[tools]` n
 | Update requests, outcomes, clock status | `<root>/data/lifecycle/` | root; core group writes `requests/` and `status/` |
 | Model harness login and caches | the core account's home; survives releases and restarts | core account |
 | Source bundles (the core's) | `<root>/bundles/`; a removal keeps them | root |
-| Who fills the core's roles, from the applied summonplan | `<root>/data/area/roles.json` (`wfe summon status`); the mind repository on Gitea holds the plan | core account |
+| Who fills the core's roles, from the applied summonplan | `<root>/data/area/roles.json` (`wfe summon status`); the catalog (`<owner>/mycatalog`) on Gitea holds the plan | core account |
 | Mirrors of summoned sources, the apply journal | `<root>/data/area/.local/summon/` | core account |
 | Gitea data | Docker volumes named `agdev-<slug>_*`, listed by `agdevctl inventory`; none for an attached service | Docker |
 
@@ -179,7 +179,7 @@ wfe request propose --workspace summoner --author <you> --braindump <file>
 ```
 
 To import the development style of a GitHub user who publishes `<user>/mycatalog`, naming the
-user is enough: *Import a development style* on the Mind page, or
+user is enough: *Import a development style* on the Catalog page, or
 
 ```sh
 wfe summon style <user> --dry-run           # the catalog it would propose from
@@ -187,8 +187,8 @@ wfe summon style <user> --author <you>      # requests summoner/propose with tha
 ```
 
 The run reads your braindumps, the installation's plan and the catalogs your wish points at
-(`<user>/mycatalog`, `catalog.yaml`; it knows `iwaag/mycatalog`), proposes a revised plan
-with the reasons for each project, and asks you. When you agree, it adds your wish to the mind
+(`<user>/mycatalog`, `projects.yaml`; it knows `iwaag/mycatalog`), proposes a revised plan
+with the reasons for each project, and asks you. When you agree, it adds your wish to your catalog
 as a braindump, writes the plan and runs `wfe summon apply`. The observer takes the recovery role
 from `area/roles.json` at its next look; nothing needs a restart.
 
@@ -199,13 +199,13 @@ $A bootstrap-projects --plan <summonplan.yaml> --dry-run   # what would arrive a
 $A bootstrap-projects --plan <summonplan.yaml>
 ```
 
-It creates or attaches the mind repository (`wfe mind init`), writes the plan there as
-`summonplans/<name>.yaml` and names it in `mind.json`, then runs `wfe summon apply`: each
+It creates or attaches the catalog (`wfe catalog init`), writes the plan there as
+`summonplans/<name>.yaml` and names it in `catalog.json`, then runs `wfe summon apply`: each
 `summoned` entry is acquired from its source into this Gitea at its commit (with history
 and submodules), registered and obtained; the roles are recorded in `area/roles.json`, the
 keys they own in `workers.json`, `conversations.json` and `submitters.json` follow, the
 conversation page is deployed, and the Observer follows the recovery role in `roles.json`.
-Without `--plan` it applies the plan the mind repository names, or, when it names none, the
+Without `--plan` it applies the plan `catalog.json` names, or, when it names none, the
 core's reference above; repeating it continues an interrupted apply. A source that needs a credential to read takes it from `agdev-cred`
 (an active `gitea-token` entry whose target is the source's origin).
 

@@ -1,292 +1,283 @@
-// The person's node catalog (p7/ex1, docs/catalog.md): reusable node
-// templates over the existing node types, each with a description for the
-// agent performing the activity and an expectation for whoever designs the
-// workflow. Shared by the service, the CLI and the browser: the shapes, the
-// validation, the seeds and the example, and instantiation — a template
-// copied into an ordinary workflow node with its provenance.
-import { canonicalJson } from './canonical.ts'
-import { APPEARANCE_COLORS, APPEARANCE_ICONS, ID_PATTERN, type Appearance, type NodeExpectation, type Workflow, type WorkflowNode } from './model.ts'
-import { EXPECTATION_STRENGTHS } from './expectations.ts'
-import { knowledgeProblems, type KnowledgeAttachment } from './knowledge.ts'
+// The catalog (user_catalog p1, docs/mycatalog.md): a user's repository
+// <owner>/mycatalog. Braindumps (free text: what is wanted and why) with their
+// reviews, the summonplans that make them concrete in an installation, and the
+// projects the user shares. Shared by the service, the CLI and the browser:
+// the shapes, reading plain data (parsed YAML) into them, and the validation.
+// Reading YAML text is server/yamlDoc.ts. Free text stays free; YAML is checked.
+import { ID_PATTERN, type Issue, type ShapeIssue } from './model.ts'
 
-export const CATALOG_SCHEMA = 'ag.node-catalog.v1'
-export const SNAPSHOT_SCHEMA = 'ag.node-catalog-snapshot.v1'
-export const CATALOG_FILE = 'node-catalog.json'
-// The types a template may have: the execution types a run performs.
-// p10: a delegate template describes a delegation task — optionally with its
-// target and acceptance scope; it is a description, not an executor.
-// p17: a review template is a person's review of completed work, prepared by
-// the agent and managed by WFE (docs/reviews.md).
-export const TEMPLATE_TYPES = ['study', 'do', 'talk', 'workflow__talk', 'delegate', 'review'] as const
-export type TemplateType = typeof TEMPLATE_TYPES[number]
+export const MYCATALOG_SCHEMA = 'ag.mycatalog.v1'
+export const SUMMONPLAN_SCHEMA = 'ag.summonplan.v1'
+export const PROJECTS_SCHEMA = 'ag.projects.v1'
+export const CATALOG_REPOSITORY = 'mycatalog' // the fixed repository name, under its user
+// A user's published catalog is <STYLE_HOST>/<user>/mycatalog: naming a GitHub
+// user is enough to import that user's development style (wfe summon style).
+export const STYLE_HOST = 'https://github.com'
+export const GITHUB_USER_PATTERN = /^[A-Za-z0-9](?:[A-Za-z0-9]|-(?=[A-Za-z0-9])){0,38}$/
+export const styleCatalogOf = (user: string) => `${STYLE_HOST}/${user}/${CATALOG_REPOSITORY}`
+// The marker file is mycatalog.yaml, not catalog.yaml: a reader of the old
+// layout that finds a catalog.yaml expects the project list and must fail clearly.
+export const CATALOG_FILE = 'mycatalog.yaml'
+export const PROJECTS_PATH = 'projects.yaml'
+export const BRAINDUMP_DIR = 'braindumps'
+export const EPISODES_DIR = 'braindumps/episodes'
+export const BRAINDUMP_FILE = 'braindump.md'
+export const REVIEW_FILE = 'review.md'
+export const SUMMONPLAN_DIR = 'summonplans'
+// The layout before user_catalog p1; never read, only recognized (wfe catalog migrate).
+export const OLD_LAYOUT = { marker: 'mind.yaml', schema: 'ag.mind.v1', projects: 'catalog.yaml', projectsSchema: 'ag.catalog.v1' } as const
+export const OLD_LAYOUT_PROBLEM = 'an old layout (mind.yaml, catalog.yaml, braindumps/<slug>.md): run `wfe catalog migrate`'
 
-// What a template says. Everything here is its content: a change of any of
-// it is a new revision.
-export interface TemplateContent {
+// The one rule for braindumps: any braindump.md under braindumps/episodes/, at
+// any depth, is a braindump. Its folder path below braindumps/episodes/ is its
+// identity; a review.md beside it is its review. Every other file there is the
+// owner's and is not read. Moving a folder makes a different braindump.
+export const SEGMENT_PATTERN = /^[a-z0-9][a-z0-9_.-]{0,63}$/
+export const MAX_BRAINDUMP_DEPTH = 8
+export const PLAN_NAME_PATTERN = /^[a-z0-9][a-z0-9_.-]{0,63}$/
+export const COMMIT_PATTERN = /^[0-9a-f]{40}$/
+export const isBraindumpId = (id: string): boolean => {
+  const segs = id.split('/')
+  return segs.length <= MAX_BRAINDUMP_DEPTH && segs.every(s => SEGMENT_PATTERN.test(s))
+}
+export const braindumpPath = (id: string) => `${EPISODES_DIR}/${id}/${BRAINDUMP_FILE}`
+export const reviewPath = (id: string) => `${EPISODES_DIR}/${id}/${REVIEW_FILE}`
+export const summonplanPath = (name: string) => `${SUMMONPLAN_DIR}/${name}.yaml`
+// braindumps/episodes/<id>/braindump.md → <id>; anything else → null.
+export const braindumpIdOfPath = (path: string): string | null => {
+  const pre = `${EPISODES_DIR}/`, post = `/${BRAINDUMP_FILE}`
+  if (!path.startsWith(pre) || !path.endsWith(post) || path.length <= pre.length + post.length) return null
+  const id = path.slice(pre.length, -post.length)
+  return isBraindumpId(id) ? id : null
+}
+
+// Roles the core needs someone to fill (docs/mycatalog.md, "Roles"). A workflow
+// role names the workflow of the entry's project that fills it; a project
+// role is filled by the project as a whole (`true`). Consumed from phase 2.
+export const ROLES = {
+  recovery: { kind: 'workflow', what: 'recovers runs the observer finds stuck or failed' },
+  coordination: { kind: 'workflow', what: 'coordinates runs across workers and projects' },
+  facilitation: { kind: 'workflow', what: 'conducts facilitated conversations' },
+  'conversation-archive': { kind: 'project', what: 'holds archived conversations' },
+  'conversation-page': { kind: 'project', what: 'serves the conversation page (/hangout/)' },
+  'dialogue-renderer': { kind: 'project', what: 'renders character dialogue lines' },
+} as const satisfies Record<string, { kind: 'workflow' | 'project'; what: string }>
+export type RoleName = keyof typeof ROLES
+export const ROLE_NAMES = Object.keys(ROLES) as RoleName[]
+
+// adopted: already present in the installation, described after the fact;
+// summoned: to be obtained from `source` at `commit` (apply, phase 2).
+export const ENTRY_STATES = ['adopted', 'summoned'] as const
+export type EntryState = typeof ENTRY_STATES[number]
+
+export interface CatalogDoc { schema: string; owner: string; title: string }
+
+export interface SummonEntry {
+  project: string
+  source: string
+  commit: string
+  because: string[]
+  roles: Record<string, string | true>
+  state: string
+  note?: string
+}
+export interface Summonplan {
+  schema: string
   name: string
-  type: string
-  description: string // for the agent performing the activity
-  expectation: string // for the designer of the workflow: how the person expects it to appear
-  appearance?: Appearance
-  // p10, delegate templates only: the target and who accepts the child's
-  // result, copied into the node it becomes (each may be left to the author).
-  target?: { project?: string; workflow?: string; accepts?: string }
-  // improve_wfnode p1, copied into the node it becomes: what its author expects
-  // of the result, and whether it starts as an example. A template owns no group.
-  expectations?: NodeExpectation[]
-  example?: boolean
-  knowledge?: KnowledgeAttachment[] // improve_workflow p3: copied into the node, like expectations
-}
-export interface NodeTemplate extends TemplateContent {
-  id: string
-  revision: number
-  updated: string
-  by: string
-}
-export interface Catalog {
-  schema: string
-  generation: number
-  initialized: { by: string; at: string; seeded: string[] } | null
-  templates: NodeTemplate[]
-  deleted: { id: string; revision: number; at: string; by: string }[]
-}
-// What a run is given (docs/catalog.md, "A run's catalog snapshot").
-export interface CatalogSnapshot {
-  schema: string
-  generation: number
-  taken: string
-  templates: (TemplateContent & { id: string; revision: number })[]
-}
-// What run.json says about it: the snapshot by file and hash, or why there is none.
-export type CatalogContext =
-  | { state: 'supplied'; file: string; sha256: string; generation: number; templates: number }
-  | { state: 'unavailable'; problem: string }
-
-// What a run was given, as views and the brief read it: the frozen
-// snapshot, why there is none, or that the run predates catalogs.
-export type RunCatalog = { state: 'supplied'; file: string; sha256: string; snapshot: CatalogSnapshot } | { state: 'unavailable'; problem: string } | { state: 'none' }
-// What an attempt records it was given (attempt.begin settings).
-export type AttemptCatalog = { state: 'supplied'; sha256: string; templates: number } | { state: 'unavailable' }
-
-// The run's catalog in an attempt's brief (docs/catalog.md, "Delivered").
-// The meaning is stated once; each template's id, name, type and
-// expectation follow; tool usage stays in the tools' help.
-export const CATALOG_MEANING = 'The person recognizes these activities as distinct steps. When one is relevant to this request, perform it as a node of its own as far as possible (a node the workflow has, or one you add first), not inside another node such as a talk. It is not an absolute rule: where that work fits no node of its own, do it the way that serves the request. Where the nodes go is your design, from the request and the current workflow.'
-export function catalogBrief(c: RunCatalog, run: string): string[] {
-  if (c.state === 'none') return []
-  if (c.state === 'unavailable') return ['', `The person's node catalog could not be read when this run was created (${c.problem}), so which activities they expect as distinct workflow nodes is not known for this run.`]
-  const t = c.snapshot.templates
-  if (!t.length) return ['', 'The person\'s node catalog was empty when this run was created: they have named no activity they expect as a workflow node of its own.']
-  return ['', `The person's node catalog, as it was when this run was created (wfe run nodes ${run} shows each template in full):`, CATALOG_MEANING,
-    ...t.map(x => `- ${x.id} "${x.name}" (${x.type}, revision ${x.revision}${x.example ? ', an example' : ''}${x.knowledge?.length ? `, pointing at knowledge: ${x.knowledge.map(a => a.category ?? 'no category').join(', ')}` : ''}${x.expectations?.length ? `, expecting ${x.expectations.map(e => `${e.key} ${e.strength ?? 'preferred'}`).join(', ')}` : ''}): ${x.expectation.trim().split('\n').join(' ')}`),
-    `A node from one of them goes into a draft of this run's definition with wfe nodes instantiate <template> --run ${run} --file <draft> (wfe nodes help); the draft becomes future work with wfe run adjust, with --source request when the request already asks for that work (wfe run help adjust).`]
+  intent: string
+  grounds: string
+  entries: SummonEntry[]
 }
 
-// A node's provenance (docs/contract.md, "Template provenance"): outside
-// every digest and the compiled graph.
-export interface TemplateRef { id: string; revision: number; expectation: string }
+// `roles`: the core roles the project can fill, in a plan entry's shape (a summoner copies it into a plan).
+export interface SharedProject { project: string; source: string; commit?: string; description: string; because: string[]; roles: Record<string, string | true> }
+export interface ProjectsDoc { schema: string; owner: string; projects: SharedProject[] }
 
-export class CatalogError extends Error {
-  code: string
-  constructor(code: string, message: string) { super(message); this.code = code }
+// A braindump as read: free Markdown. Its title is the first-level heading on
+// its first line, otherwise its identity.
+export interface Braindump { id: string; path: string; title: string; text: string }
+export function braindumpTitle(id: string, text: string): string {
+  const m = /^#\s+(.+?)\s*#*\s*$/.exec(text.split('\n', 1)[0] ?? '')
+  return m ? m[1] : id
 }
-const fail = (code: string, message: string): never => { throw new CatalogError(code, message) }
-const isObj = (v: unknown): v is Record<string, unknown> => typeof v === 'object' && v !== null && !Array.isArray(v)
+// The first lines after the title, for listings.
+export function braindumpExcerpt(text: string, chars = 480): string {
+  const lines = text.split('\n')
+  const start = lines.findIndex(l => l.trim() !== '')
+  const body = (start >= 0 && /^#\s/.test(lines[start]) ? lines.slice(start + 1) : lines).join('\n').trim()
+  return body.length > chars ? `${body.slice(0, chars).trimEnd()}…` : body
+}
 
-// Problems with one template's content, as messages; empty when it is valid.
-export function contentProblems(t: Partial<TemplateContent>): string[] {
-  const out: string[] = []
-  const txt = (v: unknown) => typeof v === 'string' && v.trim() !== ''
-  if (!txt(t.name)) out.push('name is required')
-  if (!(TEMPLATE_TYPES as readonly string[]).includes(t.type as string)) out.push(`type must be one of ${TEMPLATE_TYPES.join(', ')}`)
-  if (t.target !== undefined) {
-    const g = t.target as Record<string, unknown>
-    if (t.type !== 'delegate') out.push('target belongs to delegate templates only')
-    else if (!isObj(g)) out.push('target must be {project?, workflow?, accepts?}')
-    else {
-      for (const k of ['project', 'workflow'] as const) if (g[k] !== undefined && (typeof g[k] !== 'string' || !ID_PATTERN.test(g[k] as string))) out.push(`target.${k} must be a valid id`)
-      if (g.accepts !== undefined && !['person', 'parent'].includes(g.accepts as string)) out.push('target.accepts is person or parent')
+// ---- reading plain data --------------------------------------------------------
+
+const isRecord = (v: unknown): v is Record<string, unknown> => typeof v === 'object' && v !== null && !Array.isArray(v)
+function text(raw: Record<string, unknown>, key: string, path: string, issues: ShapeIssue[]): string {
+  const v = raw[key]
+  if (v === undefined || v === null) return ''
+  if (typeof v === 'string') return v
+  issues.push({ path: `${path}.${key}`, message: 'expected text' })
+  return String(v)
+}
+function texts(raw: Record<string, unknown>, key: string, path: string, issues: ShapeIssue[]): string[] {
+  const v = raw[key]
+  if (v === undefined || v === null) return []
+  if (!Array.isArray(v)) { issues.push({ path: `${path}.${key}`, message: 'expected a sequence' }); return [] }
+  return v.flatMap((x, i) => typeof x === 'string' ? [x] : (issues.push({ path: `${path}.${key}[${i}]`, message: 'expected text' }), []))
+}
+const top = (raw: unknown, issues: ShapeIssue[]): Record<string, unknown> | null => {
+  if (isRecord(raw)) return raw
+  issues.push({ path: '$', message: raw === null || raw === undefined ? 'empty document' : 'top level must be a mapping' })
+  return null
+}
+
+export function mycatalogFromData(raw: unknown): { catalog: CatalogDoc; issues: ShapeIssue[] } {
+  const issues: ShapeIssue[] = []
+  const r = top(raw, issues)
+  if (!r) return { catalog: { schema: '', owner: '', title: '' }, issues }
+  return { catalog: { schema: text(r, 'schema', '$', issues), owner: text(r, 'owner', '$', issues), title: text(r, 'title', '$', issues) }, issues }
+}
+
+export function summonplanFromData(raw: unknown): { plan: Summonplan; issues: ShapeIssue[] } {
+  const issues: ShapeIssue[] = []
+  const plan: Summonplan = { schema: '', name: '', intent: '', grounds: '', entries: [] }
+  const r = top(raw, issues)
+  if (!r) return { plan, issues }
+  plan.schema = text(r, 'schema', '$', issues)
+  plan.name = text(r, 'name', '$', issues)
+  plan.intent = text(r, 'intent', '$', issues)
+  plan.grounds = text(r, 'grounds', '$', issues)
+  const entries = r.entries === undefined || r.entries === null ? [] : Array.isArray(r.entries) ? r.entries : (issues.push({ path: '$.entries', message: 'expected a sequence' }), [])
+  entries.forEach((e, i) => {
+    const p = `$.entries[${i}]`
+    if (!isRecord(e)) { issues.push({ path: p, message: 'expected a mapping' }); return }
+    const roles = rolesFrom(e, p, issues)
+    plan.entries.push({
+      project: text(e, 'project', p, issues), source: text(e, 'source', p, issues), commit: text(e, 'commit', p, issues),
+      because: texts(e, 'because', p, issues), roles, state: text(e, 'state', p, issues),
+      ...(e.note !== undefined && e.note !== null ? { note: text(e, 'note', p, issues) } : {}),
+    })
+  })
+  return { plan, issues }
+}
+
+function rolesFrom(e: Record<string, unknown>, p: string, issues: ShapeIssue[]): Record<string, string | true> {
+  const roles: Record<string, string | true> = {}
+  if (e.roles !== undefined && e.roles !== null) {
+    if (!isRecord(e.roles)) issues.push({ path: `${p}.roles`, message: 'expected a mapping {<role>: <workflow> | true}' })
+    else for (const [k, v] of Object.entries(e.roles)) {
+      if (typeof v === 'string' || v === true) roles[k] = v
+      else issues.push({ path: `${p}.roles.${k}`, message: 'expected a workflow id or true' })
     }
   }
-  if (!txt(t.description)) out.push('description is required: what the agent performing this activity does and records')
-  if (!txt(t.expectation)) out.push('expectation is required: how you expect this activity to appear in a workflow')
-  if (t.expectations !== undefined) {
-    if (!Array.isArray(t.expectations)) out.push('expectations must be a list of {key, strength?, note?}')
-    else {
-      const keys = new Set<string>()
-      for (const x of t.expectations as unknown[]) {
-        const e = (isObj(x) ? x : {}) as Record<string, unknown>
-        if (typeof e.key !== 'string' || !ID_PATTERN.test(e.key)) out.push(`expectation key "${String(e.key)}" must match ${ID_PATTERN.source}`)
-        else if (keys.has(e.key)) out.push(`expectation "${e.key}" is listed twice`)
-        else keys.add(e.key)
-        if (e.strength !== undefined && !(EXPECTATION_STRENGTHS as readonly unknown[]).includes(e.strength)) out.push(`expectation "${String(e.key)}" has strength "${String(e.strength)}"; expected ${EXPECTATION_STRENGTHS.join(' or ')}`)
-        if (e.note !== undefined && typeof e.note !== 'string') out.push(`expectation "${String(e.key)}" note must be text`)
-      }
-    }
-  }
-  if (t.example !== undefined && typeof t.example !== 'boolean') out.push('example must be true or false')
-  if (t.knowledge !== undefined) {
-    if (!Array.isArray(t.knowledge) || t.knowledge.some(a => !isObj(a))) out.push('knowledge must be a list of {category?, note?, findings?}')
-    else for (const p of knowledgeProblems(t.knowledge as KnowledgeAttachment[])) if (p.severity === 'error') out.push(p.message)
-  }
-  if (t.appearance !== undefined) {
-    if (!isObj(t.appearance) || typeof t.appearance.icon !== 'string' || typeof t.appearance.color !== 'string') out.push('appearance must be {icon, color}')
-    else {
-      if (t.appearance.icon && !(APPEARANCE_ICONS as readonly string[]).includes(t.appearance.icon)) out.push(`icon "${t.appearance.icon}" is not one of ${APPEARANCE_ICONS.join(', ')}`)
-      if (t.appearance.color && !(APPEARANCE_COLORS as readonly string[]).includes(t.appearance.color)) out.push(`color "${t.appearance.color}" is not one of ${APPEARANCE_COLORS.join(', ')}`)
-    }
-  }
-  return out
+  return roles
 }
 
-// The content of a template as stored: trimmed name, no empty appearance.
-export function normalizeContent(t: TemplateContent): TemplateContent {
-  const a = t.appearance && (t.appearance.icon || t.appearance.color) ? { appearance: { icon: t.appearance.icon ?? '', color: t.appearance.color ?? '' } } : {}
-  const g = t.type === 'delegate' && t.target ? Object.fromEntries((['project', 'workflow', 'accepts'] as const).filter(k => t.target![k]).map(k => [k, t.target![k]])) : {}
-  return { name: t.name.trim(), type: t.type, description: t.description, expectation: t.expectation, ...a, ...(Object.keys(g).length ? { target: g } : {}), ...(t.expectations?.length ? { expectations: t.expectations.map(x => ({ key: x.key, ...(x.strength ? { strength: x.strength } : {}), ...(x.note ? { note: x.note } : {}) })) } : {}), ...(t.example ? { example: true } : {}), ...(t.knowledge?.length ? { knowledge: structuredClone(t.knowledge) } : {}) }
+export function projectsFromData(raw: unknown): { projects: ProjectsDoc; issues: ShapeIssue[] } {
+  const issues: ShapeIssue[] = []
+  const doc: ProjectsDoc = { schema: '', owner: '', projects: [] }
+  const r = top(raw, issues)
+  if (!r) return { projects: doc, issues }
+  doc.schema = text(r, 'schema', '$', issues)
+  doc.owner = text(r, 'owner', '$', issues)
+  const ps = r.projects === undefined || r.projects === null ? [] : Array.isArray(r.projects) ? r.projects : (issues.push({ path: '$.projects', message: 'expected a sequence' }), [])
+  ps.forEach((e, i) => {
+    const p = `$.projects[${i}]`
+    if (!isRecord(e)) { issues.push({ path: p, message: 'expected a mapping' }); return }
+    const commit = text(e, 'commit', p, issues)
+    doc.projects.push({ project: text(e, 'project', p, issues), source: text(e, 'source', p, issues), description: text(e, 'description', p, issues), because: texts(e, 'because', p, issues), roles: rolesFrom(e, p, issues), ...(commit ? { commit } : {}) })
+  })
+  return { projects: doc, issues }
 }
-export const contentOf = (t: TemplateContent): TemplateContent => normalizeContent({ name: t.name, type: t.type, description: t.description, expectation: t.expectation, ...(t.appearance ? { appearance: t.appearance } : {}), ...(t.target ? { target: t.target } : {}), ...(t.expectations ? { expectations: t.expectations } : {}), ...(t.example ? { example: t.example } : {}) , ...(t.knowledge ? { knowledge: t.knowledge } : {}) })
-export const sameContent = (a: TemplateContent, b: TemplateContent) => canonicalJson(contentOf(a)) === canonicalJson(contentOf(b))
 
-// Reads parsed JSON as a catalog; throws CatalogError('catalog-invalid')
-// naming the first problem. A catalog that does not read is never treated
-// as empty.
-export function parseCatalog(raw: unknown): Catalog {
-  if (!isObj(raw)) return fail('catalog-invalid', 'the catalog is not a JSON object')
-  if (raw.schema !== CATALOG_SCHEMA) return fail('catalog-invalid', `schema is "${String(raw.schema)}"; this release reads ${CATALOG_SCHEMA}`)
-  if (typeof raw.generation !== 'number' || !Number.isInteger(raw.generation) || raw.generation < 0) fail('catalog-invalid', 'generation must be a non-negative integer')
-  if (!Array.isArray(raw.templates)) fail('catalog-invalid', 'templates must be a list')
-  const deleted = raw.deleted === undefined ? [] : raw.deleted
-  if (!Array.isArray(deleted)) fail('catalog-invalid', 'deleted must be a list')
+// ---- validation ------------------------------------------------------------------
+
+const err = (code: string, message: string, field?: string): Issue => ({ severity: 'error', code, message, ...(field ? { field } : {}) })
+const warn = (code: string, message: string, field?: string): Issue => ({ severity: 'warning', code, message, ...(field ? { field } : {}) })
+
+// What the repository offers to resolve references against.
+export interface CatalogRefs { braindumps?: string[] /* paths present, e.g. braindumps/episodes/x/braindump.md */ }
+
+export function validateMycatalog(m: CatalogDoc): Issue[] {
+  const issues: Issue[] = []
+  if (m.schema !== MYCATALOG_SCHEMA) issues.push(err('schema', m.schema ? `Unsupported schema "${m.schema}"; expected ${MYCATALOG_SCHEMA}.` : `Missing schema; expected ${MYCATALOG_SCHEMA}.`, 'schema'))
+  if (!m.owner.trim()) issues.push(err('owner-missing', 'owner (the user this catalog belongs to) is missing.', 'owner'))
+  if (!m.title.trim()) issues.push(warn('title-missing', 'title is empty.', 'title'))
+  return issues
+}
+
+// A source is any Git URL: http(s), ssh, git, scp-like or a local path.
+const looksLikeGitUrl = (s: string) => /^(https?|ssh|git|file):\/\/\S+$/.test(s) || /^[\w.-]+@[\w.-]+:\S+$/.test(s) || /^\/\S+$/.test(s)
+
+function becauseIssues(because: string[], at: string, ctx: CatalogRefs): Issue[] {
+  const issues: Issue[] = []
+  because.forEach(b => {
+    if (braindumpIdOfPath(b) === null) issues.push(err('because-path', `${at}: because "${b}" is not ${EPISODES_DIR}/<path>/${BRAINDUMP_FILE}.`, 'because'))
+    else if (ctx.braindumps && !ctx.braindumps.includes(b)) issues.push(err('because-missing', `${at}: because "${b}" does not exist in the catalog.`, 'because'))
+  })
+  if (new Set(because).size !== because.length) issues.push(warn('because-duplicate', `${at}: because lists a braindump twice.`, 'because'))
+  return issues
+}
+
+export function validateSummonplan(p: Summonplan, ctx: CatalogRefs = {}, fileName?: string): Issue[] {
+  const issues: Issue[] = []
+  if (p.schema !== SUMMONPLAN_SCHEMA) issues.push(err('schema', p.schema ? `Unsupported schema "${p.schema}"; expected ${SUMMONPLAN_SCHEMA}.` : `Missing schema; expected ${SUMMONPLAN_SCHEMA}.`, 'schema'))
+  if (!PLAN_NAME_PATTERN.test(p.name)) issues.push(err('name-invalid', `name "${p.name}" must match ${PLAN_NAME_PATTERN.source}.`, 'name'))
+  else if (fileName && fileName !== p.name) issues.push(err('name-file', `name "${p.name}" differs from its file name "${fileName}".`, 'name'))
+  if (!p.intent.trim()) issues.push(warn('intent-missing', 'intent is empty.', 'intent'))
+  if (!p.grounds) issues.push(warn('grounds-missing', 'grounds (the catalog commit the plan was written against) is missing.', 'grounds'))
+  else if (!COMMIT_PATTERN.test(p.grounds)) issues.push(err('grounds-shape', `grounds "${p.grounds}" is not a full commit id.`, 'grounds'))
   const seen = new Set<string>()
-  const templates = (raw.templates as unknown[]).map((t, i) => {
-    if (!isObj(t)) return fail('catalog-invalid', `template ${i + 1} is not an object`)
-    const id = String(t.id ?? '')
-    if (!ID_PATTERN.test(id)) fail('catalog-invalid', `template ${i + 1}: id "${id}" must match ${ID_PATTERN.source}`)
-    if (seen.has(id)) fail('catalog-invalid', `template id "${id}" appears twice`)
-    seen.add(id)
-    if (typeof t.revision !== 'number' || !Number.isInteger(t.revision) || t.revision < 1) fail('catalog-invalid', `template ${id}: revision must be a positive integer`)
-    for (const k of ['name', 'type', 'description', 'expectation', 'updated', 'by']) if (typeof t[k] !== 'string') fail('catalog-invalid', `template ${id}: ${k} must be text`)
-    const content = { name: t.name, type: t.type, description: t.description, expectation: t.expectation, ...(t.appearance !== undefined ? { appearance: t.appearance } : {}), ...(t.target !== undefined ? { target: t.target } : {}), ...(t.expectations !== undefined ? { expectations: t.expectations } : {}), ...(t.example !== undefined ? { example: t.example } : {}), ...(t.knowledge !== undefined ? { knowledge: t.knowledge } : {}) } as TemplateContent
-    const problems = contentProblems(content)
-    if (problems.length) fail('catalog-invalid', `template ${id}: ${problems.join('; ')}`)
-    return { id, revision: t.revision as number, ...contentOf(content), updated: t.updated as string, by: t.by as string }
+  const filled = new Map<string, string>()
+  p.entries.forEach((e, i) => {
+    const at = e.project ? `entry "${e.project}"` : `entries[${i}]`
+    if (!e.project) issues.push(err('project-missing', `${at}: project is missing.`, 'project'))
+    else if (!ID_PATTERN.test(e.project)) issues.push(err('project-invalid', `${at}: project must match ${ID_PATTERN.source}.`, 'project'))
+    else if (seen.has(e.project)) issues.push(err('project-duplicate', `${at}: the project is listed twice.`, 'project'))
+    seen.add(e.project)
+    if (!e.source) issues.push(err('source-missing', `${at}: source (a Git URL) is missing.`, 'source'))
+    else if (!looksLikeGitUrl(e.source)) issues.push(err('source-shape', `${at}: source "${e.source}" is not a Git URL.`, 'source'))
+    if (!(ENTRY_STATES as readonly string[]).includes(e.state)) issues.push(err('state', `${at}: state "${e.state}" is not one of ${ENTRY_STATES.join(', ')}.`, 'state'))
+    if (!e.commit) issues.push((e.state === 'adopted' ? warn : err)('commit-missing', `${at}: commit is missing; ${e.state === 'adopted' ? 'an adopted entry still says which revision was described' : 'apply needs an exact revision'}.`, 'commit'))
+    else if (!COMMIT_PATTERN.test(e.commit)) issues.push(err('commit-shape', `${at}: commit "${e.commit}" is not a full commit id.`, 'commit'))
+    issues.push(...becauseIssues(e.because, at, ctx))
+    issues.push(...roleIssues(e.roles, at))
+    for (const role of Object.keys(e.roles)) {
+      if (!(role in ROLES)) continue
+      const other = filled.get(role)
+      if (other) issues.push(err('role-twice', `${at}: role "${role}" is already filled by "${other}".`, 'roles'))
+      else filled.set(role, e.project)
+    }
   })
-  const gone = (deleted as unknown[]).map((d, i) => {
-    if (!isObj(d) || typeof d.id !== 'string' || typeof d.revision !== 'number' || typeof d.at !== 'string' || typeof d.by !== 'string') return fail('catalog-invalid', `deleted entry ${i + 1} must be {id, revision, at, by}`)
-    if (seen.has(d.id)) fail('catalog-invalid', `template id "${d.id}" is both present and deleted`)
-    return { id: d.id, revision: d.revision, at: d.at, by: d.by }
+  return issues
+}
+
+// The shape of each role value; filling a role twice is the plan's concern (projects.yaml may offer alternatives).
+function roleIssues(roles: Record<string, string | true>, at: string): Issue[] {
+  const issues: Issue[] = []
+  for (const [role, v] of Object.entries(roles)) {
+    const def = (ROLES as Record<string, { kind: string }>)[role]
+    if (!def) { issues.push(err('role-unknown', `${at}: role "${role}" is not known (${ROLE_NAMES.join(', ')}).`, 'roles')); continue }
+    if (def.kind === 'workflow' && (typeof v !== 'string' || !ID_PATTERN.test(v))) issues.push(err('role-value', `${at}: role "${role}" names the workflow that fills it.`, 'roles'))
+    if (def.kind === 'project' && v !== true) issues.push(err('role-value', `${at}: role "${role}" is filled by the project as a whole: write true.`, 'roles'))
+  }
+  return issues
+}
+
+export function validateProjects(c: ProjectsDoc, ctx: CatalogRefs = {}): Issue[] {
+  const issues: Issue[] = []
+  if (c.schema !== PROJECTS_SCHEMA) issues.push(err('schema', c.schema ? `Unsupported schema "${c.schema}"; expected ${PROJECTS_SCHEMA}.` : `Missing schema; expected ${PROJECTS_SCHEMA}.`, 'schema'))
+  if (!c.owner.trim()) issues.push(err('owner-missing', 'owner is missing.', 'owner'))
+  const seen = new Set<string>()
+  c.projects.forEach((e, i) => {
+    const at = e.project ? `project "${e.project}"` : `projects[${i}]`
+    if (!ID_PATTERN.test(e.project)) issues.push(err('project-invalid', `${at}: project must match ${ID_PATTERN.source}.`, 'project'))
+    else if (seen.has(e.project)) issues.push(err('project-duplicate', `${at}: listed twice.`, 'project'))
+    seen.add(e.project)
+    if (!looksLikeGitUrl(e.source)) issues.push(err('source-shape', `${at}: source "${e.source}" is not a Git URL.`, 'source'))
+    if (e.commit && !COMMIT_PATTERN.test(e.commit)) issues.push(err('commit-shape', `${at}: commit "${e.commit}" is not a full commit id.`, 'commit'))
+    if (!e.description.trim()) issues.push(warn('description-missing', `${at}: description is empty.`, 'description'))
+    issues.push(...becauseIssues(e.because, at, ctx))
+    issues.push(...roleIssues(e.roles, at))
   })
-  let initialized: Catalog['initialized'] = null
-  if (raw.initialized !== undefined && raw.initialized !== null) {
-    const x = raw.initialized
-    if (!isObj(x) || typeof x.by !== 'string' || typeof x.at !== 'string' || !Array.isArray(x.seeded) || !x.seeded.every(s => typeof s === 'string')) fail('catalog-invalid', 'initialized must be {by, at, seeded: [ids]}')
-    initialized = { by: (x as Record<string, string>).by, at: (x as Record<string, string>).at, seeded: [...(x as { seeded: string[] }).seeded] }
-  }
-  return { schema: CATALOG_SCHEMA, generation: raw.generation as number, initialized, templates, deleted: gone }
-}
-
-export function parseSnapshot(raw: unknown): CatalogSnapshot {
-  if (!isObj(raw) || raw.schema !== SNAPSHOT_SCHEMA) return fail('snapshot-invalid', `the run's catalog snapshot is not ${SNAPSHOT_SCHEMA}`)
-  if (!Array.isArray(raw.templates)) return fail('snapshot-invalid', 'the snapshot lists no templates')
-  return raw as unknown as CatalogSnapshot
-}
-
-export function snapshotOf(c: Catalog, taken: string): CatalogSnapshot {
-  return { schema: SNAPSHOT_SCHEMA, generation: c.generation, taken, templates: c.templates.map(t => ({ id: t.id, revision: t.revision, ...contentOf(t) })) }
-}
-
-// ---- seeds and examples --------------------------------------------------------
-
-// The p7 palette presets become the person's own templates at the catalog's
-// one-time initialization (docs/catalog.md, "Reading and writing"). Their
-// descriptions are p7's; the expectations say what the presets meant.
-export const SEED_BY = 'workflow_editor p7/ex1'
-export const SEEDS: Record<string, TemplateContent> = {
-  present: {
-    type: 'do', name: 'Present', appearance: { icon: 'present', color: 'teal' },
-    description: 'Prepare the result for the person: freeze it as a presentation with an explanation of what changed, how to use it and what to check; make it available as this node\'s expectations say, and confirm that it can actually be reached that way.',
-    expectation: 'When a run delivers something I can look at or try, I expect a node that presents it to me for review, before the step where I confirm the result.',
-    expectations: [{ key: 'webbrowser', strength: 'preferred', note: 'The presentation service serves HTTP review links. Change this expectation on the node when the result should be tried another way.' }],
-  },
-  cleanup: {
-    type: 'do', name: 'Clean up', appearance: { icon: 'cleanup', color: 'slate' },
-    description: 'Stop what this run started for the review (presentation servers) and verify that it stopped; record the outcome.',
-    expectation: 'When a run starts something for my review (a presentation server), I expect a node at the end that stops it and verifies that it stopped.',
-  },
-}
-// Offered, never added by itself: the person chooses and edits it.
-export const EXAMPLES: Record<string, TemplateContent> = {
-  // p17 (docs/reviews.md): the deferred human review fix6 trial A lacked.
-  'human-review': {
-    type: 'review', name: 'Human review', appearance: { icon: 'review', color: 'green' },
-    description: 'After your own review, hand the finished work to the person: wfe review prepare with a short summary of what was done and what to check, and the presentations to look at. Nothing waits in a process; the person starts the review with one button, then approves or requests changes.',
-    expectation: 'When a run delivers something I can look at, I expect a human review node at the end that hands it to me with its presentations, so I can start it with one button whenever I come back. You may review it yourself and stop the pages first; my review stays possible later.',
-  },
-  'preliminary-research': {
-    type: 'study', name: 'Preliminary research', appearance: { icon: 'study', color: 'violet' },
-    description: [
-      'Research how this kind of change is usually done before the work it informs starts.',
-      'Record in this node\'s report: the sources consulted (links or references), what each says that matters here, the approach chosen and why, the alternatives set aside, and what remains uncertain.',
-    ].join('\n'),
-    expectation: 'When I ask for research or investigation before implementing, I expect a study node before the work it informs, with its sources and findings in its own report.',
-  },
-}
-
-export function newCatalog(at: string, seeded: Record<string, TemplateContent> = SEEDS): Catalog {
-  return {
-    schema: CATALOG_SCHEMA, generation: 1, initialized: { by: SEED_BY, at, seeded: Object.keys(seeded) },
-    templates: Object.entries(seeded).map(([id, c]) => ({ id, revision: 1, ...contentOf(c), updated: at, by: SEED_BY })),
-    deleted: [],
-  }
-}
-
-// ---- instantiation ------------------------------------------------------------
-
-export interface InstantiateOptions {
-  id?: string // the new node's id; default the template id, made unique
-  repositories?: string[] // binding keys of the target workflow
-  after?: string[] // nodes the new node waits for
-  before?: string[] // nodes that wait for the new node
-}
-
-export function uniqueNodeId(w: Pick<Workflow, 'nodes'>, base: string): string {
-  if (!(base in w.nodes)) return base
-  for (let n = 2; ; n++) { const id = `${base}-${n}`.slice(0, 64); if (!(id in w.nodes)) return id }
-}
-
-// A template copied into an ordinary node of `w` (a new workflow model; `w`
-// is not changed). Never declares a binding or a result confirmation: the
-// target workflow decides those. A delegate template's own target (p10) is
-// copied as the template states it.
-export function instantiate(w: Workflow, t: Pick<NodeTemplate, 'id' | 'revision'> & TemplateContent, o: InstantiateOptions = {}): { workflow: Workflow; node: string } {
-  const problems = contentProblems(t)
-  if (problems.length) fail('template-invalid', `template ${t.id}: ${problems.join('; ')}`)
-  const id = o.id ?? uniqueNodeId(w, t.id)
-  if (!ID_PATTERN.test(id)) fail('node-id-invalid', `node id "${id}" must match ${ID_PATTERN.source}`)
-  if (id in w.nodes) fail('node-id-taken', `the workflow already has a node "${id}"`)
-  const repositories = [...new Set(o.repositories ?? [])]
-  const unknown = repositories.filter(k => !(k in w.repositories))
-  if (unknown.length) fail('template-binding', `binding${unknown.length === 1 ? '' : 's'} ${unknown.join(', ')} ${unknown.length === 1 ? 'is' : 'are'} not declared by workflow ${w.id || '(this workflow)'} (declared: ${Object.keys(w.repositories).join(', ') || 'none'}); instantiation never adds access`)
-  for (const n of [...(o.after ?? []), ...(o.before ?? [])]) if (!(n in w.nodes)) fail('node-unknown', `node "${n}" is not in the workflow`)
-  const node: WorkflowNode = {
-    type: t.type, name: t.name, description: t.description, repositories,
-    ...(t.appearance && (t.appearance.icon || t.appearance.color) ? { appearance: { ...t.appearance } } : {}),
-    // A delegate template's target (p10), as the template states it.
-    ...(t.type === 'delegate' && t.target?.workflow ? { workflow: t.target.workflow } : {}),
-    ...(t.type === 'delegate' && t.target?.project ? { project: t.target.project } : {}),
-    ...(t.type === 'delegate' && t.target?.accepts ? { accepts: t.target.accepts } : {}),
-    template: { id: t.id, revision: t.revision, expectation: t.expectation },
-    ...(t.expectations?.length ? { expectations: t.expectations.map(x => ({ ...x })) } : {}),
-    ...(t.example ? { example: true } : {}),
-    ...(t.knowledge?.length ? { knowledge: structuredClone(t.knowledge) } : {}),
-  }
-  const next = structuredClone(w)
-  next.nodes[id] = node
-  for (const a of o.after ?? []) next.edges.push({ from: a, to: id })
-  for (const b of o.before ?? []) next.edges.push({ from: id, to: b })
-  // Inserted between two nodes that were directly connected: the direct
-  // edge would bypass the new node, so it goes.
-  for (const a of o.after ?? []) for (const b of o.before ?? []) next.edges = next.edges.filter(e => !(e.from === a && e.to === b))
-  return { workflow: next, node: id }
+  return issues
 }

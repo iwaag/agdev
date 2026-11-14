@@ -9,20 +9,20 @@ import { spawn } from 'node:child_process'
 import { mkdir, readFile, rename, stat } from 'node:fs/promises'
 import { dirname, join, posix, resolve } from 'node:path'
 import { tmpdir } from 'node:os'
-import { CATALOG_PATH, COMMIT_PATTERN, GITHUB_USER_PATTERN, MIND_REPOSITORY, ROLES, styleCatalogOf, validateCatalog, validateSummonplan, type RoleName, type Summonplan } from '../shared/mind.ts'
+import { CATALOG_REPOSITORY, COMMIT_PATTERN, GITHUB_USER_PATTERN, OLD_LAYOUT_PROBLEM, PROJECTS_PATH, ROLES, styleCatalogOf, validateProjects, validateSummonplan, type RoleName, type Summonplan } from '../shared/catalog.ts'
 import { gitmodules, obtainWorkspace } from './agdev.ts'
 import { atomicWrite, readTextOrNull } from './files.ts'
 import { git } from './git.ts'
 import { Gitea, GiteaError, tokenOf, type GiteaRepo } from './gitea.ts'
 import { withLock } from './lock.ts'
-import { loadMindSetting, mindSnapshot, type MindContext } from './mind.ts'
+import { loadCatalogSetting, catalogSnapshot, type CatalogContext } from './catalog.ts'
 import { loadRegistry, recordUpstream, registerRepository, repoKey, RegistryError, type Registry, type RepoCategory } from './registry.ts'
 import { sourceRootOf } from './layout.ts'
 import { categoryOf, RequestError } from './workspace.ts'
-import { parseProject, parseProjectCatalog } from './yamlDoc.ts'
+import { parseProject, parseProjects } from './yamlDoc.ts'
 import { registerGiteaProject } from './agdev.ts'
 
-export type SummonContext = MindContext
+export type SummonContext = CatalogContext
 export interface SummonStep { name: string; status: 'done' | 'kept' | 'would' | 'refused' | 'failed'; detail: string }
 
 const exists = (p: string) => stat(p).then(() => true, () => false)
@@ -269,15 +269,16 @@ export async function acquireOne(ctx: SummonContext, o: { url: string; commit: s
 // ---- the plan ------------------------------------------------------------------------
 
 async function loadPlan(ctx: SummonContext, name?: string): Promise<{ plan: Summonplan; head: string; owner: string }> {
-  const snap = await mindSnapshot(ctx, { maxAgeMs: 0 })
+  const snap = await catalogSnapshot(ctx, { maxAgeMs: 0 })
+  if (snap.catalog.problem === OLD_LAYOUT_PROBLEM) throw new RequestError(409, `the catalog is in ${OLD_LAYOUT_PROBLEM}`)
   const want = name || snap.setting.plan
-  if (!want) throw new RequestError(400, 'no plan named, and mind.json names none (wfe mind plan use <name>)')
+  if (!want) throw new RequestError(400, 'no plan named, and catalog.json names none (wfe catalog plan use <name>)')
   const p = snap.plans.find(x => x.name === want)
-  if (!p) throw new RequestError(404, `no summonplan "${want}" in the mind repository (${snap.plans.map(x => x.name).join(', ') || 'none yet'})`)
+  if (!p) throw new RequestError(404, `no summonplan "${want}" in the catalog (${snap.plans.map(x => x.name).join(', ') || 'none yet'})`)
   if (!p.plan) throw new RequestError(400, `summonplan ${want} cannot be read: ${p.problem}`)
   const errors = validateSummonplan(p.plan, { braindumps: snap.braindumps.map(b => b.path) }, want).filter(i => i.severity === 'error')
   if (errors.length) throw new RequestError(400, `summonplan ${want} has errors; nothing was applied:\n${errors.map(i => `  ${i.code}: ${i.message}`).join('\n')}`)
-  return { plan: p.plan, head: snap.head, owner: snap.mind.doc?.owner || needGitea(ctx).owner }
+  return { plan: p.plan, head: snap.head, owner: snap.catalog.doc?.owner || needGitea(ctx).owner }
 }
 
 const workspaceOf = (reg: Registry, project: string) => reg.workspaces.find(w => w.project === project && w.id === project) ?? reg.workspaces.find(w => w.project === project)
@@ -285,7 +286,7 @@ const workspaceOf = (reg: Registry, project: string) => reg.workspaces.find(w =>
 // ---- roles ---------------------------------------------------------------------------
 
 export interface RoleHolder { project: string; workspace: string; workflow?: string }
-export interface RolesDoc { schema: string; plan: string; mind: string; applied: string; roles: Partial<Record<RoleName, RoleHolder>> }
+export interface RolesDoc { schema: string; plan: string; catalog: string; applied: string; roles: Partial<Record<RoleName, RoleHolder>> }
 
 export async function loadRoles(area: string): Promise<RolesDoc | null> {
   const t = await readTextOrNull(join(area, ROLES_FILE))
@@ -400,7 +401,7 @@ function runDeploy(cwd: string, env: Record<string, string>): Promise<{ code: nu
 
 export interface EntryReport { project: string; state: string; commit: string; status: 'done' | 'nothing' | 'pending' | 'refused' | 'failed'; actions: string[]; steps: SummonStep[]; problem?: string }
 export interface ApplyReport {
-  ok: boolean; dryRun: boolean; plan: string; mind: string; continued?: string
+  ok: boolean; dryRun: boolean; plan: string; catalog: string; continued?: string
   entries: EntryReport[]
   roles: { roles: RolesDoc['roles']; changed: boolean; problems: string[] }
   files: { file: string; changed: boolean; keys: string[] }[]
@@ -410,7 +411,7 @@ export interface ApplyReport {
 }
 
 const journalFile = (area: string) => join(summonDir(area), 'journal.json')
-interface Journal { schema: 'ag.summon-journal.v1'; plan: string; mind: string; started: string; finished?: string; entries: Record<string, { status: EntryReport['status']; at: string; steps: SummonStep[]; problem?: string }> }
+interface Journal { schema: 'ag.summon-journal.v1'; plan: string; catalog: string; started: string; finished?: string; entries: Record<string, { status: EntryReport['status']; at: string; steps: SummonStep[]; problem?: string }> }
 
 async function fastForwardWorkspace(ctx: SummonContext, path: string, steps: SummonStep[], label: string) {
   const g = needGitea(ctx)
@@ -436,8 +437,8 @@ export async function apply(ctx: SummonContext, o: { plan?: string; dryRun?: boo
     let continued: string | undefined
     if (!dry) {
       const prev = await readJson(journalFile(ctx.area)) as Journal | null
-      if (prev && !prev.finished && prev.plan === plan.name) { journal = prev; continued = prev.started; journal.mind = head }
-      else journal = { schema: 'ag.summon-journal.v1', plan: plan.name, mind: head, started: new Date().toISOString(), entries: {} }
+      if (prev && !prev.finished && prev.plan === plan.name) { journal = prev; continued = prev.started; journal.catalog = head }
+      else journal = { schema: 'ag.summon-journal.v1', plan: plan.name, catalog: head, started: new Date().toISOString(), entries: {} }
       await atomicWrite(journalFile(ctx.area), `${JSON.stringify(journal, null, 1)}\n`)
     }
     const fetched = new Set<string>(), seen = new Map<string, AcquiredRepo>()
@@ -531,7 +532,7 @@ export async function apply(ctx: SummonContext, o: { plan?: string; dryRun?: boo
     }
     if (!dry) {
       if (rolesChanged || !prevRoles) {
-        const doc: RolesDoc = { schema: ROLES_SCHEMA, plan: plan.name, mind: head, applied: new Date().toISOString(), roles }
+        const doc: RolesDoc = { schema: ROLES_SCHEMA, plan: plan.name, catalog: head, applied: new Date().toISOString(), roles }
         await atomicWrite(join(ctx.area, ROLES_FILE), `${JSON.stringify(doc, null, 1)}\n`)
       }
       for (const f of files) if (f.changed && f.after) await atomicWrite(f.file, `${JSON.stringify(f.after, null, 1)}\n`)
@@ -547,9 +548,9 @@ export async function apply(ctx: SummonContext, o: { plan?: string; dryRun?: boo
     }
     const changing = entries.filter(e => e.actions.length).length
     return {
-      ok: bad === 0, dryRun: dry, plan: plan.name, mind: head, ...(continued ? { continued } : {}),
+      ok: bad === 0, dryRun: dry, plan: plan.name, catalog: head, ...(continued ? { continued } : {}),
       entries, roles: { roles, changed: rolesChanged, problems }, files: files.map(f => ({ file: f.file, changed: f.changed, keys: f.keys })), deployments, observer,
-      message: `${dry ? 'Would apply' : 'Applied'} summonplan ${plan.name} (mind ${short(head)}): ${changing} of ${entries.length} entries ${dry ? 'would change' : 'changed'}${bad ? `, ${bad} refused or failed` : ''}; roles ${rolesChanged ? (dry ? 'would change' : 'written') : 'unchanged'}; ${files.filter(f => f.changed).length} configuration file(s) ${dry ? 'would change' : 'changed'}.`,
+      message: `${dry ? 'Would apply' : 'Applied'} summonplan ${plan.name} (catalog ${short(head)}): ${changing} of ${entries.length} entries ${dry ? 'would change' : 'changed'}${bad ? `, ${bad} refused or failed` : ''}; roles ${rolesChanged ? (dry ? 'would change' : 'written') : 'unchanged'}; ${files.filter(f => f.changed).length} configuration file(s) ${dry ? 'would change' : 'changed'}.`,
     }
   }, { what: 'a summon apply', timeoutMs: 2_000 })
 }
@@ -568,9 +569,9 @@ export async function status(ctx: SummonContext, o: { plan?: string } = {}) {
   const g = needGitea(ctx)
   const roles = await loadRoles(ctx.area)
   const filled = Object.fromEntries((Object.keys(ROLES) as RoleName[]).map(r => [r, roles?.roles?.[r] ?? null]))
-  const rolesFile = roles ? { plan: roles.plan, mind: roles.mind, applied: roles.applied } : null
-  // An installation with no mind repository or no plan yet: nothing is summoned, and no role is filled unless roles.json says so.
-  if (!o.plan && !(await loadMindSetting(ctx.area))?.plan) return { plan: null, mind: null, rolesFile, roles: filled, entries: [] as EntryStatus[], journal: null, note: 'no summonplan is applied here yet (agdevctl bootstrap-projects --plan <file>, or wfe mind init and wfe summon apply)' }
+  const rolesFile = roles ? { plan: roles.plan, catalog: roles.catalog ?? (roles as unknown as { mind?: string }).mind ?? '', applied: roles.applied } : null // "mind": a roles.json written before user_catalog p1
+  // An installation with no catalog or no plan yet: nothing is summoned, and no role is filled unless roles.json says so.
+  if (!o.plan && !(await loadCatalogSetting(ctx.area))?.plan) return { plan: null, catalog: null, rolesFile, roles: filled, entries: [] as EntryStatus[], journal: null, note: 'no summonplan is applied here yet (agdevctl bootstrap-projects --plan <file>, or wfe catalog init and wfe summon apply)' }
   const { plan, head } = await loadPlan(ctx, o.plan)
   const reg = await loadRegistry(ctx.registryFile)
   const entries: EntryStatus[] = await Promise.all(plan.entries.map(async (e): Promise<EntryStatus> => {
@@ -600,7 +601,7 @@ export async function status(ctx: SummonContext, o: { plan?: string } = {}) {
     }
     return { project: e.project, state: e.state, commit: e.commit, present, repository: `${owner}/${name}`, upstream: root?.upstream ?? null, workspace: ws?.id ?? null, roles: { planned, inEffect }, applied, detail }
   }))
-  return { plan: plan.name as string | null, mind: head as string | null, rolesFile, roles: filled, entries, journal: await readJson(journalFile(ctx.area)).catch(() => null), note: '' }
+  return { plan: plan.name as string | null, catalog: head as string | null, rolesFile, roles: filled, entries, journal: await readJson(journalFile(ctx.area)).catch(() => null), note: '' }
 }
 
 // ---- importing a development style (summoner p5 ex1) ------------------------------
@@ -619,14 +620,14 @@ export async function styleRequest(ctx: SummonContext, o: { user: string }) {
   const repo = styleCatalogOf(user)
   const r = await git(tmpdir(), ['ls-remote', '--', `${repo}.git`, 'refs/heads/main'], { env: { GIT_TERMINAL_PROMPT: '0' }, timeoutMs: 60_000 })
   const commit = r.code === 0 ? r.stdout.split(/\s/)[0] : ''
-  if (!COMMIT_PATTERN.test(commit)) throw new RequestError(404, `${user} has no public ${MIND_REPOSITORY} on GitHub (${repo}, branch main): there is no style to import`)
-  const raw = `https://raw.githubusercontent.com/${user}/${MIND_REPOSITORY}/${commit}/${CATALOG_PATH}`
+  if (!COMMIT_PATTERN.test(commit)) throw new RequestError(404, `${user} has no public ${CATALOG_REPOSITORY} on GitHub (${repo}, branch main): there is no style to import`)
+  const raw = `https://raw.githubusercontent.com/${user}/${CATALOG_REPOSITORY}/${commit}/${PROJECTS_PATH}`
   const res = await fetch(raw).catch(e => { throw new RequestError(502, `reading ${raw} failed: ${(e as Error).message}`) })
-  if (!res.ok) throw new RequestError(res.status === 404 ? 404 : 502, `${repo} has no ${CATALOG_PATH} at ${commit.slice(0, 10)} (${res.status})`)
-  const parsed = parseProjectCatalog(await res.text())
-  if (!parsed.ok) throw new RequestError(422, `${repo} ${CATALOG_PATH} cannot be read: ${parsed.problem.message}`)
-  const errors = validateCatalog(parsed.model).filter(i => i.severity === 'error')
-  if (errors.length) throw new RequestError(422, `${repo} ${CATALOG_PATH} has errors:\n${errors.map(i => `  ${i.code}: ${i.message}`).join('\n')}`)
+  if (!res.ok) throw new RequestError(res.status === 404 ? 404 : 502, `${repo} has no ${PROJECTS_PATH} at ${commit.slice(0, 10)} (${res.status})${res.status === 404 ? '; a catalog in the old layout publishes catalog.yaml: its owner runs wfe catalog migrate and publishes again' : ''}`)
+  const parsed = parseProjects(await res.text())
+  if (!parsed.ok) throw new RequestError(422, `${repo} ${PROJECTS_PATH} cannot be read: ${parsed.problem.message}`)
+  const errors = validateProjects(parsed.model).filter(i => i.severity === 'error')
+  if (errors.length) throw new RequestError(422, `${repo} ${PROJECTS_PATH} has errors:\n${errors.map(i => `  ${i.code}: ${i.message}`).join('\n')}`)
   if (!parsed.model.projects.length) throw new RequestError(422, `${repo} lists no projects`)
   const reg = await loadRegistry(ctx.registryFile)
   const ws = reg.workspaces.find(w => w.id === SUMMONER.project || w.project === SUMMONER.project)
@@ -634,7 +635,7 @@ export async function styleRequest(ctx: SummonContext, o: { user: string }) {
   const projects = parsed.model.projects.map(p => ({ project: p.project, description: p.description, roles: Object.keys(p.roles ?? {}) }))
   const text = `# Import ${user}'s development style
 
-Reproduce ${user}'s development style here and start developing: summon the projects of ${user}'s catalog ${repo} (${CATALOG_PATH} at ${commit}) that are not present here yet.
+Reproduce ${user}'s development style here and start developing: summon the projects of ${user}'s catalog ${repo} (${PROJECTS_PATH} at ${commit}) that are not present here yet.
 
 The catalog lists: ${projects.map(p => p.project).join(', ')}.
 

@@ -13,7 +13,7 @@
 // presentation, no confirmation, `accepts: person`. The parent did act on
 // clear discussion-activity reminders; the hypothesis is that the evidence
 // and a concrete correction at its receiving point improve delivery.
-import type { RunCatalog } from './catalog.ts'
+import type { RunCatalog } from './nodeCatalog.ts'
 import { latestResult, originText, type Delegation, type DelegationEvent, type ResultManifest } from './delegation.ts'
 import type { Workflow } from './model.ts'
 import { isNotes, isViewable, roleOf, substantiveNodes, type Reminder } from './reminders.ts'
