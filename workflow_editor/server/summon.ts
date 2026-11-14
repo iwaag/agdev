@@ -405,7 +405,7 @@ export interface ApplyReport {
   roles: { roles: RolesDoc['roles']; changed: boolean; problems: string[] }
   files: { file: string; changed: boolean; keys: string[] }[]
   deployments: SummonStep[]
-  restart: string[]
+  observer: string | null // what the observer does about a changed recovery role (it follows roles.json itself)
   message: string
 }
 
@@ -538,7 +538,7 @@ export async function apply(ctx: SummonContext, o: { plan?: string; dryRun?: boo
     }
     for (const e of entries) if (e.status === 'nothing' && e.actions.length) e.status = dry ? 'pending' : 'done'
     const recoveryChanged = !same(prevRoles?.roles?.recovery ?? null, roles.recovery ?? null) || !same(prevRoles?.roles?.coordination ?? null, roles.coordination ?? null) || !prevRoles
-    const restart = recoveryChanged ? ['observer (its [recovery] is rendered from roles.json: agdevctl services-config --restart)'] : []
+    const observer = recoveryChanged ? `the observer takes the recovery role from ${ROLES_FILE} at its next look (no restart)` : null
     const bad = entries.filter(e => e.status === 'refused' || e.status === 'failed').length + deployments.filter(d => d.status === 'failed').length
     if (journal && !dry) {
       journal.finished = new Date().toISOString()
@@ -548,7 +548,7 @@ export async function apply(ctx: SummonContext, o: { plan?: string; dryRun?: boo
     const changing = entries.filter(e => e.actions.length).length
     return {
       ok: bad === 0, dryRun: dry, plan: plan.name, mind: head, ...(continued ? { continued } : {}),
-      entries, roles: { roles, changed: rolesChanged, problems }, files: files.map(f => ({ file: f.file, changed: f.changed, keys: f.keys })), deployments, restart,
+      entries, roles: { roles, changed: rolesChanged, problems }, files: files.map(f => ({ file: f.file, changed: f.changed, keys: f.keys })), deployments, observer,
       message: `${dry ? 'Would apply' : 'Applied'} summonplan ${plan.name} (mind ${short(head)}): ${changing} of ${entries.length} entries ${dry ? 'would change' : 'changed'}${bad ? `, ${bad} refused or failed` : ''}; roles ${rolesChanged ? (dry ? 'would change' : 'written') : 'unchanged'}; ${files.filter(f => f.changed).length} configuration file(s) ${dry ? 'would change' : 'changed'}.`,
     }
   }, { what: 'a summon apply', timeoutMs: 2_000 })

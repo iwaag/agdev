@@ -10,7 +10,7 @@ a run's claim, the "next attempt" preview, the browser's editors and Context ove
 | Scope | Default (in the project's repositories) | Local (this WFE area, not in Git) |
 | --- | --- | --- |
 | System | the common execution contract (the execution host's, by hash at claim); for authoring, the authoring area's `AGENTS.md` and `docs/contract.md` (a reference) | blocks in `<area>/.local/contexts/system/`: e.g. the Developer's instructions and cagent's cluster summary |
-| Project | `project.yaml` intent and goals; `project.yaml` `guides` | blocks in `<area>/.local/contexts/projects/<project>/project/` |
+| Project | `project.yaml` intent and goals; why the project is here (the mind's plan entry and its braindumps, [mind.md](mind.md#why-a-project-is-here-in-its-runs)); `project.yaml` `guides` | blocks in `<area>/.local/contexts/projects/<project>/project/` |
 | Workflow | the workflow's intent; its `execution.guides` | blocks in `<area>/.local/contexts/projects/<project>/workflows/<workflow>/` |
 | Run | none: a run is created, not pre-authored | the run's input — its request, answers and instructions (run.json, `wfe run`) |
 
@@ -54,6 +54,14 @@ A bundle (`shared/context.ts`, `ag.wfe-context.v1`) lists sources, each with:
   active adjusted revision). Overrides come from the owning area's current
   settings. Authoring reads the selected project workspace and workflow file;
   a workflow without an identity yet gets system and project context only.
+- **Grounds.** `project/grounds` is the project's entry in the plan the
+  installation's mind names (state, source and commit, roles, note) and the
+  full text of each braindump it gives as `because`, read from the
+  service's clone of the mind repository (fetched at most every five
+  minutes). It is information about purpose, not a request. Without a mind
+  repository, or for a project the plan does not name, it is absent; a mind
+  that cannot be read makes it absent with the reason, never an error that
+  stops an attempt.
 - **Order.** System, project, workflow; within a scope the defaults first,
   then its blocks: instructions before information, each by id.
 - **Absence and errors.** A scope without blocks contributes nothing; a

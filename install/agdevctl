@@ -1528,10 +1528,10 @@ def cmd_bootstrap_projects(i: Instance, args) -> None:
     print(done.stdout or "", end="")
     if done.stderr:
         print(done.stderr, end="", file=sys.stderr)
-    # The Observer's [recovery] is rendered from roles.json; it reads it at start.
+    # The Observer reads the recovery role from roles.json itself (summoner p5); its settings are rendered
+    # again so that [recovery] agrees with it at the next start.
     write_service_settings(i)
-    start_native(i, ["observer"], restart=True)
-    say("observer settings follow roles.json; observer restarted")
+    say("observer settings follow roles.json (the observer reads it at its next look)")
     if done.returncode != 0:
         raise SystemExit(f"wfe summon apply did not finish cleanly ({done.returncode}); repeat bootstrap-projects to continue it")
 
@@ -2344,7 +2344,9 @@ def service_files(i: Instance, isolated: bool = False) -> list[tuple[Path, str, 
          f'wfe = ["{area}/bin/wfe"]\nworker = "{worker}"\nlanes = {json.dumps(lanes)}\ndrain_file = "{area}/.local/exec/drain"\n',
          i.core_account, None),
         (state / "agobserver" / "workflow.toml",
-         f'wfe = ["{area}/bin/wfe"]\nchannel = "agobserver-{i.slug}"\ninterval_seconds = 60\njudge = {judge}\n\n'
+         f'wfe = ["{area}/bin/wfe"]\nchannel = "agobserver-{i.slug}"\ninterval_seconds = 60\njudge = {judge}\n'
+         # The Observer follows the recovery role in roles.json by itself (summoner p5); isolated, it does not.
+         + ("" if isolated else f'roles = "{area}/roles.json"\n') + "\n"
          + recovery_section(i, on),
          i.monitor_account, None),
         (state / "agobserver" / "instance.toml", f'name = "agobserver-{i.slug}"\n', i.monitor_account, None),

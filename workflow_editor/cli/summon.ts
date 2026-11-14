@@ -48,7 +48,7 @@ function applyText(r: Report): string {
   lines.push('', `roles${r.roles.changed ? (r.dryRun ? ' (would change)' : ' (written)') : ' (unchanged)'}:`, ...Object.entries(r.roles.roles).map(([k, h]) => `  ${k}: ${h!.project}${h!.workflow ? `/${h!.workflow}` : ''} (workspace ${h!.workspace})`), ...r.roles.problems.map(p => `  problem: ${p}`))
   for (const f of r.files) lines.push(`${f.file}: ${f.changed ? `${r.dryRun ? 'would change' : 'changed'} ${f.keys.join(', ')}` : f.keys.length ? f.keys.join(', ') : 'unchanged'}`)
   if (r.deployments.length) lines.push('deployments:', ...stepLines(r.deployments))
-  if (r.restart.length) lines.push(`restart: ${r.restart.join('; ')}`)
+  if (r.observer && !r.dryRun) lines.push(`observer: ${r.observer}`)
   return lines.join('\n')
 }
 

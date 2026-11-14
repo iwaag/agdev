@@ -184,6 +184,8 @@ channel = "agobserver-a"          # the name incident notes are kept under (outb
 interval_seconds = 60
 judge = true                      # local-model judgments (role wftriage)
 [timing]                          # optional overrides for trials (seconds; wfclassify.TIMING)
+roles = "<area>/roles.json"       # when present, [recovery] follows its recovery role at each look after it
+                                  # changes (summoner p5); without the file the section below stands
 [recovery]                        # the recovery path (wfrecover); agdevctl renders it from <area>/roles.json
 enabled = true                    # with no workflow (the recovery role not filled), there is no recovery path:
                                   # recoverable incidents are told to the owners (summoner p2)

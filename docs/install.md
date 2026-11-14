@@ -57,6 +57,37 @@ environments and `install/` resources. `service/current` selects one for every s
 
 ## Setup
 
+### From GitHub, on a new Linux host
+
+The shortest path, on the host itself (Ubuntu 24.04, x86-64; a user that can `sudo`). The
+installation's own Gitea then holds the core, and the installation develops it from there:
+
+```sh
+sudo apt-get install -y git python3
+git clone https://github.com/iwaag/agdev ~/agdev && cd ~/agdev
+sudo install/prepare-host                      # Docker, packages, Node, uv, Claude Code under /opt/agdev-tools
+ROOT=/srv/agdev                                # the installation root; any path
+sudo mkdir -p $ROOT/config
+sudo install/make-bundles --core . --out $ROOT/bundles
+sudo cp install/instance.example.toml $ROOT/config/instance.toml
+sudoedit $ROOT/config/instance.toml
+```
+
+In `instance.toml`: `slug`, `root` (= `$ROOT`), `public_host` (a name the host and your browsers
+resolve; the host's mDNS name `<hostname>.local` works on a home LAN), `[owner]` (your Gitea
+account), and `[tools]` as `prepare-host` printed them. Leave `[source]` out: the core is built from
+`<owner>/agdev` on this installation's Gitea, which `import-sources` fills from the bundle. Leave
+`[alerts]` out unless you have a Slack bot token; without it, owner notices are kept,
+unsent, in the Observer's outbox (its health record counts them). Then continue with `init` below, using `install/agdevctl` of the
+clone (`init` installs its own copy into `$ROOT/config/install/`). `pyagag`, the one external
+dependency, is fetched from GitHub when the release is built.
+
+The WFE page is then `http://<public_host>:<ports.web>/wfe/`, the conversation page `/hangout/`
+on the same origin, and Gitea `http://<public_host>:<ports.gitea>/` (the owner's password is in
+`$ROOT/config/secrets/`).
+
+### The steps
+
 ```sh
 # On a machine with the core repository: the core's bundle (projects are summoned, not bundled).
 install/make-bundles --core . [--core-ref <rev>] --out <bundles>
@@ -103,8 +134,8 @@ wfe request propose --workspace summoner --author <you> --braindump <file>
 The run reads your braindumps, the installation's plan and the catalogs your wish points at
 (`<user>/agdev-mind`, `catalog.yaml`; it knows `iwaag/agdev-mind`), proposes a revised plan
 with the reasons for each project, and asks you. When you agree, it adds your wish to the mind
-as a braindump, writes the plan and runs `wfe summon apply`. If apply says the observer must be
-restarted (the recovery role became filled), run `$A services-config --restart`.
+as a braindump, writes the plan and runs `wfe summon apply`. The observer takes the recovery role
+from `area/roles.json` at its next look; nothing needs a restart.
 
 With a plan of your own instead:
 
@@ -118,7 +149,7 @@ It creates or attaches the mind repository (`wfe mind init`), writes the plan th
 `summoned` entry is acquired from its source into this Gitea at its commit (with history
 and submodules), registered and obtained; the roles are recorded in `area/roles.json`, the
 keys they own in `workers.json`, `conversations.json` and `submitters.json` follow, the
-conversation page is deployed, and the Observer's `[recovery]` is rendered from the roles.
+conversation page is deployed, and the Observer follows the recovery role in `roles.json`.
 Without `--plan` it applies the plan the mind repository names, or, when it names none, the
 core's reference above; repeating it continues an interrupted apply. A source that needs a credential to read takes it from `agdev-cred`
 (an active `gitea-token` entry whose target is the source's origin).

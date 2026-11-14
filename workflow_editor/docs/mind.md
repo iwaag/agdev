@@ -151,6 +151,16 @@ Gitea credentials are the service's own (`gitea.json`).
 not a mind repository (no `mind.yaml` with `ag.mind.v1`). A mind repository
 that already exists is attached, not recreated.
 
+## Why a project is here, in its runs
+
+Every agent of a project the plan names is told why the project is here
+(summoner p5): the run context's project scope has a source
+`project/grounds` ([context.md](context.md)) with the plan's entry for the
+project (state, source and commit, the roles it fills, its note) and the full
+text of each braindump in its `because`. A summoned project's agent therefore
+knows that it was summoned, for what, and on whose words. `wfe mind why
+<project>` shows the same relation.
+
 ## Surfaces
 
 | CLI | API | |

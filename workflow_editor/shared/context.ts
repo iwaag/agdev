@@ -29,7 +29,7 @@ export type ContextCategory = 'default' | 'override' | 'input'
 export type ContextPurpose = 'execution' | 'authoring'
 export type ContextDelivery = 'body' | 'reference' | 'absent' | 'error'
 // 'override' is a p13 snapshot's single local override; p14 bundles have blocks.
-export type ContextKind = 'contract' | 'block' | 'override' | 'intent' | 'guide' | 'input'
+export type ContextKind = 'contract' | 'block' | 'override' | 'intent' | 'grounds' | 'guide' | 'input'
 
 export interface ContextOrigin {
   file?: string // a portable path: project-relative, or the context store's logical path
@@ -41,7 +41,7 @@ export interface ContextOrigin {
 }
 
 export interface ContextSource {
-  key: string // stable within a bundle: system/contract, system/block/<id>, project/intent, guide/<key>, project/block/<id>, workflow/intent, workflow/block/<id>, run/input
+  key: string // stable within a bundle: system/contract, system/block/<id>, project/intent, project/grounds, guide/<key>, project/block/<id>, workflow/intent, workflow/block/<id>, run/input
   scope: ContextScope
   category: ContextCategory
   kind: ContextKind

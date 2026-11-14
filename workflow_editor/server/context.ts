@@ -8,7 +8,8 @@
 //   system    default   the common execution contract (the execution host's, by hash at claim)
 //                       or, for authoring, the authoring area's entry documents (a reference)
 //             local     the blocks of <area>/.local/contexts/system/
-//   project   default   project.yaml intent and goals; project.yaml guides
+//   project   default   project.yaml intent and goals; why the project is here (the mind's plan entry
+//                       and the braindumps behind it, summoner p5); project.yaml guides
 //             local     the blocks of …/projects/<project>/project/
 //   workflow  default   the workflow's intent; its execution.guides
 //             local     the blocks of …/projects/<project>/workflows/<workflow>/
@@ -84,6 +85,7 @@ export async function resolveContext(ctx: AccessContext, i: ResolveInput): Promi
   } else {
     sources.push({ key: 'project/intent', scope: 'project', category: 'default', kind: 'intent', applies: both, title: 'intent and goals', origin: { file: 'project.yaml' }, provenance: ['project.yaml'], delivery: 'error', note: read.problem?.message ?? 'project.yaml cannot be read' })
   }
+  sources.push(await groundsSource(ctx, projectId, both))
   // Guides: project.yaml first, then the workflow's own; one source per guide.
   const guides = new Map<string, { scope: 'project' | 'workflow'; provenance: string[]; ref: string }>()
   for (const g of project?.guides ?? []) { const k = guideKey(g); if (!guides.has(k)) guides.set(k, { scope: 'project', provenance: ['project.yaml guides'], ref: g }) }
@@ -121,6 +123,44 @@ export async function resolveContext(ctx: AccessContext, i: ResolveInput): Promi
   const bundle: ContextBundle = { schema: CONTEXT_SCHEMA, purpose: i.purpose, project: projectId, workflow: workflowId, run: i.run?.run ?? null, resolved: new Date().toISOString(), sources, fingerprint: '' }
   bundle.fingerprint = fingerprintOf(bundle)
   return bundle
+}
+
+// Why this project is here (summoner p5, docs/mind.md): its entry in the plan
+// the installation's mind names, and the braindumps that entry gives as its
+// grounds, in full. An installation without a mind repository, or a project
+// outside the plan, has nothing here (absent). A mind that cannot be read is
+// said so but never stops an attempt: the grounds are information.
+async function groundsSource(ctx: AccessContext, project: string, applies: ContextSource['applies']): Promise<ContextSource> {
+  const base = { key: 'project/grounds', scope: 'project' as const, category: 'default' as const, kind: 'grounds' as const, applies, provenance: ['the mind repository'] }
+  try {
+    const m = await import('./mind.ts')
+    if (!await m.loadMindSetting(ctx.area)) return { ...base, title: 'why this project is here', origin: {}, delivery: 'absent', note: 'this installation has no mind repository' }
+    const mctx = { area: ctx.area, registryFile: ctx.registryFile, gitea: ctx.gitea as unknown as import('./gitea.ts').Gitea, giteaProblem: ctx.giteaProblem }
+    const snap = await m.mindSnapshot(mctx, { maxAgeMs: 300_000, withText: true })
+    const plan = snap.plans.find(p => p.name === snap.setting.plan)?.plan ?? null
+    const e = plan?.entries.find(x => x.project === project) ?? null
+    const repo = `${snap.setting.repository.owner}/${snap.setting.repository.name}`
+    const origin = { project: repo, file: `summonplans/${snap.setting.plan}.yaml`, commit: snap.head }
+    if (!e) return { ...base, title: 'why this project is here', origin, delivery: 'absent', note: plan ? `plan ${snap.setting.plan} has no entry for ${project}` : `the mind names plan ${snap.setting.plan || '(none)'}, which cannot be read` }
+    const roles = Object.entries(e.roles ?? {}).map(([r, v]) => (v === true ? r : `${r} (workflow ${v})`))
+    const lines = [
+      `This installation has ${project} because its plan \`${snap.setting.plan}\` in the mind repository ${repo} names it${plan!.intent ? ` (plan intent: ${plan!.intent})` : ''}.`,
+      '',
+      `- State: ${e.state}${e.state === 'summoned' ? ` (obtained from ${e.source} at ${e.commit ?? '?'})` : ` (present before the plan described it; source ${e.source})`}`,
+      `- Core roles it fills here: ${roles.length ? roles.join(', ') : 'none'}`,
+      ...(e.note ? [`- Note: ${e.note}`] : []),
+      `- Grounds: ${e.because.length ? e.because.join(', ') : 'none recorded'}`,
+    ]
+    for (const p of e.because) {
+      const b = snap.braindumps.find(x => x.path === p)
+      lines.push('', `### ${p}${b?.updated ? ` (by ${b.updated.author}, ${b.updated.at.slice(0, 10)})` : ''}`, '', b ? (b.text ?? '').trim() : '(missing from the mind repository)')
+    }
+    lines.push('', 'These are the person\'s reasons for having this project here; read them as purpose, not as a request to act on. `wfe mind why ' + project + '` shows the same.')
+    const text = lines.join('\n')
+    return { ...base, title: `why ${project} is here`, origin, delivery: 'body', text, sha256: sha256(text) }
+  } catch (err) {
+    return { ...base, title: 'why this project is here', origin: {}, delivery: 'absent', note: `the mind repository could not be read: ${(err as Error).message}` }
+  }
 }
 
 // The blocks of one scope, each a source: its rendered section is what it

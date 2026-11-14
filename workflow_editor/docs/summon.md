@@ -102,7 +102,12 @@ A role that is not filled removes its key. The `Observer` submitter is then
 removed. A file is written only when its parsed content changes. WFE reads
 these files on each request, so no restart is needed.
 
-The observer's configuration is the installer's: `agdevctl services-config`
+The observer follows the recovery role by itself (summoner p5): its
+`workflow.toml` names `roles = "<area>/roles.json"`, and at each look after the
+file changed it takes `[recovery]` from it (the recovery role's workflow and
+workspace, the coordination workflow exempt, off when the role is not filled).
+An apply that changes the holder therefore needs no restart. The installer
+still renders the same section as a starting value: `agdevctl services-config`
 (and `area-init`, `bootstrap-projects`) render `[recovery]` of the Observer's
 `workflow.toml` from `roles.json`. They use `workflow = "<project>/<workflow>"`,
 `workspace`, and `exempt` = the coordination workflow. When the recovery role
@@ -179,7 +184,7 @@ apply refuses and someone merges first (summoner p2, step 7).
 installation receives its projects: `wfe mind init` when there is no mind
 repository, `wfe mind plan put` and `plan use` for the file, the dry run, then
 `wfe summon apply --yes`, and the observer's settings rendered from
-`roles.json` with a restart. Without `--plan` it applies the plan the mind
+`roles.json` (the observer follows the file itself). Without `--plan` it applies the plan the mind
 repository names, and continues an interrupted apply ([install.md](../../docs/install.md)).
 
 When the mind names no plan yet, `bootstrap-projects` without `--plan` uses the

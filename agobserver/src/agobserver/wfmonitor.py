@@ -60,6 +60,7 @@ class Settings:
     timing: dict[str, float] = field(default_factory=dict)
     recovery: dict[str, Any] = field(default_factory=dict)
     judge: bool = True
+    roles: str | None = None  # <area>/roles.json: when present, the recovery role there is [recovery] (summoner p5)
 
     @staticmethod
     def load(path: Path) -> "Settings":
@@ -70,7 +71,7 @@ class Settings:
         return Settings(wfe=list(wfe) if isinstance(wfe, list) else [str(wfe)], channel=str(data.get("channel") or "observer"),
                         interval=float(data.get("interval_seconds") or 60), enabled=bool(data.get("enabled", True)),
                         timing={k: float(v) for k, v in (data.get("timing") or {}).items()}, recovery=dict(data.get("recovery") or {}),
-                        judge=bool(data.get("judge", True)))
+                        judge=bool(data.get("judge", True)), roles=str(data["roles"]) if data.get("roles") else None)
 
     @property
     def recovery_workflows(self) -> tuple[str, ...]:
@@ -80,6 +81,29 @@ class Settings:
         wf = self.recovery.get("workflow")
         exempt = [str(x) for x in (self.recovery.get("exempt") or [])]
         return ((str(wf),) if wf else ()) + tuple(exempt)
+
+
+def recovery_from_roles(doc: dict, base: dict[str, Any]) -> dict[str, Any]:
+    """[recovery] from an `ag.roles.v1` document (workflow_editor docs/summon.md): the recovery role's
+    workflow and workspace, the coordination role's workflow exempt; off when the role is not filled.
+    Other keys of `base` (timeouts, requester) are kept."""
+    keep = {k: v for k, v in (base or {}).items() if k not in ("enabled", "workflow", "workspace", "exempt")}
+    roles = doc.get("roles") or {}
+    r, c = roles.get("recovery"), roles.get("coordination")
+    if not r or not r.get("workflow"):
+        return {**keep, "enabled": False}
+    return {**keep, "enabled": True, "workflow": f'{r["project"]}/{r["workflow"]}', "workspace": r.get("workspace") or r["project"],
+            "exempt": [f'{c["project"]}/{c["workflow"]}'] if c and c.get("workflow") else []}
+
+
+def make_recoverer(cfg: dict[str, Any], log: Callable[[str], None]) -> Any:
+    if cfg.get("enabled") and cfg.get("workflow"):
+        from .wfrecover import Recoverer
+
+        log(f"recovery: incidents go to {cfg['workflow']} (the recovery role)")
+        return Recoverer(cfg, log=log)
+    log("recovery: the recovery role is not filled here; recoverable incidents are told to the owners")
+    return None
 
 
 def wfe_observe(cmd: list[str], runs: list[str] | None = None, timeout: float = 90.0, workspace: str | None = None) -> tuple[dict | None, str | None]:
@@ -168,6 +192,7 @@ class WorkflowMonitor:
         self.last_findings: dict[str, wc.Finding] = {}
         self.last_doc: dict = {}
         self.spent = {"judgments": 0, "posts": 0}
+        self.roles_seen: tuple | None = None
 
     # ---- posting --------------------------------------------------------------------
 
@@ -197,7 +222,34 @@ class WorkflowMonitor:
             self.write_health(done)
         return summary
 
+    def follow_roles(self) -> None:
+        """The recovery role as `roles.json` has it now: a summon apply that changes the holder takes
+        effect at the next look, without a restart (summoner p5). Without the file, [recovery] stands."""
+        if not self.s.roles:
+            return
+        path = Path(self.s.roles)
+        try:
+            st = path.stat()
+            key = (st.st_mtime_ns, st.st_size)
+        except OSError:
+            return
+        if key == self.roles_seen:
+            return
+        try:
+            doc = json.loads(path.read_text())
+        except (OSError, json.JSONDecodeError) as error:
+            self.log(f"roles not read ({path}): {error}")
+            return
+        self.roles_seen = key
+        cfg = recovery_from_roles(doc, self.s.recovery)
+        if cfg == self.s.recovery and (self.recoverer is not None) == bool(cfg.get("enabled") and cfg.get("workflow")):
+            return
+        self.log(f"roles.json (plan {doc.get('plan')}): the recovery role is {cfg.get('workflow') or 'not filled'}")
+        self.s.recovery = cfg
+        self.recoverer = make_recoverer(cfg, self.log)
+
     def _look(self, now: float) -> dict[str, Any]:
+        self.follow_roles()
         doc, error = self.observe(None)
         if doc is None:
             if self.source["state"] != "failed":
@@ -578,14 +630,7 @@ def main(argv: list[str] | None = None) -> int:
         from .wftriage import judge as triage
 
         judge = Judge(lambda incident, fact, evidence, seconds: triage(SPEC, incident, fact, evidence, seconds), log=log)
-    recoverer = None
-    if settings.recovery.get("enabled") and settings.recovery.get("workflow"):
-        from .wfrecover import Recoverer
-
-        recoverer = Recoverer(settings.recovery, log=log)
-        log(f"recovery: incidents go to {settings.recovery['workflow']} (the recovery role)")
-    else:
-        log("recovery: the recovery role is not filled here; recoverable incidents are told to the owners")
+    recoverer = make_recoverer(settings.recovery, log)
     monitor = WorkflowMonitor(settings, store, poster, judge=judge, recoverer=recoverer, health_path=args.state / HEALTH_FILE, log=log)
     if args.once:
         print(json.dumps(monitor.look(), indent=1, default=str))

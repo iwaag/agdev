@@ -22,14 +22,13 @@ has them, live elsewhere.
 
 ## Getting started
 
-1. Clone this repository and build a release: `scripts/wfe-release.sh build <area> HEAD`, where
-   `<area>` is a folder with a `registry.json` (`{"approver":"","workspaces":[]}` is enough for a
-   first build). It builds `workflow_editor/` and the system code and fetches no managed project;
-   Node.js with npm is needed, and `pyagag` comes from GitHub ([PROVENANCE.md](PROVENANCE.md)).
-   A build from a clean checkout of this tree was run once by the publisher (about 10 s on a warm
-   npm cache).
-2. Install it from your own inputs: copy `install/instance.example.toml` and follow
-   [docs/install.md](docs/install.md). [Transfer to a new owner](docs/transfer.md) and
+1. On the host that will run it (Ubuntu 24.04 is the tried case), clone this repository, run
+   `install/prepare-host`, make the core's bundle and write your `instance.toml`:
+   [From GitHub, on a new Linux host](docs/install.md#from-github-on-a-new-linux-host). The
+   installation's own Gitea then holds the core; `pyagag` comes from GitHub when the release is
+   built ([PROVENANCE.md](PROVENANCE.md)).
+2. Run the setup steps of [docs/install.md](docs/install.md#the-steps) (`init` … `install-lifecycle`)
+   and log the model harness in. [Transfer to a new owner](docs/transfer.md) and
    [adopting an existing installation's state](docs/migration.md) are separate guides.
 3. Receive the summoner: `agdevctl bootstrap-projects`. With no plan yet, it applies the core's
    one reference, `install/bootstrap/summonplan.yaml`: the summoner
