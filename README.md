@@ -27,13 +27,14 @@ has them, live elsewhere.
    [From GitHub, on a new Linux host](docs/install.md#from-github-on-a-new-linux-host). The
    installation's own Gitea then holds the core; `pyagag` comes from GitHub when the release is
    built ([PROVENANCE.md](PROVENANCE.md)).
-2. Run the setup steps of [docs/install.md](docs/install.md#the-steps) (`init` … `install-lifecycle`)
-   and log the model harness in. [Transfer to a new owner](docs/transfer.md) and
+2. Run the command sequence of the same section (`init` … `install-lifecycle`, the model login as
+   the core account); [The steps](docs/install.md#the-steps) explains each. [Transfer to a new owner](docs/transfer.md) and
    [adopting an existing installation's state](docs/migration.md) are separate guides.
 3. Receive the summoner: `agdevctl bootstrap-projects`. With no plan yet, it applies the core's
    one reference, `install/bootstrap/summonplan.yaml`: the summoner
    ([iwaag/pj-summoner](https://github.com/iwaag/pj-summoner)) at an exact commit.
-4. Say what you want: write a braindump (for example "reproduce iwaag's development style and
+4. In the WFE page, write what the machine is for in the system context, then say what you
+   want: write a braindump (for example "reproduce iwaag's development style and
    start developing") and request `summoner/propose` with it. It reads catalogs of shared projects
    such as [iwaag/agdev-mind](https://github.com/iwaag/agdev-mind) (warden, ponderer and
    aghangout, public at `iwaag/pj-warden`, `iwaag/pj-ponderer`, `iwaag/pj-aghangout`), proposes a
@@ -44,7 +45,10 @@ has them, live elsewhere.
 
 ## What has been tried
 
-On one Linux VM (Ubuntu 24.04, x86-64, 4 vCPU, 8 GiB RAM) the whole stack ran; a laptop (Ubuntu)
+The path above ran end to end once from this repository alone on a new VM (Ubuntu 24.04, 4 vCPU,
+8 GiB): about 5 minutes to a healthy core, then the owner's braindump, the summoner's proposal and
+agreement brought the support projects and filled the six roles. Earlier, on one Linux VM (Ubuntu
+24.04, x86-64, 4 vCPU, 8 GiB RAM) the whole stack ran; a laptop (Ubuntu)
 ran a candidate; a Mac (macOS 26, Apple silicon) ran two installations side by side and rehearsed
 adopting a large installation's state. These are single runs by the author, not independent
 reproductions. Measurements and what is not covered: [docs/install.md](docs/install.md#what-has-been-tried).

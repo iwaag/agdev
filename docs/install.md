@@ -533,6 +533,16 @@ What is not covered: nothing notifies the owner while the clock gate holds the m
 while the alert destination (Slack) is unreachable — alerts then stay queued. Both show in `agdevctl status`, so look there. Whole-VM or
 parent loss has no independent check.
 
+From GitHub alone, as a newcomer would: a new Proxmox VM (Ubuntu 24.04 cloud image, 4 vCPU,
+8 GiB, 64 GB), [From GitHub, on a new Linux host](#from-github-on-a-new-linux-host) as written.
+
+- From `apt-get` to a healthy core took about 5 minutes; the first release build about 1.5 minutes.
+- The owner then did the rest in the browser: a note in the system context, one braindump to
+  `summoner/propose`, `agree` to its proposal. Apply brought warden, ponderer and aghangout at the
+  catalog's commits and filled the six roles; the observer took the recovery role at its next look.
+  A facilitated conversation then made a new project and its first work, admitted by coordination.
+- Not seen there: a failed run handed to recovery (none failed).
+
 A Mac: macOS 26.2, Apple silicon, 32 cores, OrbStack for Docker.
 
 - Two installations ran at once under one user's LaunchAgents, one with its own Gitea and Zulip and one
