@@ -178,8 +178,16 @@ and start developing", and request the summoner's `propose` workflow with it, in
 wfe request propose --workspace summoner --author <you> --braindump <file>
 ```
 
+To import the development style of a GitHub user who publishes `<user>/mycatalog`, naming the
+user is enough: *Import a development style* on the Mind page, or
+
+```sh
+wfe summon style <user> --dry-run           # the catalog it would propose from
+wfe summon style <user> --author <you>      # requests summoner/propose with that wish
+```
+
 The run reads your braindumps, the installation's plan and the catalogs your wish points at
-(`<user>/agdev-mind`, `catalog.yaml`; it knows `iwaag/agdev-mind`), proposes a revised plan
+(`<user>/mycatalog`, `catalog.yaml`; it knows `iwaag/mycatalog`), proposes a revised plan
 with the reasons for each project, and asks you. When you agree, it adds your wish to the mind
 as a braindump, writes the plan and runs `wfe summon apply`. The observer takes the recovery role
 from `area/roles.json` at its next look; nothing needs a restart.

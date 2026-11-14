@@ -190,19 +190,19 @@ A target project needs a `publication-edit` workflow (the project's own agent, t
 | `github.com/iwaag/pj-warden` | warden: the `recovery` and `coordination` roles | `pj-warden` |
 | `github.com/iwaag/pj-ponderer` with `study-argue`, `wedo-argue` | ponderer: `facilitation`, `conversation-archive` | `pj-ponderer` and its submodules |
 | `github.com/iwaag/pj-aghangout` | aghangout: `conversation-page`, `dialogue-renderer` | `pj-aghangout` |
-| `github.com/iwaag/agdev-mind` | the owner's catalog (`catalog.yaml`, `mind.yaml`) | the owner's mind repository |
+| `github.com/iwaag/mycatalog` | the owner's catalog (`catalog.yaml`, `mind.yaml`) | the owner's mind repository |
 | `github.com/iwaag/pj-forge`, `pj-agsfx`, `wedo-sfx` | other shared projects (not role projects) | their Gitea repositories |
 
 Each is an edited derivative with its own history. A public commit's message names the internal
 commit it was made from, and the target workspace's journal records the pair. The catalog in
-`agdev-mind` is where a summoner finds the role projects (`workflow_editor/docs/mind.md`), and it
+`mycatalog` is where a summoner finds the role projects (`workflow_editor/docs/mind.md`), and it
 names their public commits. An installation that already has a project (an `adopted` plan entry)
 keeps its internal one; nothing compares the two histories.
 
 **Publishing an update** of a project: request `publisher/publish` for it ("update", with what
 changed). The publisher builds from the integrated `main`, and the public history continues. A new
 public commit of a role project is then a catalog change (its `commit`) in the mind repository, and
-`agdev-mind` is republished by hand with this tool from a clone of the mind repository outside the
+`mycatalog` is republished by hand with this tool from a clone of the mind repository outside the
 service's (`build`, read, `stage`, `push`). Installations that summoned the project move to it by a
 plan revision (fast-forward).
 

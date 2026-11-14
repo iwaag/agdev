@@ -129,7 +129,7 @@ for talking with the project agents; workflow_editor p15).
   read failure is shown as such, never as an empty list. The Project Editor's
   "Add existing repository" searches the registry and adds one as a submodule
   of that project only; other projects keep their gitlinks.
-- **Mind (summoner p1).** `<owner>/agdev-mind` on Gitea (`<area>/mind.json`,
+- **Mind (summoner p1).** `<owner>/mycatalog` on Gitea (`<area>/mind.json`,
   registry category `mind`) holds the user's braindumps (`braindumps/<slug>.md`):
   the grounds of this installation's projects. Summonplans
   (`summonplans/<name>.yaml`, `ag.summonplan.v1`) say which projects make them

@@ -36,11 +36,13 @@ has them, live elsewhere.
 4. In the WFE page, write what the machine is for in the system context, then say what you
    want: write a braindump (for example "reproduce iwaag's development style and
    start developing") and request `summoner/propose` with it. It reads catalogs of shared projects
-   such as [iwaag/agdev-mind](https://github.com/iwaag/agdev-mind) (warden, ponderer and
+   such as [iwaag/mycatalog](https://github.com/iwaag/mycatalog) (warden, ponderer and
    aghangout, public at `iwaag/pj-warden`, `iwaag/pj-ponderer`, `iwaag/pj-aghangout`), proposes a
    summonplan with its reasons, asks you, and applies it once you agree
    ([docs/install.md](docs/install.md), [workflow_editor/docs/summon.md](workflow_editor/docs/summon.md),
-   [workflow_editor/docs/mind.md](workflow_editor/docs/mind.md)). A plan of your own works too:
+   [workflow_editor/docs/mind.md](workflow_editor/docs/mind.md)). To import the style of any
+   GitHub user who publishes `<user>/mycatalog`, naming the user is enough: *Import a development
+   style* on the Mind page, or `wfe summon style <user> --author <you>`. A plan of your own works too:
    `agdevctl bootstrap-projects --plan <summonplan>`.
 
 ## What has been tried

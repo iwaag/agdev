@@ -5,6 +5,7 @@ import type { SummonContext, SummonStep } from '../server/summon.ts'
 export const SUMMON_HELP = `wfe summon apply [<plan>] [--dry-run] [--yes]
 wfe summon status [<plan>]
 wfe summon acquire <source> <commit> [--name <local name>] [--project <id> --register] [--dry-run]
+wfe summon style <github user> --author <who> [--dry-run]
 
 apply      make this installation match a summonplan of its mind repository
            (default: the plan mind.json names). Shows per entry what will
@@ -21,7 +22,12 @@ status     per entry: the plan's commit against the present one, the
            upstream recorded, the roles in effect, and whether it is applied
 acquire    one repository (and its submodules) into this Gitea, without a
            plan: <owner>/<name from the URL, or --name>; --register also
-           registers it as project --project`
+           registers it as project --project
+style      import a user's development style: read github.com/<user>/mycatalog
+           (catalog.yaml on main, pinned to its commit) and request
+           summoner/propose with the wish to reproduce that style. The
+           summoner proposes; nothing arrives before a person agrees in its
+           run. --dry-run shows the catalog and the request without making it.`
 
 export interface SummonCli {
   positional: string[]
@@ -32,6 +38,7 @@ export interface SummonCli {
   refused: (m: string) => Error
   ctx: () => Promise<SummonContext>
   confirm: (question: string) => Promise<boolean>
+  request: (o: { workspace: string; workflow: string; text: string; author: string; receipt: string }) => Promise<{ message: string; data: unknown }>
 }
 
 const mark: Record<SummonStep['status'], string> = { done: 'done  ', kept: 'kept  ', would: 'would ', refused: 'REFUSE', failed: 'FAILED' }
@@ -75,6 +82,17 @@ export async function summonCommand(c: SummonCli): Promise<number> {
       const r = await s.apply(ctx, { plan })
       c.out(applyText(r), r)
       return r.ok ? 0 : 1
+    }
+    if (sub === 'style') {
+      if (!a1) throw c.usage('wfe summon style <github user> --author <who> [--dry-run]')
+      const author = c.opt('author')
+      if (!author && !c.flag('dry-run')) throw c.usage('--author <person> is required: who asks to import the style')
+      const r = await s.styleRequest(ctx, { user: a1 })
+      const head = [`${r.catalog} @ ${short(r.commit)}: ${r.projects.length} project(s)`, ...r.projects.map(p => `  ${p.project.padEnd(14)} ${p.description}${p.roles.length ? `  (roles: ${p.roles.join(', ')})` : ''}`)]
+      if (c.flag('dry-run')) { c.out([...head, '', `Would request ${r.workspace}/${r.workflow} with:`, '', r.text].join('\n'), r); return 0 }
+      const q = await c.request({ workspace: r.workspace, workflow: r.workflow, text: r.text, author: author!, receipt: `style-${r.user}-${r.commit.slice(0, 12)}-${Date.now()}` })
+      c.out([...head, '', q.message, 'The summoner writes a proposal and asks in its run before anything is applied.'].join('\n'), { ...r, request: q.data })
+      return 0
     }
     if (sub === 'status' || sub === undefined) {
       const r = await s.status(ctx, { plan: a1 })

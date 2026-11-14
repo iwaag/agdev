@@ -174,6 +174,7 @@ export function renderMindView(root: HTMLElement): ViewHandle {
       ...v.problems.map(p => h('div.banner.warn', p)),
       v.issues.length ? h('ul.issues', v.issues.map(x => h(`li.${x.issue.severity}`, `${x.where}: ${x.issue.message}`))) : null))
     if (editing === '') main.append(h('section.card', h('h2', 'New braindump'), editor()))
+    main.append(styleCard())
     const grounded = v.projects.filter(p => p.braindumps.length).length
     main.append(h('section.card.mind-relations',
       h('div.card-head', h('h2', 'Braindumps and projects'), h('span.muted.small', `${v.braindumps.length} braindumps · ${grounded} of ${v.projects.length} projects grounded`)),
@@ -187,6 +188,31 @@ export function renderMindView(root: HTMLElement): ViewHandle {
           h('td', !p.entry ? h('span.muted', 'not in the plan') : p.braindumps.length ? h('div.chips', p.braindumps.map(b => h('a.chip', { href: '#/mind', onclick: (e: Event) => { e.preventDefault(); pick('braindump', b.slug) }, title: b.title }, b.slug + (b.missing ? ' (missing)' : '')))) : h('span.chip.warn', 'no ground')),
           h('td.small', p.entry ? roleText(p.entry.roles) : ''),
           h('td.small.muted', appliedChip(p.project), p.entry ? `${p.entry.state} · ${p.entry.commit.slice(0, 7)}${p.entry.note ? ` · ${p.entry.note}` : ''}` : '')))))))
+  }
+
+  // summoner p5 ex1: naming a GitHub user who publishes <user>/mycatalog is
+  // enough to import their development style. Checking first shows the
+  // catalog; requesting starts summoner/propose, which asks before applying.
+  const styleUser = h('input', { placeholder: 'GitHub user', 'aria-label': 'GitHub user', size: 16 })
+  let styleOut: HTMLElement | null = null
+  function styleCard() {
+    const run = (dry: boolean) => {
+      const user = styleUser.value.trim()
+      if (!user) return
+      if (!dry && !author.value.trim()) { styleOut = h('div.banner.warn', 'Give your name as the author of changes first.'); render(); return }
+      styleOut = h('p.muted.small', dry ? 'Reading the catalog…' : 'Requesting…'); render()
+      void api.summonStyle(user, author.value.trim(), dry).then(r => {
+        styleOut = h('div',
+          h('p.small', h('a', { href: r.catalog, target: '_blank', rel: 'noopener' }, r.catalog), ` @ ${r.commit.slice(0, 7)}: `, r.projects.map(p => p.project).join(', ')),
+          dry ? h('div.row', h('button.primary', { onclick: () => run(false) }, `Ask the summoner to propose ${r.user}'s style`))
+            : h('p.small', 'Requested. ', r.href ? h('a', { href: r.href }, 'Open the summoner\'s run') : null, ' — it writes a proposal and asks you before anything is applied.'))
+        render()
+      }, e => { styleOut = h('div.banner.error', (e as Error).message); render() })
+    }
+    return h('section.card.mind-style', h('h2', 'Import a development style'),
+      h('p.muted.small', 'Name a GitHub user who publishes their catalog as <user>/mycatalog. The summoner proposes the projects of that catalog that are not here yet, and asks you before anything is applied.'),
+      h('div.row', styleUser, h('button', { onclick: () => run(true) }, 'Read the catalog')),
+      styleOut)
   }
 
   render()

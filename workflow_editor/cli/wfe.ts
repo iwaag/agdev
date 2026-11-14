@@ -2583,6 +2583,13 @@ async function cmdSummon(p: Parsed): Promise<number> {
       const rl = createInterface({ input: process.stdin, output: process.stdout })
       try { return /^y(es)?$/i.test((await rl.question(`${question} [y/N] `)).trim()) } finally { rl.close() }
     },
+    request: async o => {
+      const x = await openExec(p)
+      try {
+        const r = await x.request({ ...o, via: 'cli' })
+        return { message: `${r.duplicate ? 'Already requested (same receipt)' : 'Requested'}: run ${r.ref.workflow}/${r.ref.run} in ${o.workspace}; job ${r.job.id} is ${r.job.state}.`, data: r }
+      } finally { x.close(); execStore = undefined }
+    },
   })
 }
 

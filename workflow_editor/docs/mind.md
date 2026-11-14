@@ -24,11 +24,13 @@ grounded differently in two installations.
 
 ## The repository
 
-An ordinary Gitea repository with a fixed name, `agdev-mind`, owned by the user
-it belongs to (for example `<owner>/agdev-mind`).
+An ordinary Gitea repository with a fixed name, `mycatalog`, owned by the user
+it belongs to (for example `<owner>/mycatalog`). The repository is called the
+*mind repository* in this document and in `wfe mind`; its fixed name is the
+name under which others find it.
 
 ```text
-agdev-mind/
+mycatalog/
   mind.yaml                  # ag.mind.v1: owner, title
   braindumps/<slug>.md       # free text; the file name is the identity
   summonplans/<name>.yaml    # ag.summonplan.v1; one per installation or style
@@ -39,8 +41,8 @@ agdev-mind/
 **Publication** is the owner's choice. The repository always stays on the
 cluster's Gitea. A copy on GitHub, if any, is made with the external
 publication tools (docs/external-publication.md in the core), under the same
-fixed name: `<github user>/agdev-mind`. A summoner looks there for a user's
-shared projects. The owner of this core publishes `iwaag/agdev-mind`, with
+fixed name: `<github user>/mycatalog`. A summoner looks there for a user's
+shared projects. The owner of this core publishes `iwaag/mycatalog`, with
 `catalog.yaml` and `mind.yaml` only (its `owner` becomes the public account);
 braindumps and summonplans stay internal, and a catalog entry's `because`
 then only says that grounds exist. Nothing in the
@@ -73,7 +75,7 @@ title: "developer's mind"
 schema: ag.summonplan.v1
 name: my-plan                       # = the file name
 intent: "one line on what this set of projects is for"
-grounds: <commit of agdev-mind the plan was written against>
+grounds: <commit of the mind repository the plan was written against>
 entries:
   - project: warden                 # the managed project id
     source: http://gitea.example/<owner>/pj-warden.git   # any Git URL
@@ -136,7 +138,7 @@ offer the same role: choosing between them is the plan's work.
 `<area>/mind.json`, written by `wfe mind init`:
 
 ```json
-{ "repository": { "id": 412, "owner": "developer", "name": "agdev-mind" }, "branch": "main", "plan": "my-plan" }
+{ "repository": { "id": 412, "owner": "developer", "name": "mycatalog" }, "branch": "main", "plan": "my-plan" }
 ```
 
 `plan` names the summonplan that describes this installation. The repository
@@ -147,9 +149,24 @@ Gitea, and a change counts only once Gitea has it. A push that loses a race is
 tried once more on the new head. The clone never holds work of its own. The
 Gitea credentials are the service's own (`gitea.json`).
 
-`wfe mind init` refuses when `<owner>/agdev-mind` exists with content that is
+`wfe mind init` refuses when `<owner>/mycatalog` exists with content that is
 not a mind repository (no `mind.yaml` with `ag.mind.v1`). A mind repository
 that already exists is attached, not recreated.
+
+## Importing a development style
+
+A user who publishes `<github user>/mycatalog` on GitHub, public, with a valid
+`catalog.yaml` on `main`, has a development style that others can import by
+naming the user: `wfe summon style <user> --author <who>`, `POST
+api/summon/style {user, author, dryRun?}`, or *Import a development style* on
+the Mind page. The core reads `catalog.yaml` at the head of `main`, refuses a
+user without such a repository or with a catalog that has errors or no
+projects, and requests `summoner/propose` with the wish to reproduce that
+user's style, naming the catalog and the commit it read. The summoner proposes
+the catalog's projects that are not present, explains them, and asks; nothing
+is acquired, registered or wired before the person agrees in that run. A user's
+catalog on another host is read only when a braindump or request names it; the
+convention by user name is GitHub's.
 
 ## Why a project is here, in its runs
 

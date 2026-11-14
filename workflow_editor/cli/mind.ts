@@ -19,14 +19,14 @@ wfe mind plan check <file>
 wfe mind plan put <file> --author <who> [--message <m>]
 wfe mind plan use <name>
 
-The mind repository (<owner>/agdev-mind on this installation's Gitea) holds a
+The mind repository (<owner>/mycatalog on this installation's Gitea) holds a
 user's braindumps: free text on what they want and why, the grounds of the
 projects here and of the resources they use. A summonplan
 (summonplans/<name>.yaml, ag.summonplan.v1) says which projects make those
 braindumps concrete, from which Git URL at which commit, filling which roles,
 and which braindumps ground each (because). docs/mind.md has the formats.
 
-init       create <owner>/agdev-mind on Gitea (mind.yaml, braindumps/,
+init       create <owner>/mycatalog on Gitea (mind.yaml, braindumps/,
            summonplans/, catalog.yaml), register it (category mind) and record
            it in <area>/mind.json; an existing mind repository is attached; a
            same-named repository that is not one is refused. --plan names the

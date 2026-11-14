@@ -795,6 +795,15 @@ export function createHandler(config: ServiceConfig) {
           const input = await body(req) as Record<string, unknown>
           return send(res, 200, await s.apply(ctx, { plan: typeof input.plan === 'string' ? input.plan : undefined, dryRun: input.dryRun === true }))
         }
+        // Importing a user's development style (summoner p5 ex1): read
+        // github.com/<user>/mycatalog and request summoner/propose with it.
+        if (wsId === 'style' && !b && method === 'POST') {
+          const input = await body(req) as Record<string, unknown>
+          const r = await s.styleRequest(ctx, { user: str(input.user, 'user') })
+          if (input.dryRun === true) return send(res, 200, r)
+          const q = await needExec().request({ workspace: r.workspace, workflow: r.workflow, text: r.text, author: str(input.author, 'author'), receipt: `style-${r.user}-${r.commit.slice(0, 12)}-${Date.now()}`, via: 'browser' })
+          return send(res, 201, { ...r, request: q, href: `#/ws/${encodeURIComponent(r.workspace)}/run/${encodeURIComponent(q.ref.workflow)}/${encodeURIComponent(q.ref.run)}` })
+        }
         throw new RequestError(404, `no route for ${method} ${url.pathname}`)
       }
 

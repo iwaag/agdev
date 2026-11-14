@@ -325,7 +325,7 @@ export async function putPlan(ctx: MindContext, o: { text: string; author: strin
 
 // ---- creation and attachment ---------------------------------------------------
 
-const README = (owner: string) => `# agdev-mind
+const README = (owner: string) => `# ${MIND_REPOSITORY}
 
 ${owner}'s mind repository for agdev (docs/mind.md in agdev's workflow_editor).
 

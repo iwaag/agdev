@@ -8,7 +8,12 @@ import { ID_PATTERN, type Issue, type ShapeIssue } from './model.ts'
 export const MIND_SCHEMA = 'ag.mind.v1'
 export const SUMMONPLAN_SCHEMA = 'ag.summonplan.v1'
 export const PROJECT_CATALOG_SCHEMA = 'ag.catalog.v1'
-export const MIND_REPOSITORY = 'agdev-mind' // the fixed repository name, under its user
+export const MIND_REPOSITORY = 'mycatalog' // the fixed repository name, under its user
+// A user's published catalog is <STYLE_HOST>/<user>/mycatalog: naming a GitHub
+// user is enough to import that user's development style (wfe summon style).
+export const STYLE_HOST = 'https://github.com'
+export const GITHUB_USER_PATTERN = /^[A-Za-z0-9](?:[A-Za-z0-9]|-(?=[A-Za-z0-9])){0,38}$/
+export const styleCatalogOf = (user: string) => `${STYLE_HOST}/${user}/${MIND_REPOSITORY}`
 export const MIND_FILE = 'mind.yaml'
 export const CATALOG_PATH = 'catalog.yaml'
 export const BRAINDUMP_DIR = 'braindumps'

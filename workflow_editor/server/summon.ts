@@ -9,7 +9,7 @@ import { spawn } from 'node:child_process'
 import { mkdir, readFile, rename, stat } from 'node:fs/promises'
 import { dirname, join, posix, resolve } from 'node:path'
 import { tmpdir } from 'node:os'
-import { COMMIT_PATTERN, ROLES, validateSummonplan, type RoleName, type Summonplan } from '../shared/mind.ts'
+import { CATALOG_PATH, COMMIT_PATTERN, GITHUB_USER_PATTERN, MIND_REPOSITORY, ROLES, styleCatalogOf, validateCatalog, validateSummonplan, type RoleName, type Summonplan } from '../shared/mind.ts'
 import { gitmodules, obtainWorkspace } from './agdev.ts'
 import { atomicWrite, readTextOrNull } from './files.ts'
 import { git } from './git.ts'
@@ -19,7 +19,7 @@ import { loadMindSetting, mindSnapshot, type MindContext } from './mind.ts'
 import { loadRegistry, recordUpstream, registerRepository, repoKey, RegistryError, type Registry, type RepoCategory } from './registry.ts'
 import { sourceRootOf } from './layout.ts'
 import { categoryOf, RequestError } from './workspace.ts'
-import { parseProject } from './yamlDoc.ts'
+import { parseProject, parseProjectCatalog } from './yamlDoc.ts'
 import { registerGiteaProject } from './agdev.ts'
 
 export type SummonContext = MindContext
@@ -601,4 +601,44 @@ export async function status(ctx: SummonContext, o: { plan?: string } = {}) {
     return { project: e.project, state: e.state, commit: e.commit, present, repository: `${owner}/${name}`, upstream: root?.upstream ?? null, workspace: ws?.id ?? null, roles: { planned, inEffect }, applied, detail }
   }))
   return { plan: plan.name as string | null, mind: head as string | null, rolesFile, roles: filled, entries, journal: await readJson(journalFile(ctx.area)).catch(() => null), note: '' }
+}
+
+// ---- importing a development style (summoner p5 ex1) ------------------------------
+
+// The project and workflow that turn a wish into a proposal: the summoner the
+// core's bootstrap reference brings (install/bootstrap/summonplan.yaml).
+export const SUMMONER = { project: 'summoner', workflow: 'propose' } as const
+
+// What `wfe summon style <github user>` hands the summoner: the user's public
+// catalog <STYLE_HOST>/<user>/mycatalog, read at its main now and pinned to
+// that commit, and a wish to reproduce that user's development style. Only a
+// proposal follows; nothing is acquired before a person agrees in the run.
+export async function styleRequest(ctx: SummonContext, o: { user: string }) {
+  const user = o.user.trim().replace(/^@/, '')
+  if (!GITHUB_USER_PATTERN.test(user)) throw new RequestError(400, `"${o.user}" is not a GitHub user name`)
+  const repo = styleCatalogOf(user)
+  const r = await git(tmpdir(), ['ls-remote', '--', `${repo}.git`, 'refs/heads/main'], { env: { GIT_TERMINAL_PROMPT: '0' }, timeoutMs: 60_000 })
+  const commit = r.code === 0 ? r.stdout.split(/\s/)[0] : ''
+  if (!COMMIT_PATTERN.test(commit)) throw new RequestError(404, `${user} has no public ${MIND_REPOSITORY} on GitHub (${repo}, branch main): there is no style to import`)
+  const raw = `https://raw.githubusercontent.com/${user}/${MIND_REPOSITORY}/${commit}/${CATALOG_PATH}`
+  const res = await fetch(raw).catch(e => { throw new RequestError(502, `reading ${raw} failed: ${(e as Error).message}`) })
+  if (!res.ok) throw new RequestError(res.status === 404 ? 404 : 502, `${repo} has no ${CATALOG_PATH} at ${commit.slice(0, 10)} (${res.status})`)
+  const parsed = parseProjectCatalog(await res.text())
+  if (!parsed.ok) throw new RequestError(422, `${repo} ${CATALOG_PATH} cannot be read: ${parsed.problem.message}`)
+  const errors = validateCatalog(parsed.model).filter(i => i.severity === 'error')
+  if (errors.length) throw new RequestError(422, `${repo} ${CATALOG_PATH} has errors:\n${errors.map(i => `  ${i.code}: ${i.message}`).join('\n')}`)
+  if (!parsed.model.projects.length) throw new RequestError(422, `${repo} lists no projects`)
+  const reg = await loadRegistry(ctx.registryFile)
+  const ws = reg.workspaces.find(w => w.id === SUMMONER.project || w.project === SUMMONER.project)
+  if (!ws) throw new RequestError(409, `no ${SUMMONER.project} here to propose a plan: run agdevctl bootstrap-projects first (it brings the summoner by the core's reference)`)
+  const projects = parsed.model.projects.map(p => ({ project: p.project, description: p.description, roles: Object.keys(p.roles ?? {}) }))
+  const text = `# Import ${user}'s development style
+
+Reproduce ${user}'s development style here and start developing: summon the projects of ${user}'s catalog ${repo} (${CATALOG_PATH} at ${commit}) that are not present here yet.
+
+The catalog lists: ${projects.map(p => p.project).join(', ')}.
+
+(Requested with wfe summon style ${user}.)
+`
+  return { ok: true, user, catalog: repo, commit, projects, workspace: ws.id, workflow: SUMMONER.workflow, text }
 }

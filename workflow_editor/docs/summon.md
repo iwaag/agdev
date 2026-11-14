@@ -192,7 +192,7 @@ core's one reference, `install/bootstrap/summonplan.yaml`: one `summoned` entry,
 the **summoner** (`https://github.com/iwaag/pj-summoner`), at an exact commit,
 with no roles and no grounds. It is written as the plan named after the
 installation's slug. The summoner's `propose` workflow then turns the person's
-braindumps into the rest of the plan: it reads catalogs (`<user>/agdev-mind`),
+braindumps into the rest of the plan: it reads catalogs (`<user>/mycatalog`),
 proposes, asks, and only after agreement calls `wfe mind plan put` and
 `wfe summon apply`. That is the only project the core names. Moving the
 reference to a newer summoner is a change of that file's `commit`, published
@@ -205,6 +205,7 @@ with the core.
 | `wfe summon apply [<plan>] [--dry-run] [--yes]` | `POST api/summon/apply {plan?, dryRun?}` | default plan: `mind.json` `plan`. The CLI always shows the dry run first; without `--yes` it asks, and without a terminal it does not apply. |
 | `wfe summon status [<plan>]` | `GET api/summon` | as above |
 | `wfe summon acquire <source> <commit> [--name] [--project --register] [--dry-run]` | | one repository and its submodules, without a plan |
+| `wfe summon style <github user> --author <who> [--dry-run]` | `POST api/summon/style {user, author, dryRun?}` | reads `github.com/<user>/mycatalog` and requests `summoner/propose` with it ([mind.md](mind.md#importing-a-development-style)) |
 
 The Mind page shows the indicator as a chip in the Entry column of "Projects and
 why they are here", with the detail, upstream and roles in its tooltip.

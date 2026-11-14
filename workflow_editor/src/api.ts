@@ -108,6 +108,7 @@ const drafts = (id: string) => `${ws(id)}/drafts`
 // The mind repository (summoner p1, docs/mind.md): types of server/mind.ts.
 export type MindViewResponse = Awaited<ReturnType<typeof import('../server/mind.ts').mindView>>
 export type SummonStatusResponse = Awaited<ReturnType<typeof import('../server/summon.ts').status>>
+export type SummonStyle = Awaited<ReturnType<typeof import('../server/summon.ts').styleRequest>>
 export type MindView = import('../server/mind.ts').MindView
 export type MindWhy = Awaited<ReturnType<typeof import('../server/mind.ts').why>>
 export type MindBraindump = Awaited<ReturnType<typeof import('../server/mind.ts').braindump>>
@@ -116,6 +117,8 @@ type MindChange = { ok: boolean; message: string; commit: string; changed: boole
 export const api = {
   mind: (refresh = false) => call<MindViewResponse>('GET', `api/mind${refresh ? '?refresh=1' : ''}`),
   summon: () => call<SummonStatusResponse>('GET', 'api/summon'),
+  // summoner p5 ex1: a GitHub user's development style, from <user>/mycatalog.
+  summonStyle: (user: string, author: string, dryRun = false) => call<SummonStyle & { href?: string }>('POST', 'api/summon/style', { user, author, dryRun }),
   mindWhy: (project: string) => call<MindWhy>('GET', `api/mind/why/${encodeURIComponent(project)}`),
   mindBraindump: (slug: string) => call<MindBraindump>('GET', `api/mind/braindumps/${encodeURIComponent(slug)}`),
   mindAdd: (slug: string, text: string, author: string) => call<MindChange>('POST', 'api/mind/braindumps', { slug, text, author }),
