@@ -1,4 +1,4 @@
-# The catalog: braindumps, reviews, challenges, summonplans, shared projects (user_catalog p1, p2)
+# The catalog: braindumps, reviews, challenges, summonplans, shared projects (user_catalog p1–p4)
 
 agdev's core is the workflow and the record of *why* projects exist. The
 projects themselves (warden, ponderer, aghangout and every other) are outside
@@ -390,6 +390,78 @@ is acquired, registered or wired before the person agrees in that run. A user's
 catalog on another host is read only when a braindump or request names it; the
 convention by user name is GitHub's.
 
+## Citing a braindump
+
+A person who talks in a conversation, or asks a workflow for work, can **cite**
+braindumps of the catalog (user_catalog p4). Citing is offered and never
+required: a request may stand alone.
+
+- **What a citation is.** `{kind: braindump, id: <path>, commit, title,
+  sha256}`: the braindump's path, the catalog commit it was cited at (the
+  catalog's head when the message or request was accepted, or the commit named
+  with `<path>@<commit>`), the title it had and the hash of its text then. A
+  path or a commit that does not resolve is refused when the message is sent.
+  Only this installation's catalog can be cited.
+- **What the receiving run gets.** One file per cited braindump,
+  `attachments/braindump-<path with "/" as "--">@<commit12>.md` (for example
+  `attachments/braindump-agdev_philosophy--p3@0123456789ab.md`), and the
+  reference with that file in `run.json` `input.attachments[]`. The file says
+  what it is, then holds the braindump's text at the cited commit, its review
+  as it was then with its author and date (or that none existed), and the
+  names of the projects this installation's plan grounded on it then. The
+  projects' records are not included. A later edit of the braindump never
+  changes the file; `wfe catalog braindump show <path>` is the present text.
+- **How it is labelled.** As the ground of this request: what the person
+  stands on when asking. It is not an instruction to carry out in full, and it
+  is not a preference. The run's brief names cited braindumps apart from
+  challenges and files, in those words.
+- **Where it is made.** `cites` on a person's message (`POST
+  api/conversations/<id>/messages`, the creation route with `text`, the
+  facilitation start; `wfe conversation post|start --cite <path>[@<commit>]`),
+  and on a request (`POST api/workspaces/<id>/runs`; `wfe request … --cite`,
+  `wfe run create … --cite`). In a conversation the citation is stored with
+  the message, beside its challenges (the store's `attachments` rows, kind
+  `braindump`), and every run started for that message is given it: a
+  one-to-one partner's run, the conductor's, and a project's run the
+  conductor asked about that message ([conversations.md](conversations.md)).
+- **Changed since.** The conversation view lists the citations of each
+  message with `changed` (the last change of the braindump's text when it is
+  no longer what was cited, else `null`) and `removed`. What was cited stays
+  as it was.
+- **A preference is never cited.** Every run has every preference already. A
+  challenge keeps its own attachment ([challenges.md](challenges.md)); the two
+  kinds stay two kinds.
+
+### Back references
+
+Each citation is recorded where it is made, one line in
+`<area>/.local/citations.jsonl`: `{braindump, commit, at, by, where}`, with
+`where` a conversation's message (`{kind: conversation, conversation,
+message}`) or a run whose request named it (`{kind: run, workspace, project,
+workflow, run}`). A run started for a conversation's message is reached
+through that conversation and has no record of its own. Runs and
+conversations are never scanned for citations, and nothing from before
+user_catalog p4 exists to be found.
+
+`GET api/catalog/braindumps/<path>` and `wfe catalog braindump show <path>`
+return them as `citedBy`, newest first, each with `label`, `href` (a run's
+view; a conversation opens in the conversation client) and `changed` (whether
+the text differs now from the cited commit). `GET api/catalog` gives the
+count per braindump (`cited`). The summoner's `review` reads `citedBy` as
+evidence of work done toward a braindump.
+
+### From the Catalog page
+
+An opened braindump card has, beside *Ask for a review*, **Talk about this**
+(a new conversation in the conversation client with the braindump cited in
+its composer: `<hangout>/?cite=<path>`) and **Request work** (a project and
+one of its published workflows are chosen and the request is written; it is
+sent as the person's request with the citation). Each entry of the index
+that links to a braindump or to a challenge has the same two; an entry of a
+challenge attaches the challenge (`<hangout>/?attach=<id>`, the request
+route's `challenges`). The card lists **Cited by**. A preference card has
+none of this.
+
 ## Why a project is here, in its runs
 
 Every agent of a project the plan names is told why the project is here
@@ -411,7 +483,8 @@ words, and what of that was already said to be real. `wfe catalog why
 | `wfe catalog init [--title] [--plan <name>] --author <a>` | | create or attach |
 | `wfe catalog status` | `GET api/catalog` | repository, head, plan, braindumps (title, excerpt, review author and date, published) and their projects, the index, the challenges by state, projects with their grounds, issues |
 | `wfe catalog braindump list` | (in `GET api/catalog`) | |
-| `wfe catalog braindump show <path>` | `GET api/catalog/braindumps/<path>` | text, review, history, projects, plans |
+| `wfe catalog braindump show <path>` | `GET api/catalog/braindumps/<path>` | text, review, history, projects, plans, `citedBy` |
+| `wfe conversation post … --cite <path>[@<commit>]`, `wfe request … --cite`, `wfe run create … --cite` | `cites` of `POST api/conversations/<id>/messages` and of `POST api/workspaces/<id>/runs` | cite a braindump (*Citing a braindump*) |
 | `wfe catalog braindump add <path> --file/--text --author` | `POST api/catalog/braindumps {id, text, author}` | 409 when it exists |
 | `wfe catalog braindump edit <path> --file/--text --author [--base <commit>]` | `PUT api/catalog/braindumps/<path> {text, author, base?}` | 409 when changed after `base` |
 | `wfe catalog braindump remove <path> --author [--force]` | `DELETE api/catalog/braindumps/<path> {author, force?}` | refused while a plan's `because` names it, unless forced; removes its review too |
@@ -436,7 +509,7 @@ words, and what of that was already said to be real. `wfe catalog why
 
 In JSON a braindump carries `id` (its path), `path` (the file), `title`,
 `excerpt`, `updated`, `published`, `review` (`path`, `updated`, `published`,
-or `null`) and `changedAfterReview`. `GET api/catalog` carries no full text:
+or `null`), `changedAfterReview` and `cited` (how many citations). `GET api/catalog` carries no full text:
 a braindump's `text` and its review's are in `GET
 api/catalog/braindumps/<path>`.
 
@@ -445,7 +518,7 @@ The browser shows the same data under **Catalog** on Home (`#/catalog`;
 and date, the note when something changed since, **Refresh the index**).
 Below it are the braindumps grouped by folder path, as titles with excerpts;
 a braindump's text and review are read when it is opened, and edited in the
-same place; **Ask for a review** is on each. Then **Preferences**: each file
+same place; **Ask for a review**, **Talk about this** and **Request work** are on each, with what cited it (**Cited by**). Then **Preferences**: each file
 rendered, with its author and date, edited in place. Then the challenges by state,
 each linking to its challenge page. Braindumps, reviews and the index are
 rendered as Markdown; HTML in a text is shown, not run. Each braindump and

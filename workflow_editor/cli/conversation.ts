@@ -5,7 +5,7 @@
 // the same command under its former name.
 import { readFileSync } from 'node:fs'
 import { resolve } from 'node:path'
-import { attachRequests, CONVERSATION_ID, ConversationStore, parseRunName, RELATIONS, runName, viewBaseOf, type MessageKind, type Relation } from '../server/conversations.ts'
+import { attachRequests, citeRequests, CONVERSATION_ID, ConversationStore, parseRunName, RELATIONS, runName, viewBaseOf, type MessageKind, type Relation } from '../server/conversations.ts'
 import { ConversationArchive } from '../server/conversationArchive.ts'
 import { ConversationService, type Requester, type TitleSkip } from '../server/conversationService.ts'
 import { ConversationWorkflows, type WorkflowRef, type WorkflowRelation, type WorkflowRole } from '../server/conversationWorkflows.ts'
@@ -133,13 +133,18 @@ create <id> --title <t> [--author <person>] [--member <project>]… [--default <
                               requester is whoever requested that run
 post <id> (--text <t> | --file <f>) --author <person> [--with <project>] [--to <participant>]…
      [--run <run>]… [--re <msg>]… [--token <t>] [--via <way>] [--challenge <id>[@<commit>]]…
-     [--attach <path>]…
+     [--cite <path>[@<commit>]]… [--attach <path>]…
                               the person's message, verbatim, routed as above (refused from an
                               executing attempt). --with: whom a new id is with (creates a
                               one-to-one conversation). --challenge attaches a challenge pinned to
-                              its current revision (or the commit named). --attach sends a file
+                              its current revision (or the commit named). --cite cites a braindump
+                              of the catalog (its path; wfe catalog braindump list) as the ground
+                              the words stand on, pinned to the catalog's head now (or the commit
+                              named): whoever the message reaches is given its text, its review
+                              and the projects grounded on it, and the braindump records the
+                              message under "cited by". --attach sends a file
                               with it (p19; the text may then be empty; see files below)
-start <id> (--text <t> | --file <f>) --author <person> [--token <t>] [--re <msg>]… [--challenge …]
+start <id> (--text <t> | --file <f>) --author <person> [--token <t>] [--re <msg>]… [--challenge …] [--cite …]
                               ask the conductor to lead: an explicit start with a brief (the
                               person's words to the conductor) from the current history. The
                               conversation, its members, questions, runs and attachments stay
@@ -337,7 +342,7 @@ export async function conversationCommand(c: ConversationCli): Promise<number> {
             : `${m.participant ?? m.author} (${m.author}${m.run ? ` for ${m.run}` : ''}${m.invitation ? `, request ${m.invitation}` : ''})`
           lines.push('', `#${m.id} ${m.at} ${head}${m.kind !== 'message' ? ` [${m.kind}${m.question ? ` ${m.question}` : ''}${m.node ? ` node ${m.node}` : ''}]` : ''}${m.re.length ? ` re ${m.re.map(n => `#${n}`).join(', ')}` : ''}${after}`)
           lines.push(...m.text.split('\n').map(l => `    ${l}`))
-          for (const a of m.attachments ?? []) lines.push(a.kind === 'file' ? `    [file ${a.ordinal}] ${a.name} (${a.mime}, ${a.bytes} bytes) ${a.id} — wfe conversation fetch ${id} --message ${m.id} --attachment ${a.id}` : `    [challenge] ${a.id} "${a.title}" at ${a.commit.slice(0, 12)}`)
+          for (const a of m.attachments ?? []) lines.push(a.kind === 'file' ? `    [file ${a.ordinal}] ${a.name} (${a.mime}, ${a.bytes} bytes) ${a.id} — wfe conversation fetch ${id} --message ${m.id} --attachment ${a.id}` : a.kind === 'braindump' ? `    [cites braindump] ${a.id} "${a.title}" at ${a.commit.slice(0, 12)}${a.removed ? ' — removed from the catalog since' : a.changed ? ` — changed since (${a.changed.author}, ${a.changed.at.slice(0, 10)}, ${a.changed.commit.slice(0, 12)}); now: wfe catalog braindump show ${a.id}` : ''}` : `    [challenge] ${a.id} "${a.title}" at ${a.commit.slice(0, 12)}`)
           for (const l of v.links.filter(l => l.message === m.id && !v.links.some(y => y.supersedes === l.id))) lines.push(`    → ${l.relation} ${l.run} by ${l.by}: ${l.note}`)
         }
         lines.push('', 'Requests:', ...v.requests.map(i => `  ${i.id} → ${i.participant} (${i.role ?? '?'} ${i.target}) by ${i.by}${i.byRun ? ` ${i.byRun}` : ''}${i.awaits ? ', awaited result' : i.awaitedBy ? ', awaited' : ''}${i.instruct ? ', instruction' : ''}: ${i.state}${i.late ? ' (late)' : ''}${i.run ? ` ${i.run}` : ''}${i.answeredBy ? ` answered by #${i.answeredBy}` : ''}${i.error ? ` — ${i.error}` : ''}${i.held ? ` [continuation held: ${i.held}]` : ''}; about ${i.source.map(n => `#${n}`).join(', ')}; "${i.question.split('\n')[0].slice(0, 100)}"`))
@@ -385,7 +390,7 @@ export async function conversationCommand(c: ConversationCli): Promise<number> {
         const o = await own()
         if (o) throw c.refused(`post is the person's route; ${o.run} speaks as itself: wfe conversation reply, or announce from the conductor (quote the request and name whose it is)`, { code: 'not-person' })
         const files = await attached()
-        const r = await ds.post(id, { text: text({ optional: files.length > 0 }), author, token: c.opt('token') ?? `cli-${Date.now()}-${process.pid}`, re: ids('re'), to: c.opts('to'), runs: c.opts('run'), via: c.opt('via'), with: c.opt('with'), title: c.opt('title'), challenges: attachRequests(c.opts('challenge')), files })
+        const r = await ds.post(id, { text: text({ optional: files.length > 0 }), author, token: c.opt('token') ?? `cli-${Date.now()}-${process.pid}`, re: ids('re'), to: c.opts('to'), runs: c.opts('run'), via: c.opt('via'), with: c.opt('with'), title: c.opt('title'), challenges: attachRequests(c.opts('challenge')), cites: citeRequests(c.opts('cite')), files })
         const rows = cs.fileRows({ message: r.message.id })
         c.out(`${r.duplicate ? 'Already posted (same token)' : 'Posted'}: #${r.message.id} in ${id}${r.created ? ' (created)' : ''}${r.reopened ? ' (reopened)' : ''}${rows.length ? ` with ${rows.length} file(s): ${rows.map(f => `${f.ordinal}. ${f.name} ${f.attachment}`).join(', ')}` : ''}; ${r.invitations.map(i => `request ${i.id} → ${i.participant} (${i.role}): ${i.state}${i.run ? ` ${i.run}` : ''}${i.error ? ` — ${i.error}` : ''}`).join('; ')}.`, { ok: true, ...r, files: rows })
         return 0
@@ -394,7 +399,7 @@ export async function conversationCommand(c: ConversationCli): Promise<number> {
         const id = args[0]; if (!id) throw c.usage('start needs <id>')
         const author = c.opt('author'); if (!author) throw c.usage('--author <person> is required: who asks the conductor to lead')
         if (await own()) throw c.refused('starting facilitation is the person\'s act (the conductor creating a conversation from its attempt leads it from creation: wfe conversation create)', { code: 'not-person' })
-        const r = await ds.startFacilitation(id, { text: text(), author, token: c.opt('token') ?? `cli-${Date.now()}-${process.pid}`, re: ids('re'), via: c.opt('via'), challenges: attachRequests(c.opts('challenge')) })
+        const r = await ds.startFacilitation(id, { text: text(), author, token: c.opt('token') ?? `cli-${Date.now()}-${process.pid}`, re: ids('re'), via: c.opt('via'), challenges: attachRequests(c.opts('challenge')), cites: citeRequests(c.opts('cite')) })
         c.out(`${r.duplicate ? 'Already started (same token)' : 'Facilitation started'}: ${r.facilitation.workspace}/${r.facilitation.workflow} leads ${id} from #${r.facilitation.horizon}; brief #${r.posted.message.id}; ${r.posted.invitations.map(i => `request ${i.id} (${i.role}): ${i.state}${i.run ? ` ${i.run}` : ''}${i.error ? ` — ${i.error}` : ''}`).join('; ')}.`, { ok: true, ...r })
         return 0
       }

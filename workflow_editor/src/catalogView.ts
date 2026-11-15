@@ -13,7 +13,7 @@ import { api, type CatalogBraindump, type CatalogView } from './api.ts'
 import { h, when } from './dom.ts'
 import type { ViewHandle } from './main.ts'
 import { renderMarkdown, type LinkResolver } from './markdown.ts'
-import { hangoutHref, siteLinks } from './site.ts'
+import { conversationHref, hangoutHref, siteLinks } from './site.ts'
 
 const SVG = 'http://www.w3.org/2000/svg'
 const AUTHOR_KEY = 'wfe.catalog.author'
@@ -93,6 +93,11 @@ export function relationDiagram(v: CatalogView, onPick: (kind: 'braindump' | 'pr
 type Bd = CatalogView['braindumps'][number]
 const challengeHref = (id: string) => `${hangoutHref()}?challenge=${encodeURIComponent(id)}`
 const publishedChip = (published: boolean) => h(`span.chip.${published ? 'ok' : 'muted'}`, { title: published ? 'In the published part of the catalog (publication/github.toml selects it)' : 'Internal: not selected by publication/github.toml' }, published ? 'published' : 'internal')
+// user_catalog p4: what a conversation or a request starts from — a braindump
+// (cited) or a challenge (attached). The two kinds stay two kinds.
+type Subject = { kind: 'braindump' | 'challenge'; id: string }
+// A new conversation in aghangout with the subject already chosen in its composer.
+const talkHref = (s: Subject) => `${hangoutHref()}?${s.kind === 'braindump' ? 'cite' : 'attach'}=${encodeURIComponent(s.id)}`
 type Editing = { kind: 'new' } | { kind: 'new-preference' } | { kind: 'braindump' | 'review' | 'preference'; id: string } | null
 
 export function renderCatalogView(root: HTMLElement): ViewHandle {
@@ -105,6 +110,65 @@ export function renderCatalogView(root: HTMLElement): ViewHandle {
   const open = new Set<string>() // braindumps shown in full
   const full = new Map<string, CatalogBraindump>() // texts and reviews, read when a braindump is opened
   let asked: HTMLElement | null = null // the answer to the last request to the summoner
+  // Request work (user_catalog p4): one form, shown where it was asked for.
+  let requesting: (Subject & { at: 'card' | 'index' }) | null = null
+  let reqOut: HTMLElement | null = null
+  let reqReceipt = ''
+  let reqProjects: { id: string; label: string }[] | null = null
+  const reqWs = h('select', { 'aria-label': 'Project' })
+  const reqWf = h('select', { 'aria-label': 'Workflow' })
+  const reqText = h('textarea', { rows: 5, placeholder: 'What you ask for. The braindump is given to the run as the ground of your request, not as the request itself.', 'aria-label': 'Request text' })
+  const loadWorkflows = async () => {
+    reqWf.replaceChildren(h('option', { value: '' }, 'reading…'))
+    try {
+      const ws = (await api.published(reqWs.value)).workflows.filter(w => w.id && !w.problem)
+      reqWf.replaceChildren(...ws.map(w => h('option', { value: w.id! }, `${w.name || w.id}${w.errors ? ' — has validation errors' : ''}`)))
+    } catch (e) { reqWf.replaceChildren(h('option', { value: '' }, `cannot be read: ${(e as Error).message}`)) }
+  }
+  reqWs.addEventListener('change', () => void loadWorkflows())
+  const startRequest = async (s: Subject, at: 'card' | 'index') => {
+    if (requesting && requesting.kind === s.kind && requesting.id === s.id && requesting.at === at) { requesting = null; render(); return }
+    requesting = { ...s, at }; reqOut = null; reqReceipt = ''
+    render()
+    if (!reqProjects) {
+      try { reqProjects = (await api.workspaces()).workspaces.filter(w => w.observed.available).map(w => ({ id: w.id, label: w.observed.projectName || w.label || w.id })) } catch (e) { reqOut = h('div.banner.error', (e as Error).message); reqProjects = null; render(); return }
+      reqWs.replaceChildren(...reqProjects.map(w => h('option', { value: w.id }, w.label === w.id ? w.id : `${w.id} — ${w.label}`)))
+      await loadWorkflows()
+      render()
+    }
+  }
+  const isRequesting = (s: Subject, at: 'card' | 'index') => !!requesting && requesting.kind === s.kind && requesting.id === s.id && requesting.at === at
+  // The two actions of a braindump card and of an entry of the index.
+  const startActions = (s: Subject, at: 'card' | 'index'): HTMLElement[] => [
+    h(at === 'index' ? 'a.button.small' : 'a.button', { href: talkHref(s), target: '_blank', rel: 'noopener', title: s.kind === 'braindump' ? 'A new conversation in aghangout with this braindump cited: you write the words, whoever they reach is given the braindump with its review' : 'A new conversation in aghangout with this challenge attached' }, 'Talk about this'),
+    h(at === 'index' ? 'button.small' : 'button', { 'aria-pressed': String(isRequesting(s, at)), title: s.kind === 'braindump' ? 'Ask a workflow of a project for work that stands on this braindump: the run is given your words and, beside them, the braindump as it is now' : 'Ask a workflow of a project for work on this challenge', onclick: () => void startRequest(s, at) }, 'Request work'),
+  ]
+  function requestForm(s: Subject): HTMLElement {
+    const send = h('button.primary', { onclick: async () => {
+      if (!author.value.trim()) { reqOut = h('div.banner.error', 'Write your name as the author first: the request is made in your name.'); render(); return }
+      if (!reqWs.value || !reqWf.value || !reqText.value.trim()) { reqOut = h('div.banner.error', 'Choose a project and a workflow, and write what you ask for.'); render(); return }
+      keepAuthor(author.value.trim())
+      reqReceipt ||= `catalog-${Array.from(crypto.getRandomValues(new Uint8Array(12)), b => b.toString(16).padStart(2, '0')).join('')}`
+      send.disabled = true
+      try {
+        const ws = reqWs.value
+        const r = await api.requestRun(ws, { workflow: reqWf.value, text: reqText.value, author: author.value.trim(), receipt: reqReceipt, ...(s.kind === 'braindump' ? { cites: [s.id] } : { challenges: [s.id] }) })
+        reqOut = h('div.banner.ok', `${r.duplicate ? 'Already requested' : 'Requested'}: `, h('a', { href: `#/ws/${encodeURIComponent(ws)}/run/${encodeURIComponent(r.ref.workflow)}/${encodeURIComponent(r.ref.run)}` }, `${ws}/${r.ref.workflow}/${r.ref.run}`), s.kind === 'braindump' ? ` — with ${s.id} cited.` : ` — with ${s.id} attached.`)
+        reqText.value = ''; reqReceipt = ''
+        if (s.kind === 'braindump') full.delete(s.id)
+      } catch (e) { reqOut = h('div.banner.error', `Not requested: ${(e as Error).message}`) }
+      if (s.kind === 'braindump' && open.has(s.id)) await need(s.id)
+      render()
+    } }, 'Request')
+    return h('div.catalog-editor.catalog-request',
+      h('strong.small', s.kind === 'braindump' ? `Request work that stands on ${s.id}` : `Request work on ${s.id}`),
+      h('div.row', h('label.small', 'Project ', reqWs), h('label.small', 'Workflow ', reqWf)),
+      reqText,
+      h('div.row', send, h('button', { onclick: () => { requesting = null; render() } }, 'Cancel'),
+        h('span.small.muted', s.kind === 'braindump' ? 'Your words are the request. The braindump is given beside them as it is now, with its review and the projects grounded on it: the ground you stand on, not an instruction to carry out in full.' : 'Your words are the request. The challenge is given beside them as it is now.')),
+      reqOut)
+  }
+
   const author = h('input', { value: readAuthor(), placeholder: 'your name', 'aria-label': 'Author of changes', size: 14, onchange: () => keepAuthor(author.value.trim()) })
 
   const header = h('header.topbar', h('div.crumbs', h('a', { href: '#/' }, 'agdev'), h('span.sep', '/'), h('span.muted', 'Catalog')),
@@ -137,9 +201,9 @@ export function renderCatalogView(root: HTMLElement): ViewHandle {
     for (const seg of target.replace(/[#?].*$/, '').split('/')) { if (seg === '..') segs.pop(); else if (seg && seg !== '.') segs.push(seg) }
     const path = segs.join('/')
     const bd = /^braindumps\/episodes\/(.+?)(\/(braindump|review)\.md)?$/.exec(path)
-    if (bd && v.braindumps.some(b => b.id === bd[1])) return { href: '#/catalog', onclick: e => { e.preventDefault(); void toggle(bd[1], true).then(() => pick('braindump', bd[1])) } }
+    if (bd && v.braindumps.some(b => b.id === bd[1])) return { href: '#/catalog', onclick: e => { e.preventDefault(); void toggle(bd[1], true).then(() => pick('braindump', bd[1])) }, data: { braindump: bd[1] } as Record<string, string> }
     const ch = /^challenges\/([^/]+)/.exec(path)
-    if (ch) return { href: challengeHref(ch[1]), external: true }
+    if (ch) return { href: challengeHref(ch[1]), external: true, data: { challenge: ch[1] } as Record<string, string> }
     return { href: `${v.web}/src/branch/${v.branch}/${path}`, external: true }
   }
   const ask = async (what: string, f: () => Promise<{ href: string; workspace: string; workflow: string }>) => {
@@ -197,13 +261,29 @@ export function renderCatalogView(root: HTMLElement): ViewHandle {
 
   // Closed: the title, an excerpt and whether it is reviewed. Opened: the
   // text and the review, read then (api/catalog/braindumps/<path>).
+  // Cited by (user_catalog p4): the conversations and runs that cited the
+  // braindump, newest first, from the records written when each was made.
+  function citedByBlock(b: Bd): HTMLElement | null {
+    const list = full.get(b.id)?.citedBy ?? []
+    return h('div.catalog-cited',
+      h('strong.small', 'Cited by'),
+      list.length ? h('ul', list.map(c => h('li.small',
+        c.where.kind === 'conversation'
+          ? h('a', { href: conversationHref(c.where.conversation), target: '_blank', rel: 'noopener' }, `conversation ${c.where.conversation}, message #${c.where.message}`)
+          : h('a', { href: c.href ?? '#/' }, c.label),
+        h('span.muted', ` · ${c.by} · ${when(c.at)} · at ${c.commit.slice(0, 7)}`),
+        c.changed ? h('span.chip.warn', { title: 'The braindump\'s text is not what it was at the cited commit. What was cited stays as it was.' }, 'changed since') : null)))
+        : h('span.small.muted', ' Nothing yet. A message or a request that cites this braindump is listed here.'))
+  }
   function braindumpCard(b: Bd, v: CatalogView): HTMLElement {
     const edit = editing?.kind === 'braindump' && editing.id === b.id
     const whole = open.has(b.id) && full.has(b.id)
+    const subject: Subject = { kind: 'braindump', id: b.id }
     const reviewNote = !b.review ? h('span.chip.muted', 'not reviewed') : b.changedAfterReview ? h('span.chip.warn', 'changed after its review') : h('span.chip', { title: b.review.updated ? `${b.review.updated.author} · ${when(b.review.updated.at)}` : '' }, 'reviewed')
     return h('article.catalog-bd', { dataset: { braindump: b.id } },
       h('div.entry-head', h('a.catalog-bd-title', { href: '#/catalog', onclick: (e: Event) => { e.preventDefault(); void toggle(b.id) }, title: whole ? 'Close' : 'Open the text and its review' }, h('strong', `${whole ? '▾' : '▸'} ${b.title}`)), h('code', b.id),
         reviewNote, publishedChip(b.published),
+        b.cited ? h('span.chip', { title: 'Messages and requests that cited this braindump; open it to see them' }, `cited ${b.cited}`) : null,
         b.updated ? h('span.muted.small', `${b.updated.author} · ${when(b.updated.at)} · ${b.updated.commit.slice(0, 7)}`) : null,
         h('a.small', { href: `${v.web}/src/branch/${v.branch}/${b.path}`, target: '_blank', rel: 'noopener' }, 'on Gitea')),
       h('div.chips', h('span.small.muted', 'grounds '), b.projects.length
@@ -211,9 +291,29 @@ export function renderCatalogView(root: HTMLElement): ViewHandle {
         : h('span.chip.muted', `no project in ${v.plan || 'the plan'}`)),
       edit ? editor(b) : whole ? renderMarkdown(full.get(b.id)!.text ?? '', linker(v, `braindumps/episodes/${b.id}`)) : h('div.catalog-excerpt', b.excerpt),
       !whole || edit ? null : h('div.row',
+        ...startActions(subject, 'card'),
         h('button', { onclick: () => { editing = { kind: 'braindump', id: b.id }; render() } }, 'Edit'),
         h('button.danger', { onclick: () => { if (confirm(`Remove braindump ${b.id}${b.review ? ' and its review' : ''}? They stay in the repository's history.${b.projects.length ? `\nIt grounds ${b.projects.join(', ')}: the plan's because lists must drop it first.` : ''}`)) void change(() => api.catalogRemove(b.id, author.value.trim())) } }, 'Remove')),
-      whole ? reviewBlock(b, v) : null)
+      whole && !edit && isRequesting(subject, 'card') ? requestForm(subject) : null,
+      whole ? reviewBlock(b, v) : null,
+      whole ? citedByBlock(b) : null)
+  }
+
+  // The index's text with the two actions on each entry (a list item that
+  // links to a braindump or to a challenge): an entry of a challenge attaches
+  // the challenge, an entry of a braindump cites it.
+  function indexText(v: CatalogView, text: string): HTMLElement {
+    const md = renderMarkdown(text, linker(v, ''))
+    const done = new Set<Element>()
+    for (const a of md.querySelectorAll<HTMLAnchorElement>('a[data-braindump], a[data-challenge]')) {
+      const li = a.closest('li')
+      if (!li || done.has(li)) continue
+      done.add(li)
+      const s: Subject = a.dataset.braindump ? { kind: 'braindump', id: a.dataset.braindump } : { kind: 'challenge', id: a.dataset.challenge! }
+      li.append(h('span.catalog-entry-actions', ...startActions(s, 'index')))
+      if (isRequesting(s, 'index')) li.append(requestForm(s))
+    }
+    return md
   }
 
   // The index (challenges.md): what is not yet real, written by the summoner's workflow index.
@@ -228,7 +328,7 @@ export function renderCatalogView(root: HTMLElement): ViewHandle {
       h('div.row', h('button', { title: 'The summoner reads every braindump with its review and every challenge that is not resolved or withdrawn, and rewrites challenges.md', onclick: () => void ask('the index', () => api.catalogIndexRequest(author.value.trim())) }, x.text === null ? 'Write the index' : 'Refresh the index'),
         h('button', { title: 'The summoner reviews every braindump with no review or changed after its review', onclick: () => void ask('reviews of the braindumps that need one', () => api.catalogReviewRequest(author.value.trim())) }, 'Ask for the reviews that are due')),
       asked,
-      x.text === null ? null : renderMarkdown(x.text, linker(v, '')))
+      x.text === null ? null : indexText(v, x.text))
   }
 
   // Preferences (user_catalog p3): how the owner wants work done; every file
@@ -371,7 +471,7 @@ export function renderCatalogView(root: HTMLElement): ViewHandle {
 
   render()
   void load()
-  return { dispose: () => { disposed = true }, isDirty: () => editing !== null }
+  return { dispose: () => { disposed = true }, isDirty: () => editing !== null || (requesting !== null && !!reqText.value.trim()) }
 }
 
 // The project page's section (#/ws/<workspace>): why this project exists.

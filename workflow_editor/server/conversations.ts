@@ -13,7 +13,7 @@
 import { existsSync, mkdirSync, readFileSync } from 'node:fs'
 import { join } from 'node:path'
 import type { DatabaseSync } from 'node:sqlite'
-import type { AttachmentRef, ChallengeAttachmentRef, ConversationSource } from '../shared/intake.ts'
+import type { AttachmentRef, BraindumpAttachmentRef, ChallengeAttachmentRef, ConversationSource } from '../shared/intake.ts'
 import { fileView, refOf, type FileRow, type FileView } from './messageFiles.ts'
 import type { ChallengeStore } from './challenges.ts'
 import type { PinnedAttachment } from './runs.ts'
@@ -139,7 +139,10 @@ export interface Message {
 // with, and — a separate, current read — the latest one when it moved since.
 // A file it carried (p19, docs/message-files.md): the occurrence, how a
 // browser may show it and where its bytes are read.
-export type MessageAttachment = (ChallengeAttachmentRef & { latest: { commit: string; title: string; state: string | null } | null }) | FileView
+// A braindump it cited (user_catalog p4): the commit it was cited at, and —
+// a separate, current read — the last change of its text when that differs
+// now (`changed`), or that it is gone (`removed`).
+export type MessageAttachment = (ChallengeAttachmentRef & { latest: { commit: string; title: string; state: string | null } | null }) | (BraindumpAttachmentRef & { changed: { commit: string; at: string; author: string } | null; removed: boolean }) | FileView
 // What a client names to attach: a challenge, optionally at a commit (else
 // its current revision when the message is accepted).
 export interface AttachRequest { id: string; at?: string }
@@ -152,6 +155,11 @@ export function attachRequests(v: unknown): AttachRequest[] {
     if (typeof x === 'object' && x && typeof (x as AttachRequest).id === 'string') return { id: (x as AttachRequest).id, ...(typeof (x as AttachRequest).at === 'string' && (x as AttachRequest).at ? { at: (x as AttachRequest).at } : {}) }
     throw new RequestError(400, 'challenges is a list of ids (ch-0001, ch-0001@<commit>) or {id, at}')
   })
+}
+// `cites` as a client sends it: braindump paths of the catalog,
+// ["summoning", "agdev_philosophy/p3@<commit>", {id, at?}].
+export function citeRequests(v: unknown): AttachRequest[] {
+  try { return attachRequests(v) } catch { throw new RequestError(400, 'cites is a list of braindump paths (summoning, group/p1@<commit>) or {id, at}') }
 }
 interface AttachmentRow { id: number; conv: string; message: number; kind: string; ref: string; commit_id: string; title: string; sha256: string; at: string }
 
@@ -297,8 +305,24 @@ export class ConversationStore {
     }
     return out
   }
+  // The catalog of this area, as the service reads it (user_catalog p4).
+  private catalogCtx(): import('./catalog.ts').CatalogContext {
+    return { area: this.area, registryFile: this.exec?.ctx.registryFile ?? join(this.area, 'registry.json'), gitea: this.exec?.ctx.gitea, ...(this.exec?.ctx.gitea ? {} : { giteaProblem: 'execution is not configured here' }) }
+  }
+  // Each cited braindump at the catalog's head now, or at the commit named.
+  // Refused when one does not resolve.
+  async pinCites(refs: AttachRequest[]): Promise<BraindumpAttachmentRef[]> {
+    if (!Array.isArray(refs)) throw new RequestError(400, 'cites is a list of {id, at?}')
+    if (!refs.length) return []
+    return (await import('./catalog.ts')).pinBraindumps(this.catalogCtx(), refs)
+  }
+  // What a request names to be given (wfe request, api …/runs): challenges
+  // and cited braindumps, pinned now, with the text the run is given.
+  async pinnedFor(challenges: AttachRequest[], cites: AttachRequest[]): Promise<PinnedAttachment[]> {
+    return this.pinnedTexts([...(challenges.length ? await this.pinAll(challenges) : []), ...await this.pinCites(cites)])
+  }
   // Inside the message's own transaction.
-  attachRows(conv: string, message: number, pins: ChallengeAttachmentRef[]) {
+  attachRows(conv: string, message: number, pins: (ChallengeAttachmentRef | BraindumpAttachmentRef)[]) {
     const ins = this.db.prepare('INSERT INTO attachments (conv, message, kind, ref, commit_id, title, sha256, at) VALUES (?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT (message, kind, ref) DO NOTHING')
     for (const p of pins) ins.run(conv, message, p.kind, p.id, p.commit, p.title, p.sha256, now())
   }
@@ -309,7 +333,8 @@ export class ConversationStore {
     const out: AttachmentRef[] = []
     for (const m of messages) {
       for (const a of this.all<AttachmentRow>('SELECT * FROM attachments WHERE message = ? ORDER BY id', m)) {
-        if (!out.some(x => x.kind === 'challenge' && x.id === a.ref)) out.push({ kind: 'challenge', id: a.ref, commit: a.commit_id, title: a.title, sha256: a.sha256 })
+        const kind = a.kind === 'braindump' ? 'braindump' as const : 'challenge' as const
+        if (!out.some(x => x.kind === kind && x.id === a.ref)) out.push({ kind, id: a.ref, commit: a.commit_id, title: a.title, sha256: a.sha256 })
       }
       for (const f of this.fileRows({ message: m })) if (!out.some(x => x.kind === 'file' && x.id === f.attachment)) out.push(refOf(f))
     }
@@ -322,6 +347,7 @@ export class ConversationStore {
     const out: PinnedAttachment[] = []
     for (const a of refs) {
       if (a.kind === 'file') { out.push(a); continue }
+      if (a.kind === 'braindump') { out.push({ ...a, text: await (await import('./catalog.ts')).citedText(this.catalogCtx(), a) }); continue }
       const store = await this.challenges()
       if (!store) throw new Error('the message carries challenges, but no challenge repository is configured here (challenges.json)')
       out.push({ ...a, text: await store.text(a.id, a.commit) })
@@ -343,10 +369,14 @@ export class ConversationStore {
   async attachmentViews(conv: string, viewBase?: string | null): Promise<Map<number, MessageAttachment[]>> {
     const rows = this.all<AttachmentRow>('SELECT * FROM attachments WHERE conv = ? ORDER BY id', conv)
     const out = new Map<number, MessageAttachment[]>()
-    if (rows.length) {
+    const cited = rows.filter(a => a.kind === 'braindump')
+    const now = cited.length ? await (await import('./catalog.ts')).citedNow(this.catalogCtx(), cited.map(a => ({ id: a.ref, commit: a.commit_id }))).catch(() => new Map<string, { changed: { commit: string; at: string; author: string } | null; removed: boolean }>()) : null
+    for (const a of cited) out.set(a.message, [...out.get(a.message) ?? [], { kind: 'braindump', id: a.ref, commit: a.commit_id, title: a.title, sha256: a.sha256, ...(now!.get(`${a.ref}@${a.commit_id}`) ?? { changed: null, removed: false }) }])
+    if (rows.length > cited.length) {
       const store = await this.challenges()
       await store?.sync().catch(() => undefined)
       for (const a of rows) {
+        if (a.kind === 'braindump') continue
         const cur = store?.current(a.ref) ?? null
         out.set(a.message, [...out.get(a.message) ?? [], { kind: 'challenge', id: a.ref, commit: a.commit_id, title: a.title, sha256: a.sha256, latest: cur ? { commit: cur.commit, title: cur.title, state: cur.state } : null }])
       }

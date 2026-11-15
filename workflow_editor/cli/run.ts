@@ -77,6 +77,12 @@ and run.json (docs/runs.md).
   --on-behalf-of <person>, --original <file> (keeps the input a request was
                        derived from as original-input.md), --predecessor <run>.
   --recorded-by <name> who saved a person's request (default --by).
+  --cite <path>[@<commit>]  (repeatable) a braindump of the catalog the request
+                       stands on, at the catalog's head now or at <commit>:
+                       written as attachments/braindump-<path>@<commit>.md (its
+                       text, its review then, the projects grounded on it) and
+                       named in run.json input.attachments. The ground of the
+                       request, not an instruction to carry out in full.
 Nothing is committed. Result: the run reference, folder and files written.
 Exit 0 created; 1 refused (an invalid definition, an existing run …).`,
   io: `wfe run io <run> [--attempt <id> --line <n>]
@@ -949,11 +955,18 @@ export async function runCommand(c: RunCli): Promise<number> {
       const input: CreateRunOptions['input'] = person
         ? { from: 'person', text: readInput(c, request), author: person, recordedBy: c.opt('recorded-by') ?? by ?? executor.name }
         : { from: 'agent', text: readInput(c, request), requester: need(c, 'requester', 'the agent that wrote the request'), entrustedBy: entrust(c, need(c, 'entrusted-by', 'what entrusted the request')), onBehalfOf: c.opt('on-behalf-of'), original: c.opt('original') !== undefined ? readInput(c, c.opt('original')!) : undefined }
+      // --cite (user_catalog p4): braindumps of the catalog the request stands on.
+      if (c.opts('cite').length) {
+        const { citeRequests, ConversationStore } = await import('../server/conversations.ts')
+        const cs = new ConversationStore({ area: c.area(), exec: c.exec() })
+        try { input.attachments = await wrap(() => cs.pinnedFor([], citeRequests(c.opts('cite')))) } finally { cs.close() }
+      }
       const predecessor = c.opt('predecessor') ? await wrap(() => resolveRef(ws, c.opt('predecessor')!)) : undefined
       const r = await wrap(() => createRun(ws, {
         workflow, name: c.opt('name'), input, executor, plan: c.opt('plan') !== undefined ? readInput(c, c.opt('plan')!) : undefined,
         predecessor, by: by ?? executor.name, via: 'cli', area: c.area(),
       }))
+      if (input.attachments?.length) (await import('../server/citations.ts')).recordCitations(c.area(), input.attachments, person ?? c.opt('requester') ?? '', { kind: 'run', workspace: ws.reg.id, ...(ws.reg.project ? { project: ws.reg.project } : {}), workflow: r.ref.workflow, run: r.ref.run })
       const url = await link(runKey(r.ref))
       c.out([`Created run ${runKey(r.ref)} in ${r.dir}/`, ...r.files.map(f => `  ${f}`),
         ...(r.record.definition.warnings.length ? ['Definition warnings (kept as facts):', ...r.record.definition.warnings.map(w => `  ${w}`)] : []),

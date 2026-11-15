@@ -60,7 +60,7 @@ with the reason); existing records stay readable through the CLI.
 | member | the person(s) and projects: an append-only history of `join` and `leave` (who, when, why), folded into the members. Rows written before p2 may say `facilitator` for ponderer; it reads as a project |
 | message | the person's words verbatim (author, time, submit token, `via`, `re`, whom it reached) or an agent's speech (participant, agent, run, attempt, request, node, kind `reply`/`question`/`progress`/`result`/`synthesis`/`announce`, key). The same token (the person) or key (a run) is one message |
 | link | what a message is to a run: `turn` (written by WFE: the run a request started), `new`, `follow-up`, `correction`, `steer`, `answer`, `question`, `informational`, `cites`, `handoff`. A later reading supersedes an earlier one; messages are never rewritten |
-| attachment | what a person's message carried: a challenge pinned to a revision (challenge p1, [challenges.md](challenges.md)), or a file — an occurrence of original bytes on a share, tied to exactly this message (workflow_editor p19, [message-files.md](message-files.md)) |
+| attachment | what a person's message carried: a challenge pinned to a revision (challenge p1, [challenges.md](challenges.md)), a braindump of the catalog cited at a catalog commit (user_catalog p4, [mycatalog.md](mycatalog.md) *Citing a braindump*), or a file — an occurrence of original bytes on a share, tied to exactly this message (workflow_editor p19, [message-files.md](message-files.md)) |
 | response request | table `invitations` — below |
 | facilitation | who started a conductor's leading, when, with which brief and from which horizon; when and why it ended |
 | activity, annotation, metadata, overview, workflow reference | below |
@@ -129,8 +129,18 @@ conductor issues (`wfe conversation invite`, `ask`), each awaited result.
 
 Its run gets `input.source = {kind: conversation, conversation, message,
 author, at, invitation: <request>}` and the words as its request (`request.md`), with the
-attached challenges' revisions (`input.attachments`). Every transition is a
-request event (archived).
+attached challenges' revisions and the cited braindumps (`input.attachments`).
+Every transition is a request event (archived).
+
+A request carries what the messages it is about carried (its `source`
+messages: the message itself, and those it names with `re`). So in a
+facilitated conversation the conductor's own run is given the cited
+braindumps and challenges of the person's message, and a project the
+conductor asks is given them when the question names that message (`wfe
+conversation ask … --re <msg>`); a question that names no message is about
+the newest one. A cited braindump is the ground the person stands on, not an
+instruction to carry out in full: the conductor says so when it passes one
+on, and a request made from it says which braindump it stood on.
 
 | Situation | Behaviour |
 | --- | --- |
@@ -295,9 +305,9 @@ lets the person start a child's review from the room without a manual link.
 | `GET api/conversations[?category=&state=&with=&mode=&limit=&offset=]` | `{person, disabled, participants, counts, total, offset, conversations}`; participants are each project (with `converse` and `discuss`) and the facilitator as their projects say now; each row with `mode`, `members`, `participants`, `defaultTo`, `facilitation`, `category`, `displayTitle`, `newest`, `last`, `overview` or `brief`, `status`, `activity`, `archive` |
 | `POST api/conversations {id, title, members?, defaultTo?, facilitate?, category?, text?, token?, to?, re?, author?, files?}` | creates (201; the same id by the same author is 200), and posts the first message when `text` or `files` is given |
 | `GET api/conversations/<id>[?since=<msg>]` | `conversation` (`mode`, `defaultTo`, `facilitation`, `conductor`, `requester`, `category`, `displayTitle`, `origin`), `facilitations`, `overview`, `overviews`, `brief`, `status` (with `continuations` held), `meta`, `activities`, `annotations`, `obligations`, `members`, `membership`, `messages` (with `participant`, `run`, `runUrl`, `invitation`, `addressed`, `node`, `requests`, `attachments`), `requests` (role, workflow, state, run, receipt, held, …), `links`, `runs` (shared status, run view, file route, presentations), `asking`, `horizon`, `archive`; (p17) `reviews`: the human review rounds of the runs serving the room (`id`, `state`, `text`, `summary`, `subjects`, `decision`, `page`, `api`, `runKey`; [reviews.md](reviews.md)); (p18) `progression` (*Progression*) |
-| `POST api/conversations/<id>/messages {text, token, with?, title?, to?, runs?, re?, author?, via?, challenges?, files?}` | the person's words; `{sent, duplicate, reopened, created, message, requests}`; 409 `choose-recipient` when it reaches nobody. (p19) `files: [{name, base64, mime?}]`, and `text` may be empty with files: [message-files.md](message-files.md) |
+| `POST api/conversations/<id>/messages {text, token, with?, title?, to?, runs?, re?, author?, via?, challenges?, cites?, files?}` | the person's words; `cites`: braindump paths of the catalog (`summoning`, `group/p1@<commit>`), each pinned to the catalog's head now; `{sent, duplicate, reopened, created, message, requests}`; 409 `choose-recipient` when it reaches nobody. (p19) `files: [{name, base64, mime?}]`, and `text` may be empty with files: [message-files.md](message-files.md) |
 | `GET`/`HEAD …/messages/<n>/attachments[/<attachment>][?download=1]`, `GET …/attachments/verify[?message=]` | (p19) a message's files and their original bytes, by the whole identity; explicit integrity verification ([message-files.md](message-files.md)) |
-| `POST …/facilitation {action: start, text, token, re?, challenges?} \| {action: end, note?}` | start (with the brief) or end facilitation |
+| `POST …/facilitation {action: start, text, token, re?, challenges?, cites?} \| {action: end, note?}` | start (with the brief) or end facilitation |
 | `POST …/default {participant \| null, note?}` | the default addressee |
 | `POST …/members {participant, action: join\|leave, note?}` | membership; starts nothing |
 | `POST …/requests {participant, question, re?, token?}`, `…/requests/<n>/withdraw {reason}`, `…/requests/<n>/retry` | the person's request; withdraw one not started; try a failed one again |

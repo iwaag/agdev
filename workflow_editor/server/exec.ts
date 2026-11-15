@@ -17,6 +17,7 @@
 // recorded end becomes `unknown`, a non-zero exit `interrupted`; both hold the
 // run until a person resumes it. A request or answer sent twice (same
 // receipt) is queued once.
+import { recordCitations } from './citations.ts'
 import { spawn } from 'node:child_process'
 import { createHash, randomBytes, randomUUID } from 'node:crypto'
 import { existsSync, mkdirSync, readFileSync } from 'node:fs'
@@ -159,9 +160,12 @@ const fileLine = (a: import('../shared/intake.ts').FileAttachmentRef) => `"${a.n
 export function attachmentBrief(r: RunRecord, dir: string): string[] {
   const all = r.input.attachments ?? []
   if (!all.length) return []
-  const challenges = all.filter(a => a.kind === 'challenge'), files = all.filter(a => a.kind === 'file')
+  const challenges = all.filter(a => a.kind === 'challenge'), files = all.filter(a => a.kind === 'file'), cited = all.filter(a => a.kind === 'braindump')
   const words = requestFrom(r.input) === 'agent' ? 'request' : 'person\'s words'
   return [
+    // user_catalog p4: named apart from challenges and files, and as what it is.
+    ...(cited.length ? [`Braindumps of the catalog cited with the ${words} (${cited.length}): the ground of this request — what the person stands on when asking. Not an instruction to carry out in full, and not a preference. Each as it was when cited, with its review then and the projects grounded on it:`,
+      ...cited.map(a => `- ${a.id} "${a.title}" at ${a.commit.slice(0, 12)}: ${dir}/${a.file}; its present text: wfe catalog braindump show ${a.id}`)] : []),
     ...(challenges.length ? [`Attached to the ${words} (${challenges.length}): durable challenges, each as it was when attached (wfe challenge help):`,
       ...challenges.map(a => `- ${a.id} "${a.title}" at ${a.commit.slice(0, 12)}: ${dir}/${a.file}; its files and trials then: wfe challenge show ${a.id} --at ${a.commit.slice(0, 12)}; its latest revision: wfe challenge show ${a.id}`)] : []),
     ...(files.length ? [`Files the ${words} carried (${files.length}; the original bytes are on the share, checked against their hash when fetched; fetch writes into .local/attachments/ unless --out says otherwise):`,
@@ -170,7 +174,7 @@ export function attachmentBrief(r: RunRecord, dir: string): string[] {
 }
 // What an answer's or an instruction's source carried.
 export const attachedLines = (s: import('../shared/intake.ts').SourceRef | undefined, indent = '    ') =>
-  s?.kind === 'conversation' && s.attachments?.length ? s.attachments.map(a => a.kind === 'file' ? `${indent}file: ${fileLine(a)}` : `${indent}attached: ${a.id} "${a.title}" at ${a.commit.slice(0, 12)} — wfe challenge show ${a.id} --at ${a.commit.slice(0, 12)}`) : []
+  s?.kind === 'conversation' && s.attachments?.length ? s.attachments.map(a => a.kind === 'file' ? `${indent}file: ${fileLine(a)}` : a.kind === 'braindump' ? `${indent}cited braindump (the ground of these words): ${a.id} "${a.title}" at ${a.commit.slice(0, 12)} — wfe catalog braindump show ${a.id}` : `${indent}attached: ${a.id} "${a.title}" at ${a.commit.slice(0, 12)} — wfe challenge show ${a.id} --at ${a.commit.slice(0, 12)}`) : []
 
 export function instructionBrief(r: RunRecord): string[] {
   const all = Object.values(r.instructions ?? {})
@@ -581,6 +585,10 @@ export class ExecStore {
     const env = this.ctx.gitea ? await this.ctx.gitea.gitEnv() : {}
     const attachments = o.attachments?.length ? { attachments: o.attachments } : {}
     const created = await createRunInCopy(ws, { workflow: o.workflow, input: o.input ? { ...o.input, ...attachments } : { from: 'person', text: o.text, author: o.author, recordedBy: o.by, ...(o.source ? { source: o.source } : {}), ...attachments }, executor: { host: this.executor, ...(o.node ? { node: o.node } : {}) }, by: o.by ?? o.author, via: o.via, area: this.ctx.area, receipt: `request:${o.receipt}`, ...(o.predecessor ? { predecessor: o.predecessor } : {}), ...(o.standing ? { standing: o.standing } : {}), ...(this.ctx.gitea ? { access: this.accessContext() } : {}), ...(o.trial ? { trial: o.trial } : {}) }, env)
+    // user_catalog p4: a braindump cited with the request itself is a back
+    // reference to this run (one cited by a conversation's message was
+    // recorded with that message).
+    if (!created.existing && o.source?.kind !== 'conversation') recordCitations(this.ctx.area, o.attachments ?? [], o.input?.requester ?? o.author, { kind: 'run', workspace: ws.reg.id, ...(ws.reg.project ? { project: ws.reg.project } : {}), workflow: created.ref.workflow, run: created.ref.run })
     // cluster_teamwork p5: the receipt found a run made before (its first start may have been queued under
     // another receipt, e.g. a reconcile's `start:`): a run that has started is not started again (PC
     // warden/recover/run-004 was relaunched after it had completed by a repeated submission).

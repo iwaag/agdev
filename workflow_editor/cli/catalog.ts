@@ -70,7 +70,16 @@ init       create <owner>/mycatalog on Gitea (mycatalog.yaml, projects.yaml,
 status     the repository, head, plan, braindumps with their reviews and the
            projects they ground, projects with their grounds (none is said),
            issues
-braindump  each change is one commit authored by --author: the person or agent
+braindump  show also lists what cited it, newest first ("cited by"): the
+           conversations' messages and the runs whose request named it
+           (wfe conversation post --cite <path>, wfe request … --cite <path>,
+           wfe run create … --cite <path>), each with the commit it was cited
+           at and whether the text changed since. A citation gives the
+           receiving run the braindump as it was then, with its review and
+           the names of the projects grounded on it, as the ground of that
+           request: not an instruction to carry out in full, not a preference.
+           A preference is never cited: every run has it already.
+           each change is one commit authored by --author: the person or agent
            whose words it holds. A braindump is free Markdown; a "# Title" on
            its first line is its title, otherwise its path is.
            edit --base <commit> refuses when someone changed it after that.
@@ -143,7 +152,7 @@ export async function catalogCommand(c: CatalogCli): Promise<number> {
         `${v.repository} @ ${short(v.head)}  ${v.title ? `"${v.title}"  ` : ''}${v.web}`,
         `this installation's plan: ${v.plan || '(none named; wfe catalog plan use <name>)'}`,
         '', `Braindumps (${v.braindumps.length})`,
-        ...v.braindumps.map(b => `  ${b.id.padEnd(32)} ${b.title}${b.published ? '  [published]' : ''}\n  ${''.padEnd(32)} ${b.projects.length ? `grounds: ${b.projects.join(', ')}` : `grounds no project in ${v.plan || 'the plan'}`}\n  ${''.padEnd(32)} ${reviewLine(b)}`),
+        ...v.braindumps.map(b => `  ${b.id.padEnd(32)} ${b.title}${b.published ? '  [published]' : ''}\n  ${''.padEnd(32)} ${b.projects.length ? `grounds: ${b.projects.join(', ')}` : `grounds no project in ${v.plan || 'the plan'}`}\n  ${''.padEnd(32)} ${reviewLine(b)}${b.cited ? `; cited ${b.cited} time${b.cited === 1 ? '' : 's'}` : ''}`),
         '', `Preferences (${v.preferences.length}): ${v.preferences.map(p => p.name).join(', ') || 'none'}`,
         '', `Challenges: ${v.challenges.available ? `${v.challenges.items.length} (${Object.entries(v.challenges.counts).filter(([, n]) => n).map(([k, n]) => `${k} ${n}`).join(', ') || 'none'})${v.challenges.inCatalog ? '' : `; ${v.challenges.reason}`}` : v.challenges.reason}`,
         `Index (${v.index.path}): ${v.index.updated ? `${v.index.updated.author}, ${v.index.updated.at.slice(0, 10)}, ${short(v.index.updated.commit)}${v.index.note ? `; ${v.index.note}` : ''}` : v.index.note}`,
@@ -166,7 +175,9 @@ export async function catalogCommand(c: CatalogCli): Promise<number> {
       if (!a2) throw c.usage(`wfe catalog braindump ${a1} <path>`)
       if (a1 === 'show') {
         const b = await m.braindump(ctx, a2)
-        c.out([`${b.path} @ ${short(b.updated?.commit)} (${b.updated?.author ?? '?'}, ${b.updated?.at ?? '?'})`, `grounds: ${b.projects.join(', ') || 'no project in this installation\'s plan'}${b.plans.length ? `  (plans: ${b.plans.join(', ')})` : ''}`, reviewLine(b), '', b.text ?? ''].join('\n'), b)
+        c.out([`${b.path} @ ${short(b.updated?.commit)} (${b.updated?.author ?? '?'}, ${b.updated?.at ?? '?'})`, `grounds: ${b.projects.join(', ') || 'no project in this installation\'s plan'}${b.plans.length ? `  (plans: ${b.plans.join(', ')})` : ''}`, reviewLine(b),
+          ...(b.citedBy.length ? [`cited by (${b.citedBy.length}):`, ...b.citedBy.map(x => `  ${x.at.slice(0, 16)}Z ${x.label} by ${x.by} at ${short(x.commit)}${x.changed ? ' (changed since)' : ''}`)] : ['cited by: nothing yet']),
+          '', b.text ?? ''].join('\n'), b)
         return 0
       }
       if (a1 === 'add' || a1 === 'edit') { const r = await m.changeBraindump(ctx, { op: a1, id: a2, text: await textArg(), author: author(), base: c.opt('base'), message: c.opt('message') }); c.out(r.message, r); return 0 }

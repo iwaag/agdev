@@ -69,7 +69,8 @@ import { withLock } from './lock.ts'
 import { RequestError } from './workspace.ts'
 import { fileRef, loadFilesConfig, newAttachmentId, newBundleId, publishBundle, StorageUnavailable, submissionDigest, type AllocatedFile, type IncomingFile } from './messageFiles.ts'
 import { shareRoot } from './shares.ts'
-import type { ChallengeAttachmentRef } from '../shared/intake.ts'
+import type { BraindumpAttachmentRef, ChallengeAttachmentRef } from '../shared/intake.ts'
+import { recordCitations } from './citations.ts'
 
 const MAX_TEXT = 100_000
 const TOKEN = /^[A-Za-z0-9:._/#-]{8,200}$/
@@ -219,7 +220,7 @@ const label = (i: Pick<InvitationRow, 'state' | 'late'>) => `${i.state}${i.late 
 const resolved = (s: InvitationState) => !OPEN_STATES.includes(s)
 
 // A person's message as the service takes it (`post`).
-export interface PostInput { text: string; author: string; token: string; re?: number[]; to?: string[]; runs?: string[]; via?: string; challenges?: AttachRequest[]; with?: string; title?: string; files?: IncomingFile[] }
+export interface PostInput { text: string; author: string; token: string; re?: number[]; to?: string[]; runs?: string[]; via?: string; challenges?: AttachRequest[]; cites?: AttachRequest[]; with?: string; title?: string; files?: IncomingFile[] }
 export interface PostResult { message: MessageRow; duplicate: boolean; reopened: boolean; created: boolean; invitations: InvitationRow[] }
 type Recipient = { key: string; participant: string; role: 'conduct' | 'project' | 'run'; run?: string; deliver?: { run: string; question: string | null; message: number; instruct?: boolean } }
 interface Route { c: ConversationRow; seen: MessageRow | null; re: number[]; recipients: Recipient[]; chosen: { workspace: string; workflow: string; role: RequestRole }[]; state: string }
@@ -428,7 +429,7 @@ export class ConversationService {
   // messages, members, open questions, runs and attachments stay as they
   // are; the brief's request starts the conductor's run. The same token again
   // is the same start.
-  async startFacilitation(conv: string, o: { text: string; author: string; token: string; re?: number[]; via?: string; challenges?: AttachRequest[] }): Promise<{ facilitation: FacilitationRow; duplicate: boolean; posted: Awaited<ReturnType<ConversationService['post']>> }> {
+  async startFacilitation(conv: string, o: { text: string; author: string; token: string; re?: number[]; via?: string; challenges?: AttachRequest[]; cites?: AttachRequest[] }): Promise<{ facilitation: FacilitationRow; duplicate: boolean; posted: Awaited<ReturnType<ConversationService['post']>> }> {
     const c = this.need(conv)
     const cfg = this.cfg()
     if (!TOKEN.test(o.token)) throw new RequestError(400, 'a start needs a submit token (8–200 of A-Z a-z 0-9 : . _ / # -)')
@@ -448,7 +449,7 @@ export class ConversationService {
     })
     // p18: a conductor that stood suspended leads again — the same run.
     await this.syncStanding(conv).catch(() => null)
-    const posted = await this.post(conv, { text: o.text, author: o.author, token: o.token, re: o.re, to: [cfg.facilitator.workspace], via: o.via, challenges: o.challenges })
+    const posted = await this.post(conv, { text: o.text, author: o.author, token: o.token, re: o.re, to: [cfg.facilitator.workspace], via: o.via, challenges: o.challenges, cites: o.cites })
     this.db.prepare('UPDATE facilitations SET brief = ? WHERE conv = ? AND token = ? AND brief IS NULL').run(posted.message.id, conv, token)
     return { facilitation: this.one<FacilitationRow>('SELECT * FROM facilitations WHERE conv = ? AND token = ?', conv, token)!, duplicate: !!seen, posted }
   }
@@ -503,7 +504,8 @@ export class ConversationService {
     if (op) throw this.tokenConflict(conv, o.token, op)
     const created = this.room(conv, o, null)
     const route = await this.route(conv, o)
-    const pins = route.seen ? [] : await this.cs.pinAll(o.challenges ?? [])
+    // `cites` (user_catalog p4): braindumps of the catalog the words stand on.
+    const pins = route.seen ? [] : [...await this.cs.pinAll(o.challenges ?? []), ...await this.cs.pinCites(o.cites ?? [])]
     const res = this.tx(() => this.accept(conv, o, route, pins))
     return this.afterAccept(conv, res, created)
   }
@@ -585,7 +587,7 @@ export class ConversationService {
 
   // The message and its requests (inside the transaction). With an upload
   // operation (p19): its files' rows by position and the operation accepted.
-  private accept(conv: string, o: PostInput, route: Route, pins: ChallengeAttachmentRef[], up?: { op: UploadRow; files: AllocatedFile[] }) {
+  private accept(conv: string, o: PostInput, route: Route, pins: (ChallengeAttachmentRef | BraindumpAttachmentRef)[], up?: { op: UploadRow; files: AllocatedFile[] }) {
     const { c, re, recipients, chosen } = route
     const again = this.one<MessageRow>('SELECT * FROM messages WHERE conv = ? AND token = ?', conv, o.token)
     const reopened = !again && c.state === 'closed'
@@ -597,6 +599,8 @@ export class ConversationService {
       if (!this.members(conv).some(m => m.participant === o.author)) this.joinRow(conv, this.resolve(o.author, { person: true }), o.author, 'first message')
       id = Number(this.db.prepare('INSERT INTO messages (conv, role, author, text, at, token, via, re, kind, participant, addressed) VALUES (?, \'person\', ?, ?, ?, ?, ?, ?, \'message\', ?, ?)').run(conv, o.author, o.text, at, o.token, o.via ?? null, JSON.stringify(re), o.author, JSON.stringify(recipients.map(r => r.run ?? r.participant))).lastInsertRowid)
       this.cs.attachRows(conv, id, pins)
+      // A back reference per citation, written where it is made (docs/mycatalog.md).
+      recordCitations(this.area, pins, o.author, { kind: 'conversation', conversation: conv, message: id })
       if (up) {
         const ins = this.db.prepare('INSERT INTO message_files (conv, message, ordinal, attachment, bundle, upload, name, mime, bytes, sha256, preview, served, ref, at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)')
         for (const f of up.files) ins.run(conv, id, f.ordinal, f.id, up.op.bundle, up.op.id, f.name, f.mime, f.bytes, f.sha256, f.preview, f.served, fileRef(up.op.share, up.op.prefix, conv, up.op.bundle, f.id), at)
@@ -644,7 +648,7 @@ export class ConversationService {
   }
 
   private async postFiles(conv: string, o: PostInput, files: IncomingFile[]): Promise<PostResult> {
-    const digest = submissionDigest({ author: o.author, text: o.text, files: files.map(f => ({ name: f.name, mime: f.mime, bytes: f.bytes.length, sha256: f.sha256 })), challenges: o.challenges ?? [], to: o.to ?? [], runs: o.runs ?? [], re: o.re ?? [], with: o.with ?? null, title: o.title ?? null, via: o.via ?? null })
+    const digest = submissionDigest({ author: o.author, text: o.text, files: files.map(f => ({ name: f.name, mime: f.mime, bytes: f.bytes.length, sha256: f.sha256 })), challenges: o.challenges ?? [], ...(o.cites?.length ? { cites: o.cites } : {}), to: o.to ?? [], runs: o.runs ?? [], re: o.re ?? [], with: o.with ?? null, title: o.title ?? null, via: o.via ?? null })
     const same = (op: UploadRow) => op.digest === digest && op.author === o.author
     let op = this.upload(conv, o.token)
     if (op && !same(op)) throw this.tokenConflict(conv, o.token, op)
@@ -660,7 +664,7 @@ export class ConversationService {
     // A message nobody can receive publishes nothing.
     await this.route(conv, o)
     if (!op) {
-      const pins = await this.cs.pinAll(o.challenges ?? [])
+      const pins = [...await this.cs.pinAll(o.challenges ?? []), ...await this.cs.pinCites(o.cites ?? [])]
       const alloc: AllocatedFile[] = files.map(f => ({ id: newAttachmentId(), ordinal: f.ordinal, name: f.name, mime: f.mime, bytes: f.bytes.length, sha256: f.sha256, preview: f.preview, served: f.served }))
       op = this.tx(() => {
         const again = this.upload(conv, o.token)
@@ -674,7 +678,7 @@ export class ConversationService {
       if (!same(op)) throw this.tokenConflict(conv, o.token, op)
     }
     const alloc = JSON.parse(op.files) as AllocatedFile[]
-    const pins = JSON.parse(op.pins) as ChallengeAttachmentRef[]
+    const pins = JSON.parse(op.pins) as (ChallengeAttachmentRef | BraindumpAttachmentRef)[]
     if (op.state !== 'accepted') {
       try {
         const r = await publishBundle({ share: op.share, prefix: op.prefix, conversation: conv, bundle: op.bundle, files: alloc, bytes: f => files[f.ordinal - 1].bytes }, { afterStaging: this.testHooks.afterStaging })

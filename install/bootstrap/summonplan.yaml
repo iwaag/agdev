@@ -9,7 +9,7 @@ intent: "The summoner first: it proposes this installation's other projects from
 entries:
   - project: summoner
     source: https://github.com/iwaag/pj-summoner.git
-    commit: 0aa7253582ce28bf442203a63e843d9a492bf4f5
+    commit: 42582c0346638f986a8990d2cb68566c3265e924
     because: []
     state: summoned
     note: "The core's reference (install/bootstrap/summonplan.yaml)."

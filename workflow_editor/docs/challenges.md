@@ -248,6 +248,10 @@ state.
 
 ## Carrying a challenge into work
 
+A braindump of the catalog is carried into work the same way and stays a kind
+of its own (`kind: braindump`, cited, never attached as a challenge):
+[mycatalog.md](mycatalog.md) *Citing a braindump*.
+
 A challenge is **attached** to a message as `{id, commit}` (the commit
 defaults to the current revision when the message is sent). The conversation
 store keeps, per message, the challenge, the commit, its title and the hash

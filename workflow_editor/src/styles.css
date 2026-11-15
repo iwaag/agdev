@@ -1462,3 +1462,13 @@ html[data-display="detail"] .dash-glance { max-width: none; padding: 0; }
 .catalog-projects th, .catalog-projects td { text-align: left; padding: 6px 8px; border-bottom: 1px solid var(--line); vertical-align: top; }
 .catalog-projects tr { scroll-margin: 80px; }
 @media (max-width: 640px) { .catalog-projects th:nth-child(4), .catalog-projects td:nth-child(4) { display: none; } }
+
+/* user_catalog p4: starting a conversation or a request from a braindump or an index entry; what cited a braindump */
+.catalog-entry-actions { display: inline-flex; gap: 6px; margin-left: 8px; vertical-align: baseline; }
+.catalog-entry-actions .small { font-size: 12px; padding: 1px 8px; }
+.catalog-request { margin: 8px 0; padding: 8px 12px; border-left: 3px solid var(--line); max-width: 84ch; }
+.catalog-request textarea { width: 100%; }
+.catalog-cited { margin: 8px 0 0; }
+.catalog-cited ul { margin: 4px 0 0; padding-left: 18px; }
+.catalog-cited li { margin: 2px 0; }
+.catalog-cited .chip { margin-left: 6px; }

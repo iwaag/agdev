@@ -7,7 +7,8 @@
 import { h } from './dom.ts'
 
 // Where a link of the text leads: return a URL, or a handler, or null to show it as text.
-export type LinkResolver = (target: string) => { href: string; onclick?: (e: Event) => void; external?: boolean } | null
+// `data`: what the link is, for the page that renders the text (set on the anchor's dataset).
+export type LinkResolver = (target: string) => { href: string; onclick?: (e: Event) => void; external?: boolean; data?: Record<string, string> } | null
 
 const SAFE = /^(https?:|mailto:|#)/i
 const defaultLink: LinkResolver = t => SAFE.test(t) ? { href: t, external: /^https?:/i.test(t) } : null
@@ -22,7 +23,7 @@ function inline(text: string, link: LinkResolver): (Node | string)[] {
     if (m[1]) out.push(h('code', m[2]))
     else if (m[3] !== undefined) {
       const l = link(m[4]) ?? defaultLink(m[4])
-      out.push(l ? h('a', { href: l.href, ...(l.onclick ? { onclick: l.onclick } : {}), ...(l.external ? { target: '_blank', rel: 'noopener' } : {}) }, inline(m[3], link)) : h('span', { title: m[4] }, inline(m[3], link)))
+      out.push(l ? h('a', { href: l.href, ...(l.onclick ? { onclick: l.onclick } : {}), ...(l.external ? { target: '_blank', rel: 'noopener' } : {}), ...(l.data ? { dataset: l.data } : {}) }, inline(m[3], link)) : h('span', { title: m[4] }, inline(m[3], link)))
     } else if (m[5] !== undefined || m[6] !== undefined) out.push(h('strong', inline(m[5] ?? m[6], link)))
     else if (m[7] !== undefined || m[8] !== undefined) out.push(h('em', inline(m[7] ?? m[8], link)))
     else if (m[9]) out.push(h('a', { href: m[9], target: '_blank', rel: 'noopener' }, m[9]))

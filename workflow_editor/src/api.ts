@@ -212,7 +212,8 @@ export const api = {
   applyDraft: (id: string, draft: string, input: { revision: number; by: string; key: string }) => call<ApplyResult>('POST', `${drafts(id)}/${draft}/apply`, input, [409, 422, 502]),
   tryDraft: (id: string, draft: string, input: { revision: number; text: string; author: string; receipt: string; by: string }) => call<{ ok: true; ref: { workflow: string; run: string }; job: { id: number; state: string }; duplicate: boolean }>('POST', `${drafts(id)}/${draft}/try`, input),
   syncWorkspace: (id: string, dryRun = false) => call<SyncResultView>('POST', `${ws(id)}/sync`, { dryRun }, [409]),
-  requestRun: (id: string, input: { workflow: string; text: string; author: string; receipt: string }) =>
+  // cites: braindumps of the catalog the request stands on; challenges: challenges it is about (user_catalog p4).
+  requestRun: (id: string, input: { workflow: string; text: string; author: string; receipt: string; cites?: string[]; challenges?: string[] }) =>
     call<{ ok: true; duplicate: boolean; ref: { workflow: string; run: string }; job: { id: number; state: string } }>('POST', `${ws(id)}/runs`, input),
   nodeCatalog: () => call<NodeCatalogView>('GET', 'api/nodes'),
   createTemplate: (body: TemplateBody & { id: string }) => call<{ template: NodeTemplate }>('POST', 'api/nodes', body),

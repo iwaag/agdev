@@ -30,8 +30,17 @@ export interface ChallengeAttachmentRef { kind: 'challenge'; id: string; commit:
 // accepted with — conversation, message, position — with the original name,
 // the client's media type hint, the size and the sha256.
 export interface FileAttachmentRef { kind: 'file'; id: string; bundle: string; conversation: string; message: number; ordinal: number; name: string; mime: string; bytes: number; sha256: string; ref: string }
-export type AttachmentRef = ChallengeAttachmentRef | FileAttachmentRef
-export const attachmentLabel = (a: AttachmentRef) => a.kind === 'file' ? `file "${a.name}" (${a.id}, ${a.bytes} bytes) of ${a.conversation} #${a.message}` : `challenge ${a.id} "${a.title}" at ${a.commit.slice(0, 12)}`
+// A braindump of this installation's catalog cited by a message or a request
+// (user_catalog p4, docs/mycatalog.md *Citing a braindump*): its path below
+// braindumps/episodes/, the catalog commit it was cited at (the head then, or
+// the one named), the title it had and the sha256 of its text at that commit.
+// It is the ground of the request: what the person stands on, not an
+// instruction to carry out in full and not a preference.
+export interface BraindumpAttachmentRef { kind: 'braindump'; id: string; commit: string; title: string; sha256: string }
+export type AttachmentRef = ChallengeAttachmentRef | BraindumpAttachmentRef | FileAttachmentRef
+export const attachmentLabel = (a: AttachmentRef) => a.kind === 'file' ? `file "${a.name}" (${a.id}, ${a.bytes} bytes) of ${a.conversation} #${a.message}` : a.kind === 'braindump' ? `cited braindump ${a.id} "${a.title}" at ${a.commit.slice(0, 12)}` : `challenge ${a.id} "${a.title}" at ${a.commit.slice(0, 12)}`
+// The run-relative file a cited braindump is written to.
+export const citedFile = (a: { id: string; commit: string }) => `attachments/braindump-${a.id.replaceAll('/', '--')}@${a.commit.slice(0, 12)}.md`
 // cluster_teamwork p2: an envelope another installation delivered over HTTP —
 // the authenticated sending instance and the envelope's own id, never a
 // manufactured Zulip post.

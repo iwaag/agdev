@@ -15,9 +15,12 @@
 // (written by an agent, stored and shown here, never parsed), and
 // publication/github.toml says which braindumps and challenges are in the
 // published part.
+import { createHash } from 'node:crypto'
 import { mkdir, readdir, rename, rm, stat, writeFile } from 'node:fs/promises'
 import { basename, dirname, join, resolve } from 'node:path'
 import type { Issue } from '../shared/model.ts'
+import type { BraindumpAttachmentRef } from '../shared/intake.ts'
+import { citationCounts, citations, type Citation } from './citations.ts'
 import {
   braindumpExcerpt, braindumpPath, braindumpTitle, BRAINDUMP_DIR, BRAINDUMP_FILE, CATALOG_FILE, CATALOG_REPOSITORY, CHALLENGES_DIR, EPISODES_DIR, INDEX_PATH, isBraindumpId,
   isPreferenceName, MAX_BRAINDUMP_DEPTH, MYCATALOG_SCHEMA, OLD_LAYOUT, OLD_LAYOUT_PROBLEM, PLAN_NAME_PATTERN, preferencePath, PREFERENCES_DIR, PROJECTS_PATH, PROJECTS_SCHEMA, PUBLICATION_CONTRACT, publishedPaths, readPublicationContract, reviewPath,
@@ -318,7 +321,8 @@ export interface CatalogView {
   repository: string; web: string; branch: string; head: string; plan: string
   title: string
   person: string | null
-  braindumps: (BraindumpInfo & { projects: string[] })[]
+  // cited (user_catalog p4): how many times it was cited by a message or a request here.
+  braindumps: (BraindumpInfo & { projects: string[]; cited: number })[]
   preferences: PreferenceInfo[]
   projects: ProjectGround[]
   plans: { name: string; intent: string; entries: number; problem?: string; errors: number; warnings: number }[]
@@ -352,7 +356,7 @@ async function personOf(area: string): Promise<string | null> {
 }
 
 type Known = { projects: { id: string }[]; workspaces: { id: string; project?: string }[] }
-export function relate(snap: CatalogSnapshot, reg: Known): Pick<CatalogView, 'braindumps' | 'projects'> {
+export function relate(snap: CatalogSnapshot, reg: Known): { braindumps: (BraindumpInfo & { projects: string[] })[]; projects: ProjectGround[] } {
   const registered = reg.projects.map(p => p.id)
   const plan = snap.plans.find(p => p.name === snap.setting.plan)?.plan ?? null
   const byPath = new Map(snap.braindumps.map(b => [b.path, b]))
@@ -384,11 +388,12 @@ export async function catalogView(ctx: CatalogContext, o: { maxAgeMs?: number } 
     ...snap.projects.issues.map(issue => ({ where: PROJECTS_PATH, issue })),
     ...snap.plans.flatMap(p => p.issues.map(issue => ({ where: p.path, issue }))),
   ]
+  const cited = citationCounts(ctx.area)
   return {
     configured: true,
     repository: `${snap.setting.repository.owner}/${snap.setting.repository.name}`, web: snap.web, branch: snap.setting.branch, head: snap.head, plan: snap.setting.plan,
     title: snap.catalog.doc?.title ?? '', person: await personOf(ctx.area),
-    ...relate(snap, reg),
+    ...(r => ({ projects: r.projects, braindumps: r.braindumps.map(b => ({ ...b, cited: cited.get(b.id) ?? 0 })) }))(relate(snap, reg)),
     preferences: snap.preferences,
     plans: snap.plans.map(p => ({ name: p.name, intent: p.plan?.intent ?? '', entries: p.plan?.entries.length ?? 0, ...(p.problem ? { problem: p.problem } : {}), errors: p.issues.filter(i => i.severity === 'error').length, warnings: p.issues.filter(i => i.severity === 'warning').length })),
     index: snap.index, challenges: await challengesBrief(ctx, snap.setting, snap.published),
@@ -416,7 +421,123 @@ export async function braindump(ctx: CatalogContext, id: string) {
   const reg = await loadRegistry(ctx.registryFile)
   const projects = relate(snap, reg).braindumps.find(x => x.id === id)?.projects ?? []
   const plans = snap.plans.filter(p => p.plan?.entries.some(e => e.because.includes(b.path))).map(p => p.name)
-  return { ...b, head: snap.head, web: `${snap.web}/src/branch/${snap.setting.branch}/${b.path}`, history: await historyOf(checkoutDir(ctx.area), b.path), projects, plans }
+  return { ...b, head: snap.head, web: `${snap.web}/src/branch/${snap.setting.branch}/${b.path}`, history: await historyOf(checkoutDir(ctx.area), b.path), projects, plans, citedBy: await citedBy(ctx, id) }
+}
+
+// ---- citing a braindump (user_catalog p4) ------------------------------------------
+
+// The conversations and runs that cited a braindump, newest first, each with
+// where it opens in the editor and whether the braindump's text changed since
+// the cited commit.
+// href: the run's view in the editor; a conversation opens in the conversation client.
+export type CitedBy = Citation & { href: string | null; label: string; changed: boolean }
+export async function citedBy(ctx: CatalogContext, id: string): Promise<CitedBy[]> {
+  const list = citations(ctx.area, id)
+  if (!list.length) return []
+  const dir = checkoutDir(ctx.area)
+  const now = (await git(dir, ['rev-parse', `HEAD:${braindumpPath(id)}`])).stdout.trim()
+  const blobs = new Map<string, string>()
+  const out: CitedBy[] = []
+  for (const c of list) {
+    if (!blobs.has(c.commit)) blobs.set(c.commit, (await git(dir, ['rev-parse', `${c.commit}:${braindumpPath(id)}`])).stdout.trim())
+    const w = c.where
+    out.push({ ...c, changed: blobs.get(c.commit) !== now,
+      href: w.kind === 'conversation' ? null : `#/ws/${encodeURIComponent(w.workspace)}/run/${encodeURIComponent(w.workflow)}/${encodeURIComponent(w.run)}`,
+      label: w.kind === 'conversation' ? `conversation ${w.conversation} #${w.message}` : `${w.workspace}/${w.workflow}/${w.run}` })
+  }
+  return out
+}
+
+const sha256 = (t: string) => createHash('sha256').update(t).digest('hex')
+const showAt = async (dir: string, commit: string, path: string): Promise<string | null> => { const r = await git(dir, ['show', `${commit}:${path}`]); return r.code === 0 ? r.stdout : null }
+
+// A braindump at the catalog's head now, or at the commit named: what a
+// citation records. Refused when the path or the commit does not resolve: a
+// message never carries a citation that cannot be read.
+export async function pinBraindump(ctx: CatalogContext, id: string, at?: string): Promise<BraindumpAttachmentRef> {
+  const s = await needSetting(ctx)
+  needId(id)
+  return withLock(settingFile(ctx.area), async () => {
+    const head = await sync(ctx, s, 0)
+    const dir = checkoutDir(ctx.area)
+    let commit = head
+    if (at) {
+      if (!/^[0-9a-f]{7,64}$/.test(at)) throw new RequestError(400, `"${at}" is not a commit id`)
+      const r = await git(dir, ['rev-parse', '--verify', '--quiet', `${at}^{commit}`])
+      if (r.code !== 0) throw new RequestError(404, `the catalog has no commit ${at}`, { code: 'missing' })
+      commit = r.stdout.trim()
+    }
+    const text = await showAt(dir, commit, braindumpPath(id))
+    if (text === null) throw new RequestError(404, `no braindump "${id}" in the catalog${at ? ` at ${commit.slice(0, 12)}` : ''} (${braindumpPath(id)}); wfe catalog braindump list`, { code: 'missing' })
+    return { kind: 'braindump', id, commit, title: braindumpTitle(id, text), sha256: sha256(text) }
+  }, { what: 'the catalog' })
+}
+export async function pinBraindumps(ctx: CatalogContext, refs: { id: string; at?: string }[]): Promise<BraindumpAttachmentRef[]> {
+  if (refs.length > 20) throw new RequestError(400, 'a message cites at most 20 braindumps')
+  const out: BraindumpAttachmentRef[] = []
+  for (const r of refs) {
+    const id = r.id.replace(/^\/+|\/+$/g, '')
+    if (!out.some(x => x.id === id)) out.push(await pinBraindump(ctx, id, r.at))
+  }
+  return out
+}
+
+// The file a run is given for a cited braindump: what it is, the text at the
+// cited commit, the review as it was then with its author and date, and the
+// names of the projects this installation's plan grounded on it then (the
+// names only: their records are theirs to be asked for).
+export async function citedText(ctx: CatalogContext, ref: BraindumpAttachmentRef): Promise<string> {
+  const s = await needSetting(ctx)
+  return withLock(settingFile(ctx.area), async () => {
+    const dir = checkoutDir(ctx.area)
+    if (!await exists(join(dir, '.git')) || (await git(dir, ['cat-file', '-e', `${ref.commit}^{commit}`])).code !== 0) await sync(ctx, s, 0)
+    const path = braindumpPath(ref.id)
+    const text = await showAt(dir, ref.commit, path)
+    if (text === null) throw new RequestError(404, `the cited braindump ${ref.id} cannot be read at ${ref.commit.slice(0, 12)}`)
+    if (sha256(text) !== ref.sha256) throw new RequestError(409, `the cited braindump ${ref.id}@${ref.commit.slice(0, 12)}: its text is not the one cited (hash differs)`)
+    const log = async (p: string) => { const [commit, at, author] = (await git(dir, ['log', '-1', '--format=%H%x09%aI%x09%an', ref.commit, '--', p])).stdout.trim().split('\t'); return commit ? { commit, at, author } : null }
+    const written = await log(path)
+    const review = await showAt(dir, ref.commit, reviewPath(ref.id))
+    const reviewed = review === null ? null : await log(reviewPath(ref.id))
+    const pt = s.plan ? await showAt(dir, ref.commit, summonplanPath(s.plan)) : null
+    const pp = pt === null ? null : parseSummonplan(pt)
+    const projects = pp?.ok ? pp.model.entries.filter(e => e.because.includes(path)).map(e => e.project) : []
+    const repo = `${s.repository.owner}/${s.repository.name}`
+    return [
+      `# Cited braindump: ${ref.title}`, '',
+      `This is the braindump \`${ref.id}\` of the catalog ${repo}, as it was at commit ${ref.commit.slice(0, 12)} when it was cited with the words you were given.`,
+      'It is the ground of this request: what the person stands on when asking. It is not an instruction to carry out in full, and it is not a preference (how work is done). Do what the request asks; read this to understand why it is asked and what it is part of.',
+      `A later edit never changes this file. The present text: \`wfe catalog braindump show ${ref.id}\`.`, '',
+      `- Path: \`${path}\`${written ? `; last changed by ${written.author}, ${written.at.slice(0, 10)} (${written.commit.slice(0, 12)})` : ''}`,
+      `- Projects this installation's plan${s.plan ? ` (${s.plan})` : ''} grounded on it then: ${projects.length ? projects.join(', ') : 'none'}`,
+      `- Review: ${reviewed ? `by ${reviewed.author}, ${reviewed.at.slice(0, 10)} (${reviewed.commit.slice(0, 12)}); below` : review !== null ? 'below' : 'none existed at this commit'}`, '',
+      '---', '', '## The braindump', '', text.trimEnd(), '',
+      ...(review !== null ? ['---', '', `## Its review${reviewed ? ` (${reviewed.author}, ${reviewed.at.slice(0, 10)})` : ''}`, '', 'A review is free text about the braindump: what of it became real, where, what did not.', '', review.trimEnd(), ''] : []),
+    ].join('\n')
+  }, { what: 'the catalog' })
+}
+
+// Whether each cited braindump's text changed since its cited commit: the
+// last change of the present text when it differs, `removed` when it is gone.
+export async function citedNow(ctx: CatalogContext, refs: { id: string; commit: string }[]): Promise<Map<string, { changed: Change | null; removed: boolean }>> {
+  const out = new Map<string, { changed: Change | null; removed: boolean }>()
+  if (!refs.length) return out
+  const s = await loadCatalogSetting(ctx.area)
+  if (!s) return out
+  await withLock(settingFile(ctx.area), async () => {
+    await sync(ctx, s, 10_000)
+    const dir = checkoutDir(ctx.area)
+    for (const r of refs) {
+      const key = `${r.id}@${r.commit}`
+      if (out.has(key)) continue
+      const path = braindumpPath(r.id)
+      const now = await git(dir, ['rev-parse', '--verify', '--quiet', `HEAD:${path}`])
+      if (now.code !== 0) { out.set(key, { changed: null, removed: true }); continue }
+      const then = (await git(dir, ['rev-parse', '--verify', '--quiet', `${r.commit}:${path}`])).stdout.trim()
+      out.set(key, { changed: then === now.stdout.trim() ? null : await lastChange(dir, path), removed: false })
+    }
+  }, { what: 'the catalog' })
+  return out
 }
 
 export async function plan(ctx: CatalogContext, name: string) {

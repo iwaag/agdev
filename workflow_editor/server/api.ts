@@ -385,7 +385,7 @@ export function createHandler(config: ServiceConfig) {
         if (!cs) throw new RequestError(503, 'conversations are not configured on this service')
         const { ConversationService } = await import('./conversationService.ts')
         const { ConversationArchive } = await import('./conversationArchive.ts')
-        const { viewBaseOf, attachRequests } = await import('./conversations.ts')
+        const { viewBaseOf, attachRequests, citeRequests } = await import('./conversations.ts')
         const mf = await import('./messageFiles.ts')
         const ds = new ConversationService(cs)
         const cfg = ds.config()
@@ -431,7 +431,7 @@ export function createHandler(config: ServiceConfig) {
           const r = ds.create(id, { title: str(input.title, 'title'), by: author, members: list('members'), category: opt('category'), facilitate: input.facilitate === true, ...(dt !== undefined ? { defaultTo: dt as string | null } : {}) })
           let posted = null
           const fs = files()
-          if (input.text !== undefined || fs.length) posted = await ds.post(id, { text: said(fs), author, token: str(input.token, 'token'), to: list('to'), re: nums('re'), via: opt('via'), challenges: attachRequests(input.challenges), files: fs })
+          if (input.text !== undefined || fs.length) posted = await ds.post(id, { text: said(fs), author, token: str(input.token, 'token'), to: list('to'), re: nums('re'), via: opt('via'), challenges: attachRequests(input.challenges), cites: citeRequests(input.cites), files: fs })
           return send(res, r.duplicate ? 200 : 201, { created: !r.duplicate, posted: posted && { message: posted.message.id, duplicate: posted.duplicate, requests: posted.invitations.map(i => ds.invitationView(i)) }, ...await view(id) })
         }
         if (wsId && !b && method === 'GET') {
@@ -445,7 +445,7 @@ export function createHandler(config: ServiceConfig) {
         if (wsId && b === 'messages' && !file && method === 'POST') {
           const c = need()
           const fs = files()
-          const r = await ds.post(wsId, { text: said(fs), author: opt('author') ?? c.person, token: str(input.token, 'token'), to: list('to'), runs: list('runs'), re: nums('re'), via: opt('via'), with: opt('with'), title: opt('title'), challenges: attachRequests(input.challenges), files: fs })
+          const r = await ds.post(wsId, { text: said(fs), author: opt('author') ?? c.person, token: str(input.token, 'token'), to: list('to'), runs: list('runs'), re: nums('re'), via: opt('via'), with: opt('with'), title: opt('title'), challenges: attachRequests(input.challenges), cites: citeRequests(input.cites), files: fs })
           const attached = (await cs.attachmentViews(wsId, viewBaseOf(area))).get(r.message.id) ?? []
           return send(res, 200, { sent: true, duplicate: r.duplicate, reopened: r.reopened, created: r.created, message: { ...ds.message(r.message, viewBaseOf(area)), attachments: attached }, requests: r.invitations.map(i => ds.invitationView(i, viewBaseOf(area))) })
         }
@@ -479,7 +479,7 @@ export function createHandler(config: ServiceConfig) {
           const action = str(input.action, 'action')
           const by = opt('author') ?? c.person
           if (action === 'start') {
-            const r = await ds.startFacilitation(wsId, { text: words('text'), author: by, token: str(input.token, 'token'), re: nums('re'), via: opt('via'), challenges: attachRequests(input.challenges) })
+            const r = await ds.startFacilitation(wsId, { text: words('text'), author: by, token: str(input.token, 'token'), re: nums('re'), via: opt('via'), challenges: attachRequests(input.challenges), cites: citeRequests(input.cites) })
             return send(res, 200, { duplicate: r.duplicate, facilitation: r.facilitation, message: ds.message(r.posted.message, viewBaseOf(area)), requests: r.posted.invitations.map(i => ds.invitationView(i, viewBaseOf(area))) })
           }
           if (action === 'end') return send(res, 200, await ds.endFacilitation(wsId, { by, note: opt('note') }))
@@ -1040,9 +1040,10 @@ export function createHandler(config: ServiceConfig) {
           const input = await body(req) as Record<string, unknown>
           const predecessor = typeof input.predecessor === 'string' && input.predecessor ? await resolveRef(ws, input.predecessor) : undefined
           // Challenges named with the request (challenge p1), pinned now.
-          const { attachRequests, ConversationStore } = await import('./conversations.ts')
-          const wanted = attachRequests(input.challenges)
-          const attachments = wanted.length ? await (async () => { const cs = config.conversations ?? new ConversationStore({ area, exec: needExec() }); return cs.pinnedTexts(await cs.pinAll(wanted)) })() : []
+          // Braindumps of the catalog cited with it (user_catalog p4), as well.
+          const { attachRequests, citeRequests, ConversationStore } = await import('./conversations.ts')
+          const wanted = attachRequests(input.challenges), cites = citeRequests(input.cites)
+          const attachments = wanted.length || cites.length ? await (async () => { const cs = config.conversations ?? new ConversationStore({ area, exec: needExec() }); try { return await cs.pinnedFor(wanted, cites) } finally { if (!config.conversations) cs.close() } })() : []
           const r = await needExec().request({ workspace: ws.reg.id, workflow: str(input.workflow, 'workflow'), text: str(input.text, 'the request text'), author: str(input.author, 'author'), receipt: str(input.receipt, 'receipt'), by: typeof input.by === 'string' ? input.by : undefined, via: 'browser', predecessor, ...(typeof input.node === 'string' && input.node ? { node: input.node } : {}), ...(attachments.length ? { attachments } : {}) })
           return send(res, r.duplicate ? 200 : 201, { ok: true, ...r })
         }

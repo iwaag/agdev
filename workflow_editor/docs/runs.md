@@ -117,6 +117,16 @@ the `requester` and records the reference to what entrusted it: a run and node
 path}`), or a free reference such as a conversation (`{kind: "note", text}`).
 An entrance for requests from external agents is not part of p4.
 
+What the request carried is in `input.attachments[]`, each with the file the
+run was given under `attachments/`: a challenge at its attached revision
+(`{kind: challenge, …}`, [challenges.md](challenges.md)), a braindump of the
+catalog cited with the request (`{kind: braindump, id: <path>, commit, title,
+sha256, file}`: its text at that catalog commit, its review then and the
+projects grounded on it; the ground of the request, not an instruction to
+carry out in full — [mycatalog.md](mycatalog.md) *Citing a braindump*), or a
+file a message carried (`{kind: file, …}`, [message-files.md](message-files.md)).
+`wfe request` and `wfe run create` take `--cite <path>[@<commit>]`.
+
 Runs created before this rename are read as they are and never rewritten:
 `{kind: braindump, file: braindump.md}` is a person's request, and `{kind:
 request}` without `from` an agent's (`requestFrom` in `shared/run.ts`). The

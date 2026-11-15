@@ -424,6 +424,12 @@ is equally valid; see docs/contract.md.`,
 wfe request <workflow> --request <file|-> [--requester <agent>] [--entrusted-by <ref>] [--on-behalf-of <person>] [--original <file>] [--predecessor <run>] [--node <worker>] [--receipt <id>] [--workspace <id>]
 Both take [--challenge <id>[@<commit>]]…: a challenge the work is about (wfe challenge help), given to
 the run as it is at that revision (its file in the run folder, input.attachments in run.json).
+Both take [--cite <path>[@<commit>]]…: a braindump of the catalog the request stands on (wfe catalog
+braindump list), given to the run as it is at the catalog's head now (or at <commit>):
+attachments/braindump-<path>@<commit>.md with its text, its review then and the projects grounded
+on it. A cited braindump is the ground of the request, not an instruction to carry out in full and
+not a preference; citing is never required. The braindump records the run under "cited by"
+(wfe catalog braindump show <path>).
 
 The text becomes the run's request.md. With --author it is a person's request
 (their words); otherwise an agent's: what the agent wrote, not a person's
@@ -1934,12 +1940,14 @@ async function cmdRequest(p: Parsed): Promise<number> {
     let r: Awaited<ReturnType<typeof x.request>>
     // Challenges named with the request (challenge p1), pinned now: the run
     // is given each as it is at this revision.
-    const wanted = p.opts.get('challenge') ?? []
+    // Braindumps of the catalog cited with it (user_catalog p4): the ground
+    // the request stands on, each as it is at the catalog's head now.
+    const wanted = p.opts.get('challenge') ?? [], cites = p.opts.get('cite') ?? []
     let attachments: import('../server/runs.ts').PinnedAttachment[] = []
-    if (wanted.length) {
-      const { attachRequests, ConversationStore } = await import('../server/conversations.ts')
+    if (wanted.length || cites.length) {
+      const { attachRequests, citeRequests, ConversationStore } = await import('../server/conversations.ts')
       const cs = new ConversationStore({ area: areaDir(p), exec: x })
-      try { attachments = await cs.pinnedTexts(await cs.pinAll(attachRequests(wanted))) } finally { cs.close() }
+      try { attachments = await cs.pinnedFor(attachRequests(wanted), citeRequests(cites)) } finally { cs.close() }
     }
     const trial = p.flags.has('editing') ? { file: workflow } : undefined
     try { r = await x.request({ workspace: ws.reg.id, workflow, text, author: author ?? input?.requester ?? '', receipt, by: opt(p, 'by') ?? own?.agent, via: 'cli', predecessor, node: opt(p, 'node'), ...(input ? { input } : {}), ...(attachments.length ? { attachments } : {}), ...(trial ? { trial } : {}) }) } catch (e) { if (journal !== null) ev?.wfs.abort(journal); ev?.close(); throw e }

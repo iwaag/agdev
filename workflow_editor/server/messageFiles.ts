@@ -139,7 +139,7 @@ export function decodeFiles(v: unknown): IncomingFile[] {
 // The digest an upload operation is bound to: what was said, the files in
 // order and where the words go. Derived URLs, host paths and arrival times
 // are not part of it.
-export function submissionDigest(o: { author: string; text: string; files: { name: string; mime: string; bytes: number; sha256: string }[]; challenges: unknown[]; to: string[]; runs: string[]; re: number[]; with: string | null; title: string | null; via: string | null }): string {
+export function submissionDigest(o: { author: string; text: string; files: { name: string; mime: string; bytes: number; sha256: string }[]; challenges: unknown[]; cites?: unknown[]; to: string[]; runs: string[]; re: number[]; with: string | null; title: string | null; via: string | null }): string {
   return `sha256:${createHash('sha256').update(canonicalJson({ ...o, files: o.files.map(f => ({ name: f.name, mime: f.mime, bytes: f.bytes, sha256: f.sha256 })) })).digest('hex')}`
 }
 

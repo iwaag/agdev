@@ -18,7 +18,8 @@ import {
 } from '../shared/run.ts'
 import { requestFrom } from '../shared/run.ts'
 import { runStatus } from '../shared/status.ts'
-import type { SourceRef } from '../shared/intake.ts'
+import { citedFile, type SourceRef } from '../shared/intake.ts'
+import { isBraindumpId } from '../shared/catalog.ts'
 import { atomicWrite, inside, readTextOrNull, withinRoot } from './files.ts'
 import { MANIFEST_KIND } from '../shared/review.ts'
 import { refsIn } from '../shared/shares.ts'
@@ -555,7 +556,10 @@ export interface CreatedRun { ref: RunRef; dir: string; record: RunRecord; files
 // attached commit (challenge p1): written into the run folder as given.
 // A challenge with its revision's text, or a message file by occurrence
 // (p19: its bytes stay on the share).
-export type PinnedAttachment = (import('../shared/intake.ts').ChallengeAttachmentRef & { text: string }) | import('../shared/intake.ts').FileAttachmentRef
+// A cited braindump (user_catalog p4) with the file the run is given: what
+// it is, its text at the cited commit, its review then, the projects
+// grounded on it (server/catalog.ts citedText).
+export type PinnedAttachment = (import('../shared/intake.ts').ChallengeAttachmentRef & { text: string }) | (import('../shared/intake.ts').BraindumpAttachmentRef & { text: string }) | import('../shared/intake.ts').FileAttachmentRef
 
 // The next run-NNN: past every run recorded, held by a copy or named by a
 // run branch (p9). Called under the workspace's allocation lock.
@@ -684,6 +688,15 @@ function withAttachments(input: RunInput, files: Record<string, string>, attachm
       if (seen.has(f.id)) continue
       seen.add(f.id)
       input.attachments.push(f)
+      continue
+    }
+    if (a.kind === 'braindump') {
+      if (!isBraindumpId(a.id) || !/^[0-9a-f]{40,64}$/.test(a.commit)) throw new RequestError(400, `attachment ${a.id}@${a.commit} is not a cited braindump`)
+      const file = citedFile(a)
+      if (seen.has(file)) continue
+      seen.add(file)
+      files[file] = a.text
+      input.attachments.push({ kind: 'braindump', id: a.id, commit: a.commit, title: a.title, sha256: a.sha256, file })
       continue
     }
     if (a.kind !== 'challenge' || !/^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/.test(a.id) || !/^[0-9a-f]{40,64}$/.test(a.commit)) throw new RequestError(400, `attachment ${a.id}@${a.commit} is not a pinned challenge`)

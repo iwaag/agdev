@@ -8,7 +8,7 @@ import { contextChanges, changeWords, type AttemptContext, type ContextDelivery 
 import { docStepsOf, type EffectiveGraph, type EffectiveGroup, type EffectiveNode, type StepSpec } from './compile.ts'
 import type { DocSteps } from './model.ts'
 import type { AttemptCatalog, CatalogContext } from './nodeCatalog.ts'
-import { INSTRUCTION_RESPONSES, sourceLabel, type AttachmentRef, type ChallengeAttachmentRef, type FileAttachmentRef, type SourceRef } from './intake.ts'
+import { INSTRUCTION_RESPONSES, sourceLabel, type AttachmentRef, type BraindumpAttachmentRef, type ChallengeAttachmentRef, type FileAttachmentRef, type SourceRef } from './intake.ts'
 import {
   CANDIDATE, INPUT_ID, OUTPUT_ID, SET_OBSERVATIONS, STAGINGS, outputNumber, parseRef,
   type ExternalOutput, type InputSet, type SetObservation, type ShareRef, type Staging,
@@ -88,14 +88,17 @@ export interface RunInput {
   // each as it was at the attached commit: the file in the run folder
   // (attachments/<id>@<commit12>.md) is that revision's text. Files a
   // message carried (p19, docs/message-files.md) are named by occurrence;
-  // their bytes stay on the share (wfe conversation fetch).
+  // their bytes stay on the share (wfe conversation fetch). Braindumps of the
+  // catalog cited with the words (user_catalog p4): each as it was at the
+  // cited commit, with its review and the projects grounded on it
+  // (attachments/braindump-<path>@<commit12>.md).
   attachments?: InputAttachment[]
 }
 
 export function requestFrom(input: Pick<RunInput, 'kind' | 'from'>): 'person' | 'agent' {
   return input.from ?? (input.kind === 'braindump' ? 'person' : 'agent')
 }
-export type InputAttachment = (ChallengeAttachmentRef & { file: string }) | FileAttachmentRef
+export type InputAttachment = (ChallengeAttachmentRef & { file: string }) | (BraindumpAttachmentRef & { file: string }) | FileAttachmentRef
 // `name` is the agent identity the run is performed as (p6: the workflow's
 // execution.agent); `host` the execution host that launches it, when that is
 // not the agent itself (autolab executing for ppt-agent).
@@ -981,7 +984,13 @@ export function attachmentsOf(v: unknown): AttachmentRef[] {
   return v.map((a, i) => {
     const o = isObj(a) ? a as Record<string, unknown> : fail('shape', `source.attachments[${i}] must be an object`)
     if (o.kind === 'file') return fileAttachmentOf(o, `source.attachments[${i}]`)
-    if (o.kind !== 'challenge' || typeof o.id !== 'string' || !/^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/.test(o.id)) fail('shape', `source.attachments[${i}] must be a challenge (ch-0001) or a file`)
+    if (o.kind === 'braindump') {
+      if (typeof o.id !== 'string' || !/^[a-z0-9][a-z0-9_.-]{0,63}(\/[a-z0-9][a-z0-9_.-]{0,63})*$/.test(o.id)) fail('shape', `source.attachments[${i}].id must be a braindump path`)
+      if (typeof o.commit !== 'string' || !/^[0-9a-f]{40,64}$/.test(o.commit)) fail('shape', `source.attachments[${i}].commit must be a full commit id`)
+      if (typeof o.sha256 !== 'string' || !/^[0-9a-f]{64}$/.test(o.sha256)) fail('shape', `source.attachments[${i}].sha256 must be 64 hex digits`)
+      return { kind: 'braindump' as const, id: o.id as string, commit: o.commit as string, title: typeof o.title === 'string' ? o.title : '', sha256: o.sha256 as string }
+    }
+    if (o.kind !== 'challenge' || typeof o.id !== 'string' || !/^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/.test(o.id)) fail('shape', `source.attachments[${i}] must be a challenge (ch-0001), a cited braindump or a file`)
     if (typeof o.commit !== 'string' || !/^[0-9a-f]{40,64}$/.test(o.commit)) fail('shape', `source.attachments[${i}].commit must be a full commit id`)
     if (typeof o.sha256 !== 'string' || !/^[0-9a-f]{64}$/.test(o.sha256)) fail('shape', `source.attachments[${i}].sha256 must be 64 hex digits`)
     return { kind: 'challenge' as const, id: o.id as string, commit: o.commit as string, title: typeof o.title === 'string' ? o.title : '', sha256: o.sha256 as string }
