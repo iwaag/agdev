@@ -48,6 +48,8 @@ export const ICONS: Record<string, string> = {
   stop: svg('<rect x="6" y="6" width="12" height="12" rx="1.5"/>'),
   play: svg('<path d="M8 5.5v13l10-6.5z"/>'),
   lock: svg('<rect x="5" y="10.5" width="14" height="10" rx="1.5"/><path d="M8 10.5V8a4 4 0 0 1 8 0v2.5"/>'),
+  // a dashed circle: not yet real, not yet reviewed (user_catalog p5)
+  pending: svg('<circle cx="12" cy="12" r="8.5" stroke-dasharray="3.3 3.4"/>'),
   link: svg('<path d="M10 14a4 4 0 0 0 5.7 0l3-3a4 4 0 0 0-5.7-5.7l-1 1"/><path d="M14 10a4 4 0 0 0-5.7 0l-3 3a4 4 0 0 0 5.7 5.7l1-1"/>'),
 }
 

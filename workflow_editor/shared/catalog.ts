@@ -115,11 +115,18 @@ export function braindumpTitle(id: string, text: string): string {
   const m = /^#\s+(.+?)\s*#*\s*$/.exec(text.split('\n', 1)[0] ?? '')
   return m ? m[1] : id
 }
-// The first lines after the title, for listings.
+// The first lines after the title, for listings. A first paragraph that is
+// only a note in emphasis (`_…_` or `*…*`, as on a reconstructed braindump)
+// is skipped when text follows it, so that a listing shows the braindump's
+// own first words (user_catalog p5).
 export function braindumpExcerpt(text: string, chars = 480): string {
   const lines = text.split('\n')
   const start = lines.findIndex(l => l.trim() !== '')
-  const body = (start >= 0 && /^#\s/.test(lines[start]) ? lines.slice(start + 1) : lines).join('\n').trim()
+  let body = (start >= 0 && /^#\s/.test(lines[start]) ? lines.slice(start + 1) : lines).join('\n').trim()
+  const para = /^[\s\S]*?(?=\n[ \t]*\n|$)/.exec(body)![0].trim()
+  const inner = /^_(\S[\s\S]*\S|\S)_$/.exec(para)?.[1] ?? /^\*([^*\s][^*]*)\*$/.exec(para)?.[1]
+  // One emphasis, not several: no closing mark inside it.
+  if (inner !== undefined && !/\S_(?!\w)/.test(inner)) { const rest = body.slice(body.indexOf(para) + para.length).trim(); if (rest) body = rest }
   return body.length > chars ? `${body.slice(0, chars).trimEnd()}…` : body
 }
 

@@ -513,16 +513,31 @@ or `null`), `changedAfterReview` and `cited` (how many citations). `GET api/cata
 a braindump's `text` and its review's are in `GET
 api/catalog/braindumps/<path>`.
 
+`excerpt` is the text's first words after its title line; a first paragraph
+that is only a note in emphasis (`_…_`, as on a reconstructed braindump) is
+skipped when text follows it.
+
 The browser shows the same data under **Catalog** on Home (`#/catalog`;
-`#/mind` redirects). The page opens with the index (rendered, with its author
-and date, the note when something changed since, **Refresh the index**).
-Below it are the braindumps grouped by folder path, as titles with excerpts;
-a braindump's text and review are read when it is opened, and edited in the
-same place; **Ask for a review**, **Talk about this** and **Request work** are on each, with what cited it (**Cited by**). Then **Preferences**: each file
-rendered, with its author and date, edited in place. Then the challenges by state,
-each linking to its challenge page. Braindumps, reviews and the index are
-rendered as Markdown; HTML in a text is shown, not run. Each braindump and
-challenge is marked published or internal. A relation diagram and the
-projects follow. Each project page has a "Why
-this project exists" section. A project with no ground is shown as having
-none. It is not hidden.
+`#/mind` redirects), in the two modes of every screen (the Simple/Detail
+toggle in the page head; Simple when nothing is stored). Both modes are the
+same page: Detail adds to what Simple shows.
+
+| Part | Simple | Detail adds |
+| --- | --- | --- |
+| Head | the catalog's title, **New braindump** | the repository and head, the explanation, **Author of changes**, the catalog's problems and issues (Simple says only how many there are) |
+| Summary | four counts, each a way to its part: braindumps, entries of the index, open challenges, preferences; **Write the index** when there is none | |
+| Braindumps | a grid of cards: title, two lines of excerpt, the grounded projects, one mark (reviewed, not reviewed, changed after its review). Folders are headings, after the braindumps that are in none. An opened card spans the grid: the text, the review, **Talk about this**, **Request work** | rows instead of cards; path, author, date, commit, the link to Gitea, published or internal, the cited count; **Edit**, **Remove**; the review's author and date, **Ask for a review**, **Edit review**; **Cited by** |
+| Not yet real | one line per entry of the index (a list item that links to a braindump or a challenge): its kind as an icon, its title, the rest on one line. An entry opens to its full text with **Talk about this** and **Request work**. One line with **Refresh** when the catalog changed after the index. An index with no such entry is shown whole | the index's whole text as written, its file, author, date and commit; **Refresh the index**, **Ask for the reviews that are due** |
+| Braindumps and projects | the diagram with the braindumps and the projects that have a ground; a project leads to its page | every project, with "no ground" and "not in plan"; a project leads to its row of the table |
+| Challenges | those neither resolved nor withdrawn: title and projects, each linking to its challenge page | the other states, id, trials, who and when, published or internal |
+| Preferences | each as a title and its first line; opened: the text | every text whole, its name, author, date, commit, the link to Gitea; **New preference**, **Edit**, **Remove** |
+| Projects and why they are here | | the table |
+| Import a development style | | the card |
+
+A title that is the braindump's path, or that repeats in its folder, is told
+apart in Simple by the last segment of the path. Free text is rendered as
+Markdown; HTML in a text is shown, not run. The name changes are made in is
+remembered per browser; when an action needs it and it is not known, the page
+asks for it where the action was started. Each project page has a "Why this
+project exists" section. A project with no ground is shown as having none. It
+is not hidden.
