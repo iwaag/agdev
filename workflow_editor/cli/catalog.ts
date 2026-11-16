@@ -13,6 +13,7 @@ wfe catalog braindump show <path>
 wfe catalog braindump add <path> (--file <md> | --text <text>) --author <who> [--message <m>]
 wfe catalog braindump edit <path> (--file <md> | --text <text>) --author <who> [--base <commit>] [--message <m>]
 wfe catalog braindump remove <path> --author <who> [--force]
+wfe catalog braindump archive (<path> | --all) --author <who> [--note <text>] [--dry-run]
 wfe catalog review show <path>
 wfe catalog review put <path> (--file <md> | --text <text>) --author <who> [--base <commit>] [--message <m>]
 wfe catalog review request [<path>] --author <who>
@@ -68,8 +69,8 @@ init       create <owner>/mycatalog on Gitea (mycatalog.yaml, projects.yaml,
            one is refused. --plan names the summonplan that describes this
            installation.
 status     the repository, head, plan, braindumps with their reviews and the
-           projects they ground, projects with their grounds (none is said),
-           issues
+           projects they ground, the archive folders, projects with their
+           grounds (none is said), issues
 braindump  show also lists what cited it, newest first ("cited by"): the
            conversations' messages and the runs whose request named it
            (wfe conversation post --cite <path>, wfe request … --cite <path>,
@@ -84,7 +85,22 @@ braindump  show also lists what cited it, newest first ("cited by"): the
            its first line is its title, otherwise its path is.
            edit --base <commit> refuses when someone changed it after that.
            remove refuses while a plan's because names it (--force anyway),
-           and removes its review with it.
+           and removes its review with it. It is for a braindump that should
+           not be kept in the tree at all; otherwise archive.
+           archive moves the braindump with its review to
+           braindumps/archive/<date>/<path>/, in one commit that also takes it
+           out of every because (summonplans/*.yaml and projects.yaml; a list
+           left empty is "no ground", nothing is written in its place) and
+           lists it in that folder's README.md with its title, its last commit
+           and the projects that named it. --all archives every braindump.
+           Only what is below braindumps/episodes/ is a braindump: an archived
+           one grounds nothing, is not reviewed, not indexed and cannot be
+           cited; it stays readable in the repository. The tag archive/<date>
+           is set on the commit before (a later archive of the same day:
+           archive/<date>.2, …). What cited the braindump keeps the text it
+           cited, shown as removed. A path already in the day's folder gets a
+           numbered folder. --note is written in the README and the commit.
+           --dry-run prints the moves and each because that would change.
 review     put writes review.md beside the braindump, one commit authored by
            --author (an agent signs by being the author); --base as for edit.
            No structure is required. show also says whether the braindump
@@ -153,6 +169,7 @@ export async function catalogCommand(c: CatalogCli): Promise<number> {
         `this installation's plan: ${v.plan || '(none named; wfe catalog plan use <name>)'}`,
         '', `Braindumps (${v.braindumps.length})`,
         ...v.braindumps.map(b => `  ${b.id.padEnd(32)} ${b.title}${b.published ? '  [published]' : ''}\n  ${''.padEnd(32)} ${b.projects.length ? `grounds: ${b.projects.join(', ')}` : `grounds no project in ${v.plan || 'the plan'}`}\n  ${''.padEnd(32)} ${reviewLine(b)}${b.cited ? `; cited ${b.cited} time${b.cited === 1 ? '' : 's'}` : ''}`),
+        ...(v.archived.length ? [`  archived: ${v.archived.map(a => `${a.name} (${a.braindumps})  ${a.web}`).join('; ')}`] : []),
         '', `Preferences (${v.preferences.length}): ${v.preferences.map(p => p.name).join(', ') || 'none'}`,
         '', `Challenges: ${v.challenges.available ? `${v.challenges.items.length} (${Object.entries(v.challenges.counts).filter(([, n]) => n).map(([k, n]) => `${k} ${n}`).join(', ') || 'none'})${v.challenges.inCatalog ? '' : `; ${v.challenges.reason}`}` : v.challenges.reason}`,
         `Index (${v.index.path}): ${v.index.updated ? `${v.index.updated.author}, ${v.index.updated.at.slice(0, 10)}, ${short(v.index.updated.commit)}${v.index.note ? `; ${v.index.note}` : ''}` : v.index.note}`,
@@ -172,6 +189,13 @@ export async function catalogCommand(c: CatalogCli): Promise<number> {
         c.out(v.braindumps.map(b => `${b.id.padEnd(32)} ${b.title}  [${b.projects.join(', ') || 'no project'}]  ${short(b.updated?.commit)} ${b.updated?.author ?? ''}  ${reviewLine(b)}`).join('\n') || 'No braindumps yet.', v.braindumps)
         return 0
       }
+      if (a1 === 'archive') {
+        const all = c.flag('all'), dry = c.flag('dry-run')
+        if (!!a2 === all) throw c.usage('wfe catalog braindump archive (<path> | --all) --author <who> [--note <text>] [--dry-run]')
+        const r = await m.archiveBraindumps(ctx, { id: a2, all, author: dry ? (c.opt('author') ?? '') : author(), note: c.opt('note'), dryRun: dry })
+        c.out([r.message, ...r.lines.map(l => `  ${l}`)].join('\n'), r)
+        return 0
+      }
       if (!a2) throw c.usage(`wfe catalog braindump ${a1} <path>`)
       if (a1 === 'show') {
         const b = await m.braindump(ctx, a2)
@@ -182,7 +206,7 @@ export async function catalogCommand(c: CatalogCli): Promise<number> {
       }
       if (a1 === 'add' || a1 === 'edit') { const r = await m.changeBraindump(ctx, { op: a1, id: a2, text: await textArg(), author: author(), base: c.opt('base'), message: c.opt('message') }); c.out(r.message, r); return 0 }
       if (a1 === 'remove') { const r = await m.changeBraindump(ctx, { op: 'remove', id: a2, author: author(), force: c.flag('force'), message: c.opt('message') }); c.out(r.message, r); return 0 }
-      throw c.usage('wfe catalog braindump list | show | add | edit | remove')
+      throw c.usage('wfe catalog braindump list | show | add | edit | remove | archive')
     }
     if (sub === 'review' || sub === 'reviews') {
       if (a1 === 'request') {

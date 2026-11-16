@@ -114,6 +114,7 @@ export type CatalogWhy = Awaited<ReturnType<typeof import('../server/catalog.ts'
 export type CatalogBraindump = Awaited<ReturnType<typeof import('../server/catalog.ts').braindump>>
 export type CatalogUpkeep = { ok: boolean; kind: string; workspace: string; workflow: string; href: string }
 type CatalogChange = { ok: boolean; message: string; commit: string; changed: boolean }
+export type CatalogArchive = Awaited<ReturnType<typeof import('../server/catalog.ts').archiveBraindumps>>
 // A braindump's identity is a folder path: each segment is encoded, the slashes are kept.
 const bd = (id: string) => id.split('/').map(encodeURIComponent).join('/')
 
@@ -129,6 +130,8 @@ export const api = {
   catalogPreferencePut: (name: string, text: string, author: string, base?: string) => call<CatalogChange>('PUT', `api/catalog/preferences/${encodeURIComponent(name)}`, { text, author, base }),
   catalogPreferenceRemove: (name: string, author: string) => call<CatalogChange>('DELETE', `api/catalog/preferences/${encodeURIComponent(name)}`, { author }),
   catalogRemove: (id: string, author: string, force = false) => call<CatalogChange>('DELETE', `api/catalog/braindumps/${bd(id)}`, { author, force }),
+  // user_catalog p6: archive one braindump (dryRun: what would move and which because lists would change).
+  catalogArchive: (path: string, author: string, dryRun = false, note?: string) => call<CatalogArchive>('POST', 'api/catalog/braindumps/archive', { path, author, dryRun, note }),
   // user_catalog p2: the summoner writes reviews and the index on request (its workflows review and index).
   catalogReviewRequest: (author: string, path?: string) => call<CatalogUpkeep>('POST', 'api/catalog/reviews/request', { author, path }),
   catalogIndexRequest: (author: string) => call<CatalogUpkeep>('POST', 'api/catalog/index/request', { author }),

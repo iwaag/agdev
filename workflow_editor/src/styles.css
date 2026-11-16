@@ -1406,6 +1406,8 @@ html[data-display="detail"] .dash-glance { max-width: none; padding: 0; }
 .catalog-view .row input { width: auto; }
 .catalog-bd { border-top: 1px solid var(--line); padding: 12px 0; scroll-margin: 80px; }
 .catalog-bd:first-of-type { border-top: 0; }
+.catalog-empty { margin-top: 8px; }
+.catalog-archived { margin: 12px 0 0; }
 .catalog-folder { margin: 4px 0 4px 6px; padding-left: 12px; border-left: 2px solid var(--line); }
 .catalog-folder > .catalog-folder-name { font-size: 12px; color: var(--muted); font-family: ui-monospace, SFMono-Regular, Menlo, monospace; padding-top: 8px; }
 .catalog-review { margin: 8px 0 4px; padding: 8px 12px; border-left: 3px solid var(--c-teal); background: var(--c-teal-bg); border-radius: 0 6px 6px 0; max-width: 84ch; }

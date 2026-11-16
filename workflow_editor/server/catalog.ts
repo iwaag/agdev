@@ -22,8 +22,8 @@ import type { Issue } from '../shared/model.ts'
 import type { BraindumpAttachmentRef } from '../shared/intake.ts'
 import { citationCounts, citations, type Citation } from './citations.ts'
 import {
-  braindumpExcerpt, braindumpPath, braindumpTitle, BRAINDUMP_DIR, BRAINDUMP_FILE, CATALOG_FILE, CATALOG_REPOSITORY, CHALLENGES_DIR, EPISODES_DIR, INDEX_PATH, isBraindumpId,
-  isPreferenceName, MAX_BRAINDUMP_DEPTH, MYCATALOG_SCHEMA, OLD_LAYOUT, OLD_LAYOUT_PROBLEM, PLAN_NAME_PATTERN, preferencePath, PREFERENCES_DIR, PROJECTS_PATH, PROJECTS_SCHEMA, PUBLICATION_CONTRACT, publishedPaths, readPublicationContract, reviewPath,
+  ARCHIVE_DIR, braindumpExcerpt, braindumpPath, braindumpTitle, BRAINDUMP_DIR, BRAINDUMP_FILE, CATALOG_FILE, CATALOG_REPOSITORY, CHALLENGES_DIR, EPISODES_DIR, INDEX_PATH, isBraindumpId,
+  isPreferenceName, MAX_BRAINDUMP_DEPTH, MYCATALOG_SCHEMA, OLD_LAYOUT, OLD_LAYOUT_PROBLEM, PLAN_NAME_PATTERN, preferencePath, PREFERENCES_DIR, PROJECTS_PATH, PROJECTS_SCHEMA, PUBLICATION_CONTRACT, publishedPaths, readPublicationContract, REVIEW_FILE, reviewPath,
   SEGMENT_PATTERN, summonplanPath, SUMMONPLAN_DIR, validateMycatalog, validateProjects, validateSummonplan,
   type CatalogDoc, type ProjectsDoc, type SummonEntry, type Summonplan,
 } from '../shared/catalog.ts'
@@ -34,7 +34,7 @@ import { loadChallengeConfig, type ChallengeStore } from './challenges.ts'
 import { withLock } from './lock.ts'
 import { loadRegistry, registerRepository } from './registry.ts'
 import { RequestError } from './workspace.ts'
-import { parseMycatalog, parseProjects, parseSummonplan } from './yamlDoc.ts'
+import { dropBecause, parseMycatalog, parseProjects, parseSummonplan } from './yamlDoc.ts'
 
 export const CATALOG_SETTING = 'catalog.json'
 // publicationWorkspace: where the owner publishes the catalog from (the folder
@@ -120,7 +120,7 @@ export interface CatalogChange { path: string; text: string | null } // null: re
 // that loses a race is tried once more on Gitea's new head; `check` runs on
 // the fresh clone before each try and may refuse. Changes may be computed from
 // the fresh clone.
-async function commitChanges(ctx: CatalogContext, s: CatalogSetting, changes: CatalogChange[] | ((dir: string) => Promise<CatalogChange[]>), author: string, message: string, check?: (dir: string) => Promise<void>): Promise<{ commit: string; changed: boolean }> {
+async function commitChanges(ctx: CatalogContext, s: CatalogSetting, changes: CatalogChange[] | ((dir: string) => Promise<CatalogChange[]>), author: string, message: string | (() => string), check?: (dir: string) => Promise<void>): Promise<{ commit: string; changed: boolean }> {
   if (!author.trim()) throw new RequestError(400, 'a change to the catalog needs its author: the person or agent whose words it holds (--author)')
   const g = needGitea(ctx)
   const dir = checkoutDir(ctx.area)
@@ -135,7 +135,7 @@ async function commitChanges(ctx: CatalogContext, s: CatalogSetting, changes: Ca
       }
       await gitOk(dir, ['add', '-A'])
       if ((await git(dir, ['diff', '--cached', '--quiet'])).code === 0) return { commit: (await gitOk(dir, ['rev-parse', 'HEAD'])).trim(), changed: false }
-      await gitOk(dir, ['commit', '-q', '--author', authorLine(author.trim()), '-m', message], { config: { 'user.name': 'agdev', 'user.email': 'agdev@agdev.invalid' } })
+      await gitOk(dir, ['commit', '-q', '--author', authorLine(author.trim()), '-m', typeof message === 'function' ? message() : message], { config: { 'user.name': 'agdev', 'user.email': 'agdev@agdev.invalid' } })
       const p = await git(dir, ['push', '-q', '--', g.cloneUrl(s.repository.owner, s.repository.name), `HEAD:refs/heads/${s.branch}`], { env: await wrap(() => g.gitEnv()), timeoutMs: 120_000 })
       if (p.code === 0) {
         await gitOk(dir, ['update-ref', `refs/remotes/origin/${s.branch}`, 'HEAD'])
@@ -195,8 +195,12 @@ export interface CatalogSnapshot {
   plans: PlanInfo[]
   projects: { doc: ProjectsDoc | null; problem?: string; issues: Issue[] }
   index: IndexInfo
+  archived: ArchiveInfo[]
   published: Map<string, string> // source path → public path
 }
+// user_catalog p6: a folder of archived braindumps (braindumps/archive/<name>/).
+// Only counted and linked: nothing below it is read as content.
+export interface ArchiveInfo { name: string; path: string; braindumps: number; web: string }
 // challenges.md: the index of what is not yet real. `stale` lists what
 // changed under braindumps/ or challenges/ after the index's last change
 // (derived from Git; a commit that only moves files does not count).
@@ -223,11 +227,22 @@ async function readIndex(dir: string): Promise<IndexInfo> {
   if (text === null) return { path: INDEX_PATH, text: null, updated: null, stale: [], note: `No index yet (${INDEX_PATH}).` }
   const updated = await lastChange(dir, INDEX_PATH)
   const stale: IndexInfo['stale'] = []
-  if (updated) for (const under of [BRAINDUMP_DIR, CHALLENGES_DIR]) {
+  // Braindumps are those below braindumps/episodes/: one that left it (removed
+  // or archived) counts, a change below braindumps/archive/ does not.
+  if (updated) for (const under of [EPISODES_DIR, CHALLENGES_DIR]) {
     const c = await lastChangeUnder(dir, under)
     if (c && await isAfter(dir, c.commit, updated.commit)) stale.push({ ...c, under })
   }
   return { path: INDEX_PATH, text, updated, stale, note: stale.length ? `Changed since the index was written: ${stale.map(c => `${c.under}/ (${c.author}, ${c.at.slice(0, 10)}, ${c.commit.slice(0, 7)})`).join('; ')}.` : '' }
+}
+
+async function readArchives(dir: string, web: string, branch: string): Promise<ArchiveInfo[]> {
+  const count = new Map<string, number>()
+  for (const f of (await gitOk(dir, ['-c', 'core.quotePath=false', 'ls-files', '-z', '--', ARCHIVE_DIR])).split('\0').filter(Boolean)) {
+    const name = f.slice(ARCHIVE_DIR.length + 1).split('/')[0]
+    count.set(name, (count.get(name) ?? 0) + (f.endsWith(`/${BRAINDUMP_FILE}`) ? 1 : 0))
+  }
+  return [...count].sort(([a], [b]) => a.localeCompare(b)).map(([name, braindumps]) => ({ name, path: `${ARCHIVE_DIR}/${name}`, braindumps, web: `${web}/src/branch/${branch}/${ARCHIVE_DIR}/${name}` }))
 }
 
 // What publication/github.toml selects of the repository's files (source path → public path).
@@ -298,7 +313,8 @@ async function readSnapshot(ctx: CatalogContext, s: CatalogSetting, head: string
   const ct = await readTextOrNull(join(dir, PROJECTS_PATH))
   const cp = ct === null ? null : parseProjects(ct)
   const projects = ct === null ? { doc: null, problem: `${PROJECTS_PATH} is missing`, issues: [] } : cp!.ok ? { doc: cp!.model, issues: validateProjects(cp!.model, { braindumps: known }) } : { doc: null, problem: cp!.problem.message, issues: [] }
-  return { setting: s, web: g.webUrl(s.repository.owner, s.repository.name), head, catalog, braindumps, preferences: await readPreferences(dir, published), plans, projects, index: await readIndex(dir), published }
+  const web = g.webUrl(s.repository.owner, s.repository.name)
+  return { setting: s, web, head, catalog, braindumps, preferences: await readPreferences(dir, published), plans, projects, index: await readIndex(dir), archived: await readArchives(dir, web, s.branch), published }
 }
 
 // What the catalog holds now (read from Gitea at most every maxAgeMs).
@@ -327,6 +343,7 @@ export interface CatalogView {
   projects: ProjectGround[]
   plans: { name: string; intent: string; entries: number; problem?: string; errors: number; warnings: number }[]
   index: IndexInfo
+  archived: ArchiveInfo[]
   challenges: ChallengesBrief
   issues: { where: string; issue: Issue }[]
   problems: string[]
@@ -396,7 +413,7 @@ export async function catalogView(ctx: CatalogContext, o: { maxAgeMs?: number } 
     ...(r => ({ projects: r.projects, braindumps: r.braindumps.map(b => ({ ...b, cited: cited.get(b.id) ?? 0 })) }))(relate(snap, reg)),
     preferences: snap.preferences,
     plans: snap.plans.map(p => ({ name: p.name, intent: p.plan?.intent ?? '', entries: p.plan?.entries.length ?? 0, ...(p.problem ? { problem: p.problem } : {}), errors: p.issues.filter(i => i.severity === 'error').length, warnings: p.issues.filter(i => i.severity === 'warning').length })),
-    index: snap.index, challenges: await challengesBrief(ctx, snap.setting, snap.published),
+    index: snap.index, archived: snap.archived, challenges: await challengesBrief(ctx, snap.setting, snap.published),
     issues, problems,
   }
 }
@@ -588,6 +605,157 @@ export async function changeBraindump(ctx: CatalogContext, o: { op: BraindumpOp;
   return { ok: true, message: r.changed ? `${o.op === 'add' ? 'Added' : o.op === 'edit' ? 'Changed' : 'Removed'} braindump ${o.id} (${r.commit.slice(0, 7)}).` : `Braindump ${o.id} is unchanged.`, commit: r.commit, changed: r.changed, path }
 }
 
+// ---- archiving (user_catalog p6) ----------------------------------------------------
+//
+// Archiving moves a braindump with its review from braindumps/episodes/<path>/
+// to braindumps/archive/<date>/<path>/. The one rule reads braindumps only
+// below braindumps/episodes/, so an archived one is no braindump any more: it
+// grounds nothing, is not reviewed, not indexed and not offered for citing; it
+// stays readable in the tree. The same commit removes it from every `because`
+// (summonplans/*.yaml and projects.yaml; a list left empty is "no ground", and
+// no ground is written in its place) and records in the folder's README.md
+// which projects named it. A tag archive/<date> marks the commit before: the
+// last state with the braindumps in place. Citation records are not touched:
+// what was cited keeps its text at its commit.
+export interface ArchiveMove { id: string; title: string; from: string; to: string; review: boolean; updated: Change | null; named: { where: string; projects: string[] }[] }
+export interface ArchiveBecause { file: string; entry: string; before: string[]; after: string[] }
+interface ArchivePlan { date: string; folder: string; tag: string; parent: string; moves: ArchiveMove[]; because: ArchiveBecause[]; warnings: string[]; changes: CatalogChange[] }
+
+const localDate = (d = new Date()) => `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`
+const ARCHIVE_README = (date: string) => `# Braindumps archived on ${date}
+
+These texts were braindumps of this catalog. They were archived: moved here, each with its review,
+from \`${EPISODES_DIR}/<path>/\`. agdev reads braindumps only below \`${EPISODES_DIR}/\`, so nothing
+here grounds a project, is reviewed, is listed in the index or is offered for citing. They are kept
+to be read.
+
+- A message or a run that cited one of them keeps the text it cited, at the commit it cited. Where
+  the citation is shown it says that the braindump was removed.
+- Do not write a new braindump at one of these paths unless it is meant to be the same braindump:
+  what cited the old one is then listed as having cited the new one.
+- Each list below says which projects named the braindump in \`because\` when it was archived. It
+  was taken out of those \`because\` lists in the same commit, and no other ground was written in
+  its place.
+`
+
+async function planArchive(ctx: CatalogContext, s: CatalogSetting, dir: string, o: { id?: string; all?: boolean; author: string; note?: string }): Promise<ArchivePlan> {
+  const g = needGitea(ctx)
+  const all = await braindumpIds(dir)
+  if (o.id && !all.includes(o.id)) throw new RequestError(404, `no braindump "${o.id}" (${braindumpPath(o.id)}); wfe catalog braindump list`)
+  const ids = o.id ? [o.id] : all
+  if (!ids.length) throw new RequestError(409, `the catalog has no braindump below ${EPISODES_DIR}/: nothing to archive`)
+  const date = localDate(), folder = `${ARCHIVE_DIR}/${date}`
+  const parent = (await gitOk(dir, ['rev-parse', 'HEAD'])).trim()
+  // The tag marks the commit before this archive; a later archive of the same day gets a numbered one.
+  const lr = await git(dir, ['ls-remote', '--tags', '--', g.cloneUrl(s.repository.owner, s.repository.name), `refs/tags/archive/${date}*`], { env: await wrap(() => g.gitEnv()), timeoutMs: 60_000 })
+  if (lr.code !== 0) throw new RequestError(502, `reading the catalog's tags failed: ${lr.stderr.trim()}`)
+  const tags = new Set(lr.stdout.split('\n').map(l => l.split('\t')[1]?.replace(/^refs\/tags\//, '').replace(/\^\{\}$/, '')).filter(Boolean))
+  let tag = `archive/${date}`
+  for (let n = 2; tags.has(tag); n++) tag = `archive/${date}.${n}`
+
+  const gone = new Set(ids.map(braindumpPath))
+  const changes: CatalogChange[] = [], because: ArchiveBecause[] = [], warnings: string[] = []
+  const named = new Map<string, { where: string; projects: string[] }[]>()
+  const rewrite = async (file: string, key: 'entries' | 'projects', where: string) => {
+    const text = await readTextOrNull(join(dir, file))
+    if (text === null) return
+    const r = dropBecause(text, key, gone)
+    if (!r) { if ([...gone].some(p => text.includes(p))) warnings.push(`${file} cannot be read as YAML and names an archived braindump: its because lists were not changed`); return }
+    if (!r.changed.length) return
+    changes.push({ path: file, text: r.text })
+    for (const c of r.changed) {
+      because.push({ file, ...c })
+      for (const p of c.before.filter(b => gone.has(b))) {
+        const list = named.get(p) ?? []
+        const at = list.find(x => x.where === where) ?? (list.push({ where, projects: [] }), list.at(-1)!)
+        at.projects.push(c.entry)
+        named.set(p, list)
+      }
+    }
+  }
+  for (const f of (await readdir(join(dir, SUMMONPLAN_DIR)).catch(() => [] as string[])).filter(f => f.endsWith('.yaml')).sort()) await rewrite(`${SUMMONPLAN_DIR}/${f}`, 'entries', `plan \`${f.slice(0, -5)}\``)
+  await rewrite(PROJECTS_PATH, 'projects', `\`${PROJECTS_PATH}\``)
+
+  // A path already in the day's folder gets a numbered folder, never an overwrite.
+  const taken = new Set<string>()
+  const moves: ArchiveMove[] = []
+  const lines: string[] = []
+  for (const id of ids) {
+    let to = id
+    for (let n = 2; taken.has(to) || await exists(join(dir, folder, to, BRAINDUMP_FILE)) || await exists(join(dir, folder, to, REVIEW_FILE)); n++) to = `${id}.${n}`
+    taken.add(to)
+    const text = (await readTextOrNull(join(dir, braindumpPath(id)))) ?? ''
+    const review = await readTextOrNull(join(dir, reviewPath(id)))
+    const updated = await lastChange(dir, braindumpPath(id))
+    const reviewed = review === null ? null : await lastChange(dir, reviewPath(id))
+    changes.push({ path: braindumpPath(id), text: null }, { path: `${folder}/${to}/${BRAINDUMP_FILE}`, text })
+    if (review !== null) changes.push({ path: reviewPath(id), text: null }, { path: `${folder}/${to}/${REVIEW_FILE}`, text: review })
+    const m: ArchiveMove = { id, title: braindumpTitle(id, text), from: `${EPISODES_DIR}/${id}`, to: `${folder}/${to}`, review: review !== null, updated, named: named.get(braindumpPath(id)) ?? [] }
+    moves.push(m)
+    const say = (c: Change | null) => c ? `\`${c.commit.slice(0, 12)}\` (${c.author}, ${c.at.slice(0, 10)})` : 'not committed'
+    lines.push(`- [\`${id}\`](${to}/${BRAINDUMP_FILE})${m.title === id ? '' : `: ${m.title}`}`,
+      `  - last change: ${say(updated)}`,
+      `  - review: ${review === null ? 'none' : `[${REVIEW_FILE}](${to}/${REVIEW_FILE}), ${say(reviewed)}`}`,
+      ...(m.named.length ? m.named.map(n => `  - ${n.where}: ${n.projects.join(', ')}`) : ['  - named by no project']))
+  }
+  const pub = await readTextOrNull(join(dir, PUBLICATION_CONTRACT))
+  if (pub !== null) for (const id of ids) if (new RegExp(`${EPISODES_DIR}/${id.replace(/[.]/g, '\\.')}(["'/]|$)`, 'm').test(pub)) warnings.push(`${PUBLICATION_CONTRACT} still names ${EPISODES_DIR}/${id}: take it out of the file list before the next publication`)
+
+  const readme = `${folder}/README.md`
+  const before = await readTextOrNull(join(dir, readme))
+  const section = [`## ${new Date().toISOString().slice(0, 16)}Z, by ${o.author.trim() || '(dry run)'}`, '',
+    `${moves.length} braindump${moves.length === 1 ? '' : 's'}. The catalog before this commit: tag \`${tag}\` (\`${parent.slice(0, 12)}\`).`, '',
+    ...(o.note?.trim() ? [o.note.trim(), ''] : []), ...lines, ''].join('\n')
+  changes.push({ path: readme, text: `${(before ?? ARCHIVE_README(date)).trimEnd()}\n\n${section}` })
+  return { date, folder, tag, parent, moves, because, warnings, changes }
+}
+
+export async function archiveBraindumps(ctx: CatalogContext, o: { id?: string; all?: boolean; author: string; note?: string; dryRun?: boolean }) {
+  const s = await needSetting(ctx)
+  if (!!o.id === !!o.all) throw new RequestError(400, 'name one braindump to archive (<path>), or all of them (--all)')
+  if (o.id) needId(o.id)
+  const g = needGitea(ctx)
+  const dir = checkoutDir(ctx.area)
+  let plan: ArchivePlan | undefined
+  const result = (p: ArchivePlan, done: { commit: string } | null, problems: string[] = []) => {
+    const lines = [
+      ...p.moves.map(m => `move    ${m.from}/ → ${m.to}/  (${BRAINDUMP_FILE}${m.review ? `, ${REVIEW_FILE}` : ''})`),
+      ...p.because.map(b => `because ${b.file}: ${b.entry}: [${b.before.map(x => braindumpIdOf(x)).join(', ')}] → [${b.after.map(x => braindumpIdOf(x)).join(', ')}]`),
+      `write   ${p.folder}/README.md`,
+      `tag     ${p.tag} → ${p.parent.slice(0, 12)} (the catalog before)`,
+      ...[...p.warnings, ...problems].map(w => `warning ${w}`),
+    ]
+    const counts = `${p.moves.length} braindump${p.moves.length === 1 ? '' : 's'}, ${p.moves.filter(m => m.review).length} review${p.moves.filter(m => m.review).length === 1 ? '' : 's'}, ${p.because.length} because list${p.because.length === 1 ? '' : 's'}`
+    return { ok: true, dryRun: !done, message: done ? `Archived ${counts} to ${p.folder}/ (${done.commit.slice(0, 7)}); tag ${p.tag} is the catalog before.` : `Would archive ${counts} to ${p.folder}/ in one commit:`,
+      date: p.date, folder: p.folder, tag: p.tag, parent: p.parent, commit: done?.commit ?? null, moves: p.moves, because: p.because, warnings: [...p.warnings, ...problems], lines }
+  }
+  if (o.dryRun) {
+    const p = await withLock(settingFile(ctx.area), async () => { await sync(ctx, s, 0); return planArchive(ctx, s, dir, o) }, { what: 'the catalog' })
+    return result(p, null)
+  }
+  const r = await commitChanges(ctx, s, async d => { plan = await planArchive(ctx, s, d, o); return plan.changes }, o.author,
+    () => [`Archive ${o.all ? `every braindump (${plan!.moves.length})` : `braindump ${o.id}`} to ${plan!.folder}/`, '',
+      `Moved with ${o.all ? 'their reviews' : 'its review'}; taken out of ${plan!.because.length} because list${plan!.because.length === 1 ? '' : 's'}. The catalog before: tag ${plan!.tag}.`,
+      ...(o.note?.trim() ? ['', o.note.trim()] : [])].join('\n'))
+  const p = plan!
+  // The tag on the commit before: on Gitea, and on the mirrors (the commit itself went there with the push).
+  const problems: string[] = []
+  await withLock(settingFile(ctx.area), async () => {
+    const url = g.cloneUrl(s.repository.owner, s.repository.name)
+    const t = await git(dir, ['push', '-q', '--', url, `${p.parent}:refs/tags/${p.tag}`], { env: await wrap(() => g.gitEnv()), timeoutMs: 60_000 })
+    if (t.code !== 0) problems.push(`the tag ${p.tag} was not set on Gitea: ${t.stderr.trim()} (the commit before is ${p.parent})`)
+    try {
+      const { config, inCatalog } = challengesHere(ctx, s)
+      if (config && inCatalog) for (const m of config.mirrors) {
+        const x = await git(dir, ['push', '-q', '--', m, `${p.parent}:refs/tags/${p.tag}`], { env: { GIT_TERMINAL_PROMPT: '0', ...(config.sshCommand ? { GIT_SSH_COMMAND: config.sshCommand } : {}) }, timeoutMs: 60_000 })
+        if (x.code !== 0) problems.push(`the tag ${p.tag} was not set on the mirror ${m}: ${x.stderr.trim()}`)
+      }
+    } catch (e) { problems.push(`mirrors: ${(e as Error).message}`) }
+  }, { what: 'the catalog' })
+  return result(p, { commit: r.commit }, problems)
+}
+const braindumpIdOf = (path: string) => path.startsWith(`${EPISODES_DIR}/`) && path.endsWith(`/${BRAINDUMP_FILE}`) ? path.slice(EPISODES_DIR.length + 1, -BRAINDUMP_FILE.length - 1) : path
+
 // A preference (user_catalog p3): how the owner wants work done, in
 // preferences/<name>.md. Free Markdown, one file per subject; the Git author
 // is the writer. Who may write is said in the guides, as for braindumps: an
@@ -743,6 +911,7 @@ each braindump has become real (reviews).
 
 - \`braindumps/episodes/<path>/braindump.md\`: free text: what is wanted and why. Written by the person, or by an agent the person asked, who signs as the Git author.
 - \`braindumps/episodes/<path>/review.md\` (optional): free text about that braindump: what became real, where, what did not.
+- \`braindumps/archive/<date>/<path>/\`: braindumps you archived (\`wfe catalog braindump archive\`), with their reviews. Kept to be read; agdev does not read them as braindumps.
 - \`challenges/<id>/\`: a problem found during work, with its trials and evidence. Written through agdev (\`wfe challenge\`), by people and agents.
 - \`challenges.md\`: the index of what is not yet real: braindumps that were not carried out and challenges that are not resolved, one or two lines each. An agent writes it (\`wfe catalog index request\`).
 - \`preferences/<name>.md\`: free text: how ${owner} wants work done (the language of documents, how results are handed over, …), one file per subject. agdev gives every file here to every run. Not what is wanted (a braindump) and not facts about machines.

@@ -23,6 +23,10 @@ export const BRAINDUMP_DIR = 'braindumps'
 export const EPISODES_DIR = 'braindumps/episodes'
 export const BRAINDUMP_FILE = 'braindump.md'
 export const REVIEW_FILE = 'review.md'
+// user_catalog p6: archived braindumps, braindumps/archive/<date>/<path>/. Moved
+// there with their reviews, they are no braindumps any more: nothing below this
+// folder is validated or read as content; it is only counted and linked.
+export const ARCHIVE_DIR = 'braindumps/archive'
 export const SUMMONPLAN_DIR = 'summonplans'
 // user_catalog p2: the owner's challenges live in the catalog (challenges/<id>/…,
 // docs/challenges.md), and challenges.md at the root is the index of what is not

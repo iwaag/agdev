@@ -15,6 +15,11 @@
 // real (one line per entry of the index) and what I can do next; what serves
 // inspection and upkeep (paths, commits, authors, editing, the projects
 // table) is marked `.d-only`. Only the diagram is redrawn for a mode.
+//
+// user_catalog p6: a braindump is archived from its opened card in Detail
+// (moved to braindumps/archive/<date>/, out of every because); the archive
+// folders are listed at the end of Braindumps; a catalog with no braindump
+// says what one is and leads to writing one. Archiving all is a command.
 import { api, type CatalogBraindump, type CatalogView } from './api.ts'
 import { displayToggle, isSimple, onDisplay, showDetail } from './displayMode.ts'
 import { h, when } from './dom.ts'
@@ -277,6 +282,23 @@ export function renderCatalogView(root: HTMLElement): ViewHandle {
     await load(true)
   }
   const cancel = () => h('button', { onclick: () => { editing = null; render() } }, 'Cancel')
+  const newBraindump = () => h('button', { title: 'Write what you want and why, as a new braindump of the catalog', onclick: () => { editing = { kind: 'new' }; render(); go('new') } }, icon('plus', 'icon small'), 'New braindump')
+
+  // Archive (user_catalog p6): asked first without changing anything, so that
+  // the confirmation names the projects that lose this ground.
+  async function archive(b: Bd) {
+    const place = `bd:${b.id}`
+    if (!haveAuthor(place, () => void archive(b))) return
+    let d: Awaited<ReturnType<typeof api.catalogArchive>>
+    try { d = await api.catalogArchive(b.id, author.value.trim(), true) } catch (e) { message = h('div.banner.error', (e as Error).message); render(); return }
+    const losing = d.because.map(x => `  ${x.entry} (${x.file})${x.after.length ? '' : ': left with no ground'}`)
+    if (!confirm([`Archive braindump ${b.id}${b.review ? ' and its review' : ''}?`,
+      `It moves to ${d.moves[0]?.to ?? d.folder}/ and is no braindump any more: it grounds nothing, is not reviewed or indexed, and cannot be cited. It stays readable in the repository; what cited it keeps the text it cited.`,
+      losing.length ? `These lose this ground:\n${losing.join('\n')}` : 'No project names it.',
+      ...d.warnings].join('\n\n'))) return
+    open.delete(b.id); full.delete(b.id)
+    await change(place, () => api.catalogArchive(b.id, author.value.trim()))
+  }
 
   function editor(b?: Bd): HTMLElement {
     const id = h('input', { value: '', placeholder: 'folder path: a-thought, or group/phase', 'aria-label': 'Braindump path', size: 40 })
@@ -355,7 +377,8 @@ export function renderCatalogView(root: HTMLElement): ViewHandle {
       edit ? null : authorSlot(`bd:${b.id}`),
       !whole || edit ? null : h('div.row.d-only',
         h('button', { onclick: () => { editing = { kind: 'braindump', id: b.id }; render() } }, 'Edit'),
-        h('button.danger', { onclick: () => { if (confirm(`Remove braindump ${b.id}${b.review ? ' and its review' : ''}? They stay in the repository's history.${b.projects.length ? `\nIt grounds ${b.projects.join(', ')}: the plan's because lists must drop it first.` : ''}`)) void change(`bd:${b.id}`, () => api.catalogRemove(b.id, author.value.trim())) } }, 'Remove')),
+        h('button', { title: 'Move this braindump and its review to braindumps/archive/<date>/ and take it out of every because: it stays readable in the repository and is no braindump any more', onclick: () => void archive(b) }, 'Archive'),
+        h('button.danger', { title: 'Delete the files; they stay only in the repository\'s history. To keep the text readable, archive instead.', onclick: () => { if (confirm(`Remove braindump ${b.id}${b.review ? ' and its review' : ''}? They stay in the repository's history.${b.projects.length ? `\nIt grounds ${b.projects.join(', ')}: the plan's because lists must drop it first.` : ''}`)) void change(`bd:${b.id}`, () => api.catalogRemove(b.id, author.value.trim())) } }, 'Remove')),
       whole ? reviewBlock(b, v) : null,
       !whole || edit ? null : h('div.row.catalog-bd-actions', ...startActions(subject, 'card')),
       whole && !edit && isRequesting(subject, 'card') ? requestForm(subject) : null,
@@ -525,14 +548,14 @@ export function renderCatalogView(root: HTMLElement): ViewHandle {
       h('div.card-head', h('h2', v.title || 'Catalog'),
         h('div.row', h('a.small.d-only', { href: v.web, target: '_blank', rel: 'noopener' }, `${v.repository} @ ${v.head.slice(0, 7)}`),
           h('label.small.d-only', 'Author of changes ', author),
-          h('button', { title: 'Write what you want and why, as a new braindump of the catalog', onclick: () => { editing = { kind: 'new' }; render(); go('new') } }, icon('plus', 'icon small'), 'New braindump'))),
+          newBraindump())),
       h('p.muted.small.d-only', `Braindumps are free text on what you want and why: the grounds of the projects here. A review is free text about a braindump: what became real, where, what did not. Which projects each braindump grounds is recorded in this installation's summonplan (${v.plan ? `summonplans/${v.plan}.yaml` : 'none named'}), not in the projects.`),
       message,
       trouble ? h('p.small.s-only.catalog-trouble', icon('alert', 'icon small'), h('a', { href: '#/catalog', onclick: (e: Event) => { e.preventDefault(); showDetail(() => window.scrollTo(0, 0)) } }, `${trouble} problem${trouble === 1 ? '' : 's'} with the catalog: see Detail`)) : null,
       ...v.problems.map(p => h('div.banner.warn.d-only', p)),
       v.issues.length ? h('ul.issues.d-only', v.issues.map(x => h(`li.${x.issue.severity}`, `${x.where}: ${x.issue.message}`))) : null))
     // The summary: four counts, each a way to its part.
-    const stat = (name: string, n: string | number, label: string, section: string) => h('a.catalog-stat', { href: '#/catalog', onclick: (e: Event) => { e.preventDefault(); go(section) } }, icon(name), h('strong', n), h('span', label))
+    const stat = (name: string, n: string | number, label: string, section: string) => h('a.catalog-stat', { href: '#/catalog', onclick: (e: Event) => { e.preventDefault(); go(section) } }, icon(name), h('strong', String(n)), h('span', label))
     main.append(h('nav.catalog-summary', { 'aria-label': 'What the catalog holds' },
       stat('doc', v.braindumps.length, v.braindumps.length === 1 ? 'braindump' : 'braindumps', 'braindumps'),
       !index ? h('div.catalog-stat', icon('pending'), h('span', 'no index of what is not yet real'), h('button.small', { onclick: () => { go('index'); askIndex() } }, 'Write the index'))
@@ -541,7 +564,10 @@ export function renderCatalogView(root: HTMLElement): ViewHandle {
       stat('settings', v.preferences.length, v.preferences.length === 1 ? 'preference' : 'preferences', 'preferences')))
     if (editing?.kind === 'new') main.append(h('section.card', { dataset: { section: 'new' } }, h('h2', 'New braindump'), editor()))
     const reviewed = v.braindumps.filter(b => b.review).length
-    main.append(h('section.card', { dataset: { section: 'braindumps' } }, h('div.card-head', h('h2', 'Braindumps'), h('span.muted.small.d-only', `${reviewed} of ${v.braindumps.length} reviewed · ${v.braindumps.filter(b => b.published).length} published`)), v.braindumps.length ? h('div.catalog-bds', tree(v.braindumps, v)) : h('p.muted', 'No braindumps yet.')))
+    main.append(h('section.card', { dataset: { section: 'braindumps' } }, h('div.card-head', h('h2', 'Braindumps'), h('span.muted.small.d-only', `${reviewed} of ${v.braindumps.length} reviewed · ${v.braindumps.filter(b => b.published).length} published`)), v.braindumps.length ? h('div.catalog-bds', tree(v.braindumps, v))
+      : h('div.catalog-empty', h('p', 'No braindumps yet. A braindump is free text on what you want and why: it is what the projects here stand on.'), editing?.kind === 'new' ? null : h('div.row', newBraindump())),
+      v.archived.length ? h('p.small.muted.d-only.catalog-archived', { title: 'Archived braindumps are kept in the repository to be read. They ground nothing, are not reviewed or indexed, and cannot be cited.' }, 'Archived: ',
+        v.archived.map((a, i) => [i ? ' · ' : '', h('a', { href: a.web, target: '_blank', rel: 'noopener' }, a.name), ` (${a.braindumps} braindump${a.braindumps === 1 ? '' : 's'}, on Gitea)`])) : null))
     main.append(indexCard(v, index?.el ?? null))
     const grounded = v.projects.filter(p => p.braindumps.length).length
     const diagram = h('div.catalog-diagram-wrap')
@@ -553,7 +579,8 @@ export function renderCatalogView(root: HTMLElement): ViewHandle {
     }
     redrawDiagram = () => { diagram.className = `catalog-diagram-wrap${isSimple() ? ' compact' : ''}`; diagram.replaceChildren(relationDiagram(v, picked, isSimple())) }
     redrawDiagram()
-    main.append(h('section.card.catalog-relations', { dataset: { section: 'relations' } },
+    // With no braindump there is nothing to relate: Detail still shows the projects, Simple nothing.
+    main.append(h(`section.card.catalog-relations${v.braindumps.length ? '' : '.d-only'}`, { dataset: { section: 'relations' } },
       h('div.card-head', h('h2', 'Braindumps and projects'), h('span.muted.small.d-only', `${v.braindumps.length} braindumps · ${grounded} of ${v.projects.length} projects grounded`)),
       h('p.muted.small.d-only', 'Hover or focus a box to follow its edges; click to jump to it below.'),
       diagram))

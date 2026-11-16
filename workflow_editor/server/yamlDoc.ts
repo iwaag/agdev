@@ -93,6 +93,31 @@ export const parseMycatalog = (text: string) => parseWith<CatalogDoc>(text, myca
 export const parseSummonplan = (text: string) => parseWith<Summonplan>(text, summonplanFromData, 'plan')
 export const parseProjects = (text: string) => parseWith<ProjectsDoc>(text, projectsFromData, 'projects')
 
+// Removes the named braindumps from every `because` of a summonplan
+// (`entries`) or of projects.yaml (`projects`), on the document itself, so
+// that comments, order and every other field stay as written (user_catalog
+// p6: archiving). A list left without a ground is `because: []`. Returns the
+// new text and what changed; null when the text cannot be read.
+export interface BecauseChange { entry: string; before: string[]; after: string[] }
+export function dropBecause(text: string, listKey: 'entries' | 'projects', gone: ReadonlySet<string>): { text: string; changed: BecauseChange[] } | null {
+  const r = parseSubset(text)
+  if (!r.ok) return null
+  const seq = r.doc.get(listKey, true)
+  const changed: BecauseChange[] = []
+  if (isSeq(seq)) for (const item of seq.items) {
+    if (!isMap(item)) continue
+    const because = item.get('because', true)
+    if (!isSeq(because)) continue
+    const value = (x: unknown) => isScalar(x) ? String(x.value) : null
+    const before = because.items.map(x => value(x) ?? '')
+    if (!before.some(b => gone.has(b))) continue
+    because.items = because.items.filter(x => { const v = value(x); return v === null || !gone.has(v) })
+    because.flow = true
+    changed.push({ entry: String(item.get('project') ?? ''), before, after: because.items.map(x => value(x) ?? '') })
+  }
+  return { text: changed.length ? r.doc.toString(STRINGIFY) : text, changed }
+}
+
 // ---- applying a model onto a document ------------------------------------
 
 // A shape tells the sync which keys the model owns. "record" owns only the

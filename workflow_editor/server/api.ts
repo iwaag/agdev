@@ -788,6 +788,12 @@ export function createHandler(config: ServiceConfig) {
             const input = await body(req) as Record<string, unknown>
             return send(res, 200, await m.changeBraindump(ctx, { op: 'add', id: str(input.id, 'id'), text: str(input.text, 'text'), author: str(input.author, 'author'), message: text(input.message) }))
           }
+          // user_catalog p6: archiving one braindump or all of them (never a braindump's own path: POST has none).
+          if (id === 'archive' && method === 'POST') {
+            const input = await body(req) as Record<string, unknown>
+            const dryRun = input.dryRun === true
+            return send(res, 200, await m.archiveBraindumps(ctx, { id: text(input.path) || undefined, all: input.all === true, author: dryRun ? text(input.author) ?? '' : str(input.author, 'author'), note: text(input.note), dryRun }))
+          }
           if (id && method === 'GET') return send(res, 200, await m.braindump(ctx, id))
           if (id && method === 'PUT') {
             const input = await body(req) as Record<string, unknown>

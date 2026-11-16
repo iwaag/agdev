@@ -1,4 +1,4 @@
-# The catalog: braindumps, reviews, challenges, summonplans, shared projects (user_catalog p1–p4)
+# The catalog: braindumps, reviews, challenges, summonplans, shared projects (user_catalog p1–p6)
 
 agdev's core is the workflow and the record of *why* projects exist. The
 projects themselves (warden, ponderer, aghangout and every other) are outside
@@ -82,6 +82,7 @@ mycatalog/
   projects.yaml                               # ag.projects.v1: the projects this user shares
   braindumps/episodes/<path>/braindump.md     # free text
   braindumps/episodes/<path>/review.md        # free text, optional
+  braindumps/archive/<date>/<path>/…          # archived braindumps with their reviews; README.md lists them. Not read
   challenges/<id>/…                           # the owner's challenges (challenges.md in these docs)
   challenges.md                               # the index of what is not yet real: braindumps and challenges
   preferences/<name>.md                       # free text: how the owner wants work done; given to every run
@@ -115,6 +116,8 @@ and is not read.**
   name does not match is not entered.
 - `because` names the file: `braindumps/episodes/<path>/braindump.md`.
 - Moving a folder makes a different braindump.
+- Only `braindumps/episodes/` is read. A `braindump.md` below
+  `braindumps/archive/` is not a braindump (*Archiving* below).
 
 ### Braindumps
 
@@ -139,6 +142,49 @@ field and no required structure.
   note. Nothing inside `review.md` is needed for it. A commit that only moves
   a file does not count as a change of what it says.
 - Removing a braindump removes its review with it.
+
+### Archiving
+
+A braindump that is no longer what the owner wants to stand on is
+**archived**, not deleted (user_catalog p6): `wfe catalog braindump archive
+<path>`, or **Archive** on its card. `--all` archives every braindump, to
+clear a catalog in order before writing it again; that is a command only.
+
+- **What moves.** `braindump.md` and `review.md` go from
+  `braindumps/episodes/<path>/` to `braindumps/archive/<date>/<path>/` (the
+  service's local date). A second archive on the same day adds to the same
+  folder; a path already there gets a numbered folder (`<path>.2`), never an
+  overwrite. Other files of the episode folder are the owner's and stay.
+- **What it is afterwards.** No braindump: it grounds nothing, is not
+  reviewed, not listed for the index, not offered for citing, and not
+  validated. It stays readable in the repository's tree. `GET api/catalog` and
+  `wfe catalog status` list the archive folders with their counts and links
+  (`archived`); the page shows them at the end of *Braindumps* in Detail.
+- **`because` is emptied of it, not rewritten.** The same commit takes the
+  braindump out of every `because` in `summonplans/*.yaml` and in
+  `projects.yaml`, keeping the files' comments and order. A list left empty
+  is `because: []`, "no ground". No ground is written in its place; the
+  agents of such a project are told that it has no ground here.
+- **The mapping is kept.** `braindumps/archive/<date>/README.md` lists each
+  archived braindump with its title, its last commit, its review, and the
+  projects that named it, per plan and in `projects.yaml`. `--note` is
+  written there and in the commit message.
+- **One commit, and a tag before it.** The move, the README and the `because`
+  changes are one commit, so that no commit of the catalog has a `because`
+  that points at nothing. The tag `archive/<date>` (then `archive/<date>.2`,
+  …) is set on its parent: the last state with the braindumps in place.
+- **What was cited stays as it was.** Citation records are not edited. A
+  message or a run that cited an archived braindump keeps the text at its
+  pinned commit; where the citation is shown it says *removed*. A new
+  braindump at the same path would be listed as cited by those, so a path is
+  reused only when the same braindump is meant.
+- **Not done by it.** The index is not rewritten (it is shown as older than
+  the catalog; ask for it again). A `[[tree]]` of `publication/github.toml`
+  that names the folder is reported and left to the owner.
+
+`wfe catalog braindump remove` is for a braindump that should not be in the
+tree at all; it stays only in the history, and is refused while a plan names
+it.
 
 ### Challenges
 
@@ -177,7 +223,7 @@ judged.
   second place to keep state: a challenge's state is in its `summary.md`, a
   braindump's in its review.
 - **"Changed since the index"** is derived from Git: the newest commit under
-  `braindumps/` or under `challenges/` is newer than the index's last change.
+  `braindumps/episodes/` or under `challenges/` is newer than the index's last change.
   A commit that only moves files does not count. It is shown as a note; the
   index is rewritten on request (`wfe catalog index request`, **Refresh the
   index** on the Catalog page), not automatically.
@@ -481,13 +527,14 @@ words, and what of that was already said to be real. `wfe catalog why
 | CLI | API | |
 | --- | --- | --- |
 | `wfe catalog init [--title] [--plan <name>] --author <a>` | | create or attach |
-| `wfe catalog status` | `GET api/catalog` | repository, head, plan, braindumps (title, excerpt, review author and date, published) and their projects, the index, the challenges by state, projects with their grounds, issues |
+| `wfe catalog status` | `GET api/catalog` | repository, head, plan, braindumps (title, excerpt, review author and date, published) and their projects, the index, the archive folders (`archived`), the challenges by state, projects with their grounds, issues |
 | `wfe catalog braindump list` | (in `GET api/catalog`) | |
 | `wfe catalog braindump show <path>` | `GET api/catalog/braindumps/<path>` | text, review, history, projects, plans, `citedBy` |
 | `wfe conversation post … --cite <path>[@<commit>]`, `wfe request … --cite`, `wfe run create … --cite` | `cites` of `POST api/conversations/<id>/messages` and of `POST api/workspaces/<id>/runs` | cite a braindump (*Citing a braindump*) |
 | `wfe catalog braindump add <path> --file/--text --author` | `POST api/catalog/braindumps {id, text, author}` | 409 when it exists |
 | `wfe catalog braindump edit <path> --file/--text --author [--base <commit>]` | `PUT api/catalog/braindumps/<path> {text, author, base?}` | 409 when changed after `base` |
 | `wfe catalog braindump remove <path> --author [--force]` | `DELETE api/catalog/braindumps/<path> {author, force?}` | refused while a plan's `because` names it, unless forced; removes its review too |
+| `wfe catalog braindump archive (<path> \| --all) --author [--note <text>] [--dry-run]` | `POST api/catalog/braindumps/archive {path?, all?, author, note?, dryRun?}` | one commit: moved to `braindumps/archive/<date>/`, out of every `because`, listed in the folder's README; `--dry-run` prints the moves and each `because` that would change (*Archiving*) |
 | `wfe catalog review show <path>` | `GET api/catalog/reviews/<path>` | the review, its history, whether the braindump changed after it |
 | `wfe catalog review put <path> --file/--text --author [--base <commit>]` | `PUT api/catalog/reviews/<path> {text, author, base?}` | 404 without the braindump; 409 when changed after `base` |
 | `wfe catalog review request [<path>] --author` | `POST api/catalog/reviews/request {path?, author}` | requests the summoner's `review`; 409 without a summoner |
@@ -526,9 +573,9 @@ same page: Detail adds to what Simple shows.
 | --- | --- | --- |
 | Head | the catalog's title, **New braindump** | the repository and head, the explanation, **Author of changes**, the catalog's problems and issues (Simple says only how many there are) |
 | Summary | four counts, each a way to its part: braindumps, entries of the index, open challenges, preferences; **Write the index** when there is none | |
-| Braindumps | a grid of cards: title, two lines of excerpt, the grounded projects, one mark (reviewed, not reviewed, changed after its review). Folders are headings, after the braindumps that are in none. An opened card spans the grid: the text, the review, **Talk about this**, **Request work** | rows instead of cards; path, author, date, commit, the link to Gitea, published or internal, the cited count; **Edit**, **Remove**; the review's author and date, **Ask for a review**, **Edit review**; **Cited by** |
+| Braindumps | a grid of cards: title, two lines of excerpt, the grounded projects, one mark (reviewed, not reviewed, changed after its review). Folders are headings, after the braindumps that are in none. An opened card spans the grid: the text, the review, **Talk about this**, **Request work**. With no braindump: one sentence on what a braindump is, and **New braindump** | rows instead of cards; path, author, date, commit, the link to Gitea, published or internal, the cited count; **Edit**, **Archive** (its confirmation names the projects that lose this ground), **Remove**; the archive folders with their counts, linked to Gitea; the review's author and date, **Ask for a review**, **Edit review**; **Cited by** |
 | Not yet real | one line per entry of the index (a list item that links to a braindump or a challenge): its kind as an icon, its title, the rest on one line. An entry opens to its full text with **Talk about this** and **Request work**. One line with **Refresh** when the catalog changed after the index. An index with no such entry is shown whole | the index's whole text as written, its file, author, date and commit; **Refresh the index**, **Ask for the reviews that are due** |
-| Braindumps and projects | the diagram with the braindumps and the projects that have a ground; a project leads to its page | every project, with "no ground" and "not in plan"; a project leads to its row of the table |
+| Braindumps and projects | the diagram with the braindumps and the projects that have a ground; a project leads to its page. Not shown while there is no braindump | every project, with "no ground" and "not in plan"; a project leads to its row of the table |
 | Challenges | those neither resolved nor withdrawn: title and projects, each linking to its challenge page | the other states, id, trials, who and when, published or internal |
 | Preferences | each as a title and its first line; opened: the text | every text whole, its name, author, date, commit, the link to Gitea; **New preference**, **Edit**, **Remove** |
 | Projects and why they are here | | the table |
