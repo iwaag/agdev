@@ -2583,8 +2583,8 @@ async function cmdCatalog(p: Parsed): Promise<number> {
     request: async o => {
       const x = await openExec(p)
       try {
-        const r = await x.request({ ...o, via: 'cli' })
-        return { message: `${r.duplicate ? 'Already requested (same receipt)' : 'Requested'}: run ${r.ref.workflow}/${r.ref.run} in ${o.workspace}; job ${r.job.id} is ${r.job.state}.`, data: r }
+        const r = await x.requestOnce({ ...o, via: 'cli' })
+        return { message: `${r.duplicate ? 'Already requested, still open' : 'Requested'}: run ${r.ref.workflow}/${r.ref.run} in ${o.workspace}; job ${r.job.id} is ${r.job.state}.`, data: r, ref: r.ref }
       } finally { x.close(); execStore = undefined }
     },
   })

@@ -447,8 +447,8 @@ then was).
   (`announce:agenda`, `ask:facts`, `ponder:after-facts`). Another round is
   new nodes; completed ones and their records stay; no cycle. A wake (p18)
   appends `ponder-w<n>` itself.
-- **A turn that spoke and left its node running** (p3:
-  rts-vs-bot/discuss/run-001, run-004): `wfe conversation contribute
+- **A turn that spoke and left its node running** (p3, two
+  discuss runs): `wfe conversation contribute
   --completing <node>` speaks and completes in one command. Reconcile
   completes a node whose message was delivered (a message with `node`, or a
   participant's reply answering its request in a one-node discuss

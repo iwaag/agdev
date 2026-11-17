@@ -115,7 +115,7 @@ function tar(args: string[], cwd: string, input?: Buffer): Promise<{ code: numbe
   return new Promise((resolve, reject) => {
     // macOS tar would add AppleDouble `._*` entries for extended attributes;
     // a Linux worker extracts them as ordinary files and commits them
-    // (project_migration p7, playprey freework/run-001).
+    // (project_migration p7).
     const p = spawn('tar', args, { cwd, env: { ...process.env, COPYFILE_DISABLE: '1' } })
     const out: Buffer[] = []; let err = ''
     p.stdout.on('data', d => out.push(d)); p.stderr.on('data', d => { err += d })

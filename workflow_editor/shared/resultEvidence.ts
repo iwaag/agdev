@@ -9,8 +9,8 @@
 // Why: in tidy p1's trial (ponderer/conduct/run-048) ponderer judged three
 // results 12–23 s after taking them up, from the child's outcome line, and
 // accepted a report that was never written and a README carrying one host's
-// addresses. protoprey freework/run-007 reported "7 tests pass" with an
-// eighth test that never ran; run-006 read data/deliveries.json without its
+// addresses. One freework run reported "7 tests pass" with an
+// eighth test that never ran; another read data/deliveries.json without its
 // status check and missed an adoption pointing at agsfx's run copy. After two
 // corrections ponderer reported one (#453), and conversation-unanswered could
 // not see it because #452 had already replied.

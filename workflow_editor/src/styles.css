@@ -1558,3 +1558,91 @@ html[data-display="simple"] .nyr-head { padding: 4px 2px; }
 /* The card's title is the text's first heading: not shown twice. */
 html[data-display="simple"] .catalog-bds .catalog-bd.open.titled > .md > h1:first-child { display: none; }
 .catalog-bd-actions { align-items: stretch; }
+
+/* user_catalog p6 ex1: tags, tag proposals, drafts */
+.catalog-tags { display: inline-flex; gap: 4px; flex-wrap: wrap; align-items: center; }
+.chip.tag { background: #e8eefb; color: #2c4a86; border: 0; font: inherit; font-size: 12px; cursor: default; }
+button.chip.tag { cursor: pointer; }
+button.chip.tag.on { background: #2c4a86; color: #fff; }
+button.chip.tag.on .muted { color: #dbe4f7; }
+.chip.tag.example { background: transparent; border: 1px dashed #9fb2da; }
+.chip.tag.removable .icon-btn { margin-left: 3px; padding: 0 2px; line-height: 1; font-size: 13px; background: none; border: 0; cursor: pointer; color: inherit; }
+.catalog-tag-input { display: flex; flex-direction: column; gap: 6px; }
+.catalog-tag-input .row { flex-wrap: wrap; }
+.catalog-tag-examples { display: flex; gap: 4px; flex-wrap: wrap; align-items: center; }
+.catalog-tag-filter { gap: 5px; flex-wrap: wrap; margin: 4px 0 10px; }
+.catalog-tags-block { margin: 6px 0; display: flex; flex-direction: column; gap: 6px; }
+.catalog-tags-block > .row { flex-wrap: wrap; gap: 6px; }
+.catalog-proposal { border: 1px solid #c9d5ee; border-radius: 8px; padding: 8px 10px; background: #f6f8fd; }
+.catalog-proposal.stale { border-color: var(--warn); background: var(--warn-bg); }
+.catalog-proposal ul { margin: 6px 0; padding-left: 4px; list-style: none; }
+.catalog-proposal li { margin: 3px 0; }
+.catalog-drafts .catalog-draft { border-top: 1px solid var(--line); padding: 10px 0; }
+.catalog-drafts .catalog-draft:first-of-type { border-top: 0; }
+.catalog-draft-editor textarea { width: 100%; box-sizing: border-box; font-family: inherit; }
+.catalog-save-state { font-size: 12px; }
+.catalog-save-state.saving { color: var(--muted); }
+.catalog-save-state.saved { color: var(--ok); }
+.catalog-save-state.failed { color: var(--error); font-weight: 600; }
+.catalog-advice { border: 1px solid var(--line); border-radius: 8px; padding: 8px 10px; margin-top: 8px; }
+.catalog-advice.older { border-style: dashed; }
+.catalog-compare { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
+.catalog-compare pre { white-space: pre-wrap; word-break: break-word; max-height: 320px; overflow: auto; background: #f7f7f9; padding: 6px; border-radius: 6px; font-size: 12px; margin: 0; }
+@media (max-width: 640px) { .catalog-compare { grid-template-columns: 1fr; } }
+.catalog-register { border: 1px solid #8fc79a; border-radius: 8px; padding: 8px 10px; margin-top: 8px; }
+.catalog-ask { display: flex; flex-direction: column; gap: 4px; margin-top: 6px; }
+.catalog-ask textarea { width: 100%; box-sizing: border-box; font-family: inherit; }
+.catalog-asked { background: #f6f8fd; border-radius: 6px; padding: 4px 8px; margin: 4px 0; white-space: pre-wrap; }
+
+/* user_catalog p6 ex2: the writing field, one-line tag answers, unfinished texts */
+.catalog-compose .card-head { align-items: baseline; }
+.catalog-compose-text { width: 100%; box-sizing: border-box; font-family: inherit; font-size: 15px; line-height: 1.5; padding: 10px 12px; border-radius: 8px; resize: vertical; min-height: 160px; }
+.catalog-compose-tags { display: flex; align-items: center; gap: 4px; flex-wrap: wrap; min-height: 0; margin: 4px 0; }
+.catalog-compose-actions { flex-wrap: wrap; gap: 8px; margin: 6px 0; }
+.catalog-compose-actions button[hidden] { display: none; }
+.catalog-compose-detail { display: flex; flex-direction: column; gap: 6px; margin: 6px 0; }
+.catalog-compose-path[hidden] { display: none !important; }
+.catalog-compose-path input { max-width: 320px; }
+.catalog-tag-line { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; margin: 6px 0; padding: 5px 8px; border: 1px solid #c9d5ee; border-radius: 8px; background: #f6f8fd; }
+.catalog-unfinished { margin-top: 10px; }
+.catalog-unfinished ul { list-style: none; margin: 4px 0 0; padding: 0; }
+.catalog-unfinished li { padding: 5px 0; border-top: 1px solid var(--line); overflow-wrap: anywhere; }
+.catalog-unfinished li:first-child { border-top: 0; }
+/* user_catalog p6 ex2: chips beside the title (tags, the summoner's reading) wrap below a narrow title instead of squeezing it. */
+html[data-display="simple"] .catalog-bds .entry-head { flex-wrap: wrap; }
+html[data-display="simple"] .catalog-bds .catalog-bd-title { flex: 1 1 12em; }
+/* The one-line tag answer and the run link stay clickable on a closed card (whose title covers it). */
+html[data-display="simple"] .catalog-bds .catalog-bd:not(.open) .catalog-tag-line, html[data-display="simple"] .catalog-bds .catalog-bd:not(.open) .entry-head a.chip { position: relative; z-index: 1; }
+
+/* user_catalog p7: Ask, suggested links, rules */
+.catalog-diagram .md-edge.md-suggested { stroke-dasharray: 5 4; stroke: var(--accent); opacity: .75; }
+.catalog-action { align-items: flex-start; }
+.catalog-action .catalog-action-words { flex: 1 1 240px; min-width: 0; overflow-wrap: anywhere; }
+.catalog-action .catalog-action-result { flex: 1 1 100%; overflow-wrap: anywhere; }
+.catalog-action.done, .catalog-action.declined { background: transparent; border-style: dashed; }
+.catalog-dismiss { margin-left: 8px; }
+.catalog-asked-list li { display: flex; flex-wrap: wrap; align-items: center; gap: 4px; }
+.catalog-link-line { align-items: flex-start; }
+.catalog-link-line .catalog-link-words { flex: 1 1 260px; min-width: 0; overflow-wrap: anywhere; }
+.catalog-link-quote { color: var(--muted); }
+.catalog-suggested { margin-top: 10px; }
+.catalog-links-pending { margin-top: 10px; }
+.catalog-uncovered, .catalog-rule-line { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; margin: 6px 0; }
+.catalog-rule { border-top: 1px solid var(--line); padding: 8px 0; }
+.catalog-rule p { margin: 2px 0; overflow-wrap: anywhere; }
+html[data-display="simple"] .catalog-bds .catalog-bd:not(.open) .catalog-rule-line { position: relative; z-index: 1; }
+
+/* user_catalog p8: what waits for the owner (its count on the navigation), the Public section, tag choices with meanings. */
+.nav-count { display: inline-block; min-width: 18px; margin-left: 6px; padding: 0 5px; border-radius: 9px; background: #c2410c; color: #fff; font-size: 11px; line-height: 18px; text-align: center; font-weight: 600; }
+.nav-count[hidden] { display: none; }
+.catalog-waiting { border-color: #e0a96d; background: #fffaf3; }
+.catalog-waiting .catalog-waiting-line { background: #fff; border-color: #ecd2b0; }
+.catalog-waiting-line .catalog-link-words { flex: 1 1 260px; min-width: 0; overflow-wrap: anywhere; }
+.catalog-public h3 { margin: 12px 0 4px; font-size: 13px; }
+.catalog-public ul { margin: 4px 0; padding-left: 18px; }
+.catalog-public li { overflow-wrap: anywhere; }
+.catalog-public .catalog-tag-line > span { flex: 1 1 240px; min-width: 0; overflow-wrap: anywhere; }
+ul.catalog-tag-meanings { list-style: none; margin: 4px 0 0; padding: 0; display: grid; gap: 2px; }
+span.catalog-tag-meanings { display: block; margin-top: 2px; overflow-wrap: anywhere; }
+.catalog-compose-offer { margin: 4px 0; }
+.catalog-compose-offer .chip, .catalog-tag-examples .chip { margin: 2px 2px; }

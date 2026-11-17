@@ -274,7 +274,7 @@ export function assessResult(parent: RunRecord, d: Delegation, ev: DelegationEve
   }
 
   // ---- documentation steps completed without their document (tidy p1) ----
-  // protoprey freework/run-006 completed _final-report with no report.md and
+  // A freework run completed _final-report with no report.md and
   // its requester was told the audit was there; ponderer judged it satisfied
   // 14 s later. Only completed steps of the frozen record count.
   if (fr && c.graph) {

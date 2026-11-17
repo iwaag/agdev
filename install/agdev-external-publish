@@ -33,6 +33,7 @@ Contract (TOML, schema agdev.publication.v1; forge.publication.v1 is read for ol
   local_secrets = ["forge.env"]                optional KEY=VALUE files of the workspace whose values must not
                                                occur (findings name the key, never the value)
   [[allow]] file, found, why                   a reviewed exception for one finding label and file glob
+                                               (found = "private:<id>" for the name of a project kept private)
   [[tree]] public, from, [exclude]             a directory: every file under from = source:<dir> | overlay:<dir>
                                                ("source:" = the whole repository) at the pinned revision, placed
                                                under public ("" = the root), minus exclude globs relative to from
@@ -52,7 +53,21 @@ staging over another owner's unfinished staging needs `--take-over <reason>` (re
 
 Standard library only; Python >= 3.11. Exit status 1 with `agdev-external-publish [<code>]: <reason>` on any
 refusal; codes: conflict, stale-public-head, unavailable-source, child-not-public, graph, contract, check-failed,
-checkout-state, owner, busy, infrastructure, usage.
+checkout-state, owner, busy, infrastructure, usage, rule.
+
+Rules (agdev docs/mycatalog.md, Rules): a catalog's rules.yaml refuses a candidate that holds a braindump kept
+private by a tag rule, or a public projects.yaml whose because names one; and on an installation with a catalog,
+build, stage and push refuse the workspace of a project its owner's words keep private (an adopted project rule
+never-publish, or such a statement proposed and not declined). The area is $WFE_AREA, the folder of
+$WFE_REGISTRY, or <root>/data/area beside the installed tool.
+
+Private names (improve_publish p1): on an installation with a catalog, every candidate of any workspace is
+searched for the id of each project kept private (case-insensitive, as a word: not next to [A-Za-z0-9]); a
+finding is labelled private:<id> and stops stage and resolve like a forbidden word unless an [[allow]] records
+why the public text needs the name. The public rules.yaml of a catalog (a repository with mycatalog.yaml at its
+root) is derived: only rules whose source braindump the same candidate selects, that are not never-publish on a
+project and not share: never; without source.commit; adopted.by the destination's account. It takes no
+[[file.edit]].
 """
 from __future__ import annotations
 
@@ -344,11 +359,11 @@ def excluded_by(rel: str, patterns: list[str]) -> bool:
     return any(fnmatch(rel, p) or fnmatch(rel, p.rstrip("/") + "/*") for p in patterns)
 
 
-def tree_selection(repo: Path, rev: str, contract: dict) -> dict[str, tuple[bytes, str, str]]:
-    """Every file a [[tree]] selects: public path -> (content, mode, origin). A tree copies a directory of the
+def tree_selection(repo: Path, rev: str, contract: dict) -> dict[str, tuple[bytes, str, str, str | None]]:
+    """Every file a [[tree]] selects: public path -> (content, mode, origin, source path or None). A tree copies a directory of the
     source (or overlay) at the pinned revision, minus `exclude` globs (relative to `from`). Gitlinks and
     .gitmodules are never copied (submodules come from [[submodule]]), nor the source's publication/ folder."""
-    selected: dict[str, tuple[bytes, str, str]] = {}
+    selected: dict[str, tuple[bytes, str, str, str | None]] = {}
     for spec in contract.get("tree", []):
         kind, _, base = spec.get("from", "").partition(":")
         if kind not in ("source", "overlay"):
@@ -373,7 +388,8 @@ def tree_selection(repo: Path, rev: str, contract: dict) -> dict[str, tuple[byte
             public = f"{public_root}/{rel}" if public_root else rel
             if public in selected:
                 raise Refusal.coded("contract", f"{public} is selected by two [[tree]] entries")
-            selected[public] = (git(repo, "cat-file", "blob", sha), mode, f"{spec['from']} (tree)")
+            selected[public] = (git(repo, "cat-file", "blob", sha), mode, f"{spec['from']} (tree)",
+                                path if kind == "source" else None)
             found += 1
         if not found:
             raise Refusal.coded("contract", f"[[tree]] {spec.get('from')} selects nothing at {rev[:12]}")
@@ -396,17 +412,224 @@ def admitted(ctx: Ctx, rel: str, digest: str) -> bytes:
     raise Refusal.coded("contract", f"workspace:{rel} does not have sha256 {digest} (and no kept copy): review it and pin its hash")
 
 
+RULES_FILE, RULES_SCHEMAS = "rules.yaml", ("ag.catalog-rules.v1", "ag.catalog-rules.v2")
+EPISODES = "braindumps/episodes/"
+
+
+def installation_area() -> Path | None:
+    """The WFE area of the installation this tool belongs to: $WFE_AREA, the folder of $WFE_REGISTRY, or
+    <root>/data/area for the installed tool (<root>/config/install/agdev-external-publish)."""
+    if os.environ.get("WFE_AREA"):
+        return Path(os.environ["WFE_AREA"])
+    if os.environ.get("WFE_REGISTRY"):
+        return Path(os.environ["WFE_REGISTRY"]).parent
+    guess = Path(__file__).resolve().parents[2] / "data" / "area"
+    return guess if guess.is_dir() else None
+
+
+def read_yaml_rules(raw: bytes, where: str) -> dict:
+    try:
+        import yaml
+    except ImportError:
+        raise Refusal.coded("rule", f"{where} holds adopted rules and PyYAML is not installed to read them: "
+                                    "nothing is built (python3 -m pip install pyyaml)")
+    class Loader(yaml.SafeLoader):  # times stay as written (a public form copies them as they are)
+        pass
+    Loader.yaml_implicit_resolvers = {k: [r for r in v if r[0] != "tag:yaml.org,2002:timestamp"]
+                                      for k, v in yaml.SafeLoader.yaml_implicit_resolvers.items()}
+    try:
+        return yaml.load(raw.decode("utf-8"), Loader=Loader) or {}
+    except Exception as error:  # a rules file that cannot be read protects nothing: refuse
+        raise Refusal.coded("rule", f"{where} cannot be read ({error}): nothing is built")
+
+
+_PRIVATE: dict | None = None
+
+
+def private_projects() -> dict[str, list[str]]:
+    """The projects this installation's catalog keeps private, each with why (the same reading as
+    `wfe catalog disclosure`: an adopted project rule never-publish at HEAD of the service's clone, or such a
+    proposal not declined). {} on an installation without a catalog."""
+    global _PRIVATE
+    if _PRIVATE is not None:
+        return _PRIVATE
+    found: dict[str, list[str]] = {}
+    area = installation_area()
+    if area and (area / "catalog.json").is_file():
+        clone = area / ".local" / "catalog"
+        raw = git(clone, "cat-file", "blob", f"HEAD:{RULES_FILE}", check=False) if clone.is_dir() else b""
+        if raw and any(schema in raw.decode("utf-8", errors="replace") for schema in RULES_SCHEMAS):
+            for r in read_yaml_rules(raw, f"the catalog's {RULES_FILE}").get("rules") or []:
+                if r.get("project") and r.get("follows") == "never-publish":
+                    src = r.get("source") or {}
+                    found.setdefault(str(r["project"]), []).append(
+                        f"rule {r.get('id')}, adopted by {(r.get('adopted') or {}).get('by')} from "
+                        f"{src.get('braindump')}@{str(src.get('commit'))[:7]}: \"{src.get('sentence')}\"")
+        try:
+            links = json.loads((area / ".local" / "catalog-links.json").read_text(encoding="utf-8"))
+            for d in links.get("disclosure") or []:
+                if d.get("project") and d.get("follows") == "never-publish" and d.get("state") == "suggested":
+                    found.setdefault(str(d["project"]), []).append(
+                        f"proposed by {links.get('by')} ({links.get('id')}, {d.get('n')}) from {d.get('braindump')}: "
+                        f"\"{d.get('quote')}\" (not answered yet; No on the Catalog page lifts it)")
+        except Exception:
+            pass
+    _PRIVATE = found
+    return found
+
+
+def private_name_re(project: str):
+    import re
+    return re.compile(r"(?<![A-Za-z0-9])" + re.escape(project) + r"(?![A-Za-z0-9])", re.IGNORECASE)
+
+
+def disclosure_refusal(ctx: "Ctx") -> None:
+    """A project the owner's words keep private (user_catalog p8; agdev docs/mycatalog.md, Rules): an adopted
+    `project: <id>, follows: never-publish` in the catalog's rules.yaml, or such a statement the summoner proposed
+    and the owner has not declined (<area>/.local/catalog-links.json). Its workspace is refused for build, stage and
+    push. An installation without a catalog, or a catalog without such a rule, is not affected."""
+    area = installation_area()
+    if not area or not (area / "catalog.json").is_file():
+        return
+    try:
+        setting = json.loads((area / "catalog.json").read_text(encoding="utf-8"))
+    except Exception:
+        return
+    if setting.get("publicationWorkspace") and Path(setting["publicationWorkspace"]).resolve() == ctx.workspace:
+        return  # the catalog itself: its tag rules are read from the candidate (rule_refusals)
+    project = None
+    try:
+        registry = json.loads((area / "registry.json").read_text(encoding="utf-8"))
+        for w in registry.get("workspaces", []):
+            if Path(w.get("path", "")).resolve() == ctx.workspace:
+                project = w.get("project") or w.get("id")
+    except Exception:
+        pass
+    if not project and ctx.workspace.name.startswith("pj-"):
+        project = ctx.workspace.name[3:]
+    if not project:
+        return
+    found = private_projects().get(project, [])
+    if found:
+        raise Refusal.coded("rule", f"project {project} is kept private by the owner's words: {'; '.join(found)}. "
+                                    "Nothing of it is published by this tool (wfe catalog disclosure)")
+
+
+def selected_sources(repo: Path, rev: str, contract: dict) -> tuple[list[str], set[str]]:
+    """Every path of the repository at rev, and the source paths the contract selects ([[file]] source: and
+    [[tree]] source: minus its excludes)."""
+    selected = {e["from"].partition(":")[2].strip("/") for e in contract.get("file", [])
+                if e.get("from", "").startswith("source:")}
+    listing = [r.split("\t", 1)[1] for r in
+               filter(None, git(repo, "ls-tree", "-r", "-z", "--full-tree", rev).decode().split("\0"))]
+    for spec in contract.get("tree", []):
+        kind, _, base = spec.get("from", "").partition(":")
+        if kind != "source":
+            continue
+        base = base.strip("/")
+        for path in listing:
+            if base and not path.startswith(base + "/"):
+                continue
+            if not excluded_by(path[len(base) + 1:] if base else path, list(spec.get("exclude", []))):
+                selected.add(path)
+    return listing, selected
+
+
+def public_rules(repo: Path, rev: str, contract: dict, raw: bytes) -> bytes:
+    """The public form of a catalog's rules.yaml (improve_publish p1 decisions 4-7): the rules whose source
+    braindump this candidate selects, that are not never-publish on a project (it names what is private) and not
+    share: never; without source.commit (an internal commit no reader can resolve); adopted.by the account of the
+    destination (only the owner adopts a rule). Everything else is left out without a trace."""
+    import yaml
+    doc = read_yaml_rules(raw, f"{RULES_FILE} at {rev[:12]}")
+    _, selected = selected_sources(repo, rev, contract)
+    account = identity(contract.get("destination", "")).split("/")[0] or None
+    kept = []
+    for r in doc.get("rules") or []:
+        if not isinstance(r, dict):
+            continue
+        source = r.get("source") or {}
+        if f"{EPISODES}{source.get('braindump')}/braindump.md" not in selected:
+            continue
+        if r.get("project") and r.get("follows") == "never-publish":
+            continue
+        if r.get("share") == "never" or r.get("follows") == "default-licence":
+            continue
+        rule = {k: r[k] for k in ("id", "tag", "project", "follows") if k in r}
+        rule["source"] = {k: source[k] for k in ("braindump", "sentence") if k in source}
+        adopted = dict(r.get("adopted") or {})
+        if account and "by" in adopted:
+            adopted["by"] = account
+        if adopted:
+            rule["adopted"] = adopted
+        kept.append(rule)
+    head = ("# Rules adopted by the owner from their own words (ag.catalog-rules.v2; agdev docs/mycatalog.md, "
+            "Rules).\n\n")
+    body = yaml.safe_dump({"schema": doc.get("schema") or "ag.catalog-rules.v2", "rules": kept},
+                          allow_unicode=True, sort_keys=False, width=1000)
+    return (head + body).encode("utf-8")
+
+
+def is_catalog(repo: Path, rev: str) -> bool:
+    return git_ok(repo, "cat-file", "-e", f"{rev}:mycatalog.yaml")
+
+
+def rule_refusals(repo: Path, rev: str, contract: dict) -> None:
+    """A catalog's adopted rules (rules.yaml at its root, ag.catalog-rules.v1; agdev docs/mycatalog.md, Rules).
+    `never-publish` on a tag: no candidate may hold the braindump.md or review.md of a braindump whose
+    metadata.yaml carries that tag at the pinned revision. A repository without that file is not affected."""
+    raw = git(repo, "cat-file", "blob", f"{rev}:{RULES_FILE}", check=False)
+    if not raw or not any(schema in raw.decode("utf-8", errors="replace") for schema in RULES_SCHEMAS):
+        return
+    import yaml
+    doc = read_yaml_rules(raw, f"{RULES_FILE} at {rev[:12]}")
+    rules = [r for r in doc.get("rules") or [] if isinstance(r, dict) and r.get("follows") == "never-publish" and r.get("tag")]
+    if doc.get("schema") not in RULES_SCHEMAS or not rules:
+        return
+    listing, selected = selected_sources(repo, rev, contract)
+    for path in listing:
+        if not (path.startswith(EPISODES) and path.endswith("/metadata.yaml")):
+            continue
+        folder = path[:-len("metadata.yaml")]
+        try:
+            tags = (yaml.safe_load(git(repo, "cat-file", "blob", f"{rev}:{path}").decode("utf-8")) or {}).get("tags") or []
+        except Exception:
+            tags = []
+        tags = {str(t).lower() for t in tags}
+        for rule in rules:
+            if str(rule["tag"]).lower() not in tags:
+                continue
+            held = [f for f in (folder + "braindump.md", folder + "review.md") if f in selected]
+            if held:
+                source = rule.get("source") or {}
+                raise Refusal.coded("rule", f"{', '.join(held)}: braindump {folder[len(EPISODES):-1]} is tagged "
+                                    f"#{rule['tag']}, which is never published (rule {rule.get('id')}, adopted from "
+                                    f"{source.get('braindump')}@{str(source.get('commit'))[:7]}: "
+                                    f"\"{source.get('sentence')}\"). Take it out of the contract, or change the "
+                                    "tag or the rule (wfe catalog publication check)")
+            # user_catalog p8: a because of the public projects.yaml that names it by its path
+            if "projects.yaml" in selected and (folder + "braindump.md").encode() in \
+                    git(repo, "cat-file", "blob", f"{rev}:projects.yaml", check=False):
+                raise Refusal.coded("rule", f"projects.yaml: a because names braindump {folder[len(EPISODES):-1]}, tagged "
+                                    f"#{rule['tag']}, which is never published (rule {rule.get('id')}). Take the link "
+                                    "out of the shared project, or keep projects.yaml out of the contract")
+
+
 def build(ctx: Ctx, repo: Path, rev: str, contract: dict, out: Path, links: dict[str, tuple[str, str]],
           declared: list[str]) -> dict:
     """Write the candidate of one repository; links: submodule path -> (public commit, public URL)."""
     if out.exists() and any(out.iterdir()):
         raise Refusal.coded("usage", f"{out} is not empty")
+    rule_refusals(repo, rev, contract)
     out.mkdir(parents=True, exist_ok=True)
     files, inputs = [], []
     named = {f["public"] for f in contract.get("file", [])}
-    for public, (content, mode, origin) in sorted(tree_selection(repo, rev, contract).items()):
+    catalog = is_catalog(repo, rev)
+    for public, (content, mode, origin, source_path) in sorted(tree_selection(repo, rev, contract).items()):
         if public in named:
             continue  # a [[file]] for the same path decides (with its edits)
+        if catalog and source_path == RULES_FILE:
+            content = public_rules(repo, rev, contract, content)
         target = out / public
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_bytes(content)
@@ -417,6 +640,11 @@ def build(ctx: Ctx, repo: Path, rev: str, contract: dict, out: Path, links: dict
         mode = "100644"
         if kind == "source":
             content, mode = blob(repo, rev, rel)
+            if rel.strip("/") == RULES_FILE and is_catalog(repo, rev):
+                if entry.get("edit"):
+                    raise Refusal.coded("contract", f"{entry['public']}: the public {RULES_FILE} of a catalog is derived from its "
+                                        "rules and takes no [[file.edit]] (agdev docs/external-publication.md, The owner's words)")
+                content = public_rules(repo, rev, contract, content)
         elif kind == "overlay":
             content, mode = blob(repo, rev, f"{OVERLAY}/{rel}")
         elif kind == "workspace":
@@ -470,19 +698,30 @@ def secret_values(ctx: Ctx, contract: dict, extra: list[str]) -> list[tuple[str,
     return values
 
 
-def check(ctx: Ctx, out: Path, contract: dict, extra_secrets: list[str]) -> list[dict]:
+def check(ctx: Ctx, out: Path, contract: dict, extra_secrets: list[str], kept: list[dict] | None = None) -> list[dict]:
+    """Findings not covered by an [[allow]]: forbidden words, secret values, and (improve_publish p1) the id of
+    every project this installation keeps private, labelled private:<id>. Allowed private names go to `kept`."""
     allowed = contract.get("allow", [])
     findings = []
     secrets = secret_values(ctx, contract, extra_secrets)
+    private = [(f"private:{p}", private_name_re(p)) for p in sorted(private_projects())]
     for path in sorted(p for p in out.rglob("*") if p.is_file() and ".git" not in p.relative_to(out).parts):
         rel = path.relative_to(out).as_posix()
         text = path.read_bytes().decode("utf-8", errors="replace")
         lower = text.lower()
         found = [word for word in contract.get("forbidden", []) if word.lower() in lower]
         found += [label for label, value in secrets if value in text]
+        found += [label for label, pattern in private if pattern.search(text)]
         for label in found:
-            if not any(fnmatch(rel, a["file"]) and a["found"] == label for a in allowed):
-                findings.append({"file": rel, "found": label})
+            allow = next((a for a in allowed if fnmatch(rel, a["file"]) and a["found"] == label), None)
+            if not allow:
+                finding = {"file": rel, "found": label}
+                if label.startswith("private:"):
+                    finding["why"] = "names a project kept private: generalize it, or record why the name is needed " \
+                                     f"([[allow]] file = \"{rel}\", found = \"{label}\", why = \"…\")"
+                findings.append(finding)
+            elif label.startswith("private:") and kept is not None:
+                kept.append({"file": rel, "found": label, "why": allow.get("why", "")})
     return findings
 
 
@@ -504,9 +743,12 @@ def candidate_tree(ctx: Ctx, node_repo: Path, rev: str, contract_path: str, chec
         out = Path(tmp) / "candidate"
         info = build(ctx, node_repo, rev, contract, out, links, declared)
         if checked:
-            findings = check(ctx, out, contract, extra_secrets)
+            kept: list[dict] = []
+            findings = check(ctx, out, contract, extra_secrets, kept)
             if findings:
-                raise Refusal.coded("check-failed", f"candidate check failed for {identity_of(node_repo)}@{rev[:12]}: " + json.dumps(findings))
+                raise Refusal.coded("check-failed", f"candidate check failed for {identity_of(node_repo)}@{rev[:12]}: "
+                                    + json.dumps(findings, ensure_ascii=False))
+            info["private_names"] = {"searched": sorted(private_projects()), "allowed": kept}
         return info, tree_of(checkout, out, info["gitlinks"])
 
 
@@ -612,7 +854,8 @@ def stage_repo(ctx: Ctx, root: Node, node: Node, journal: dict, results: dict, m
     head = git(checkout, "rev-parse", "--verify", "-q", "HEAD", check=False).decode().strip()
     entry = {"source_rev": node.rev, "candidate_tree": tree, "destination": state["destination"], "branch": branch,
              "inputs": info["inputs"], "files": len(info["files"]), "gitlinks": gl_record,
-             "checks": {"forbidden_and_secret_values": "passed"}, "operation": op["id"], "staged_at": now()}
+             "checks": {"forbidden_and_secret_values": "passed", "private_names": info.get("private_names")},
+             "operation": op["id"], "staged_at": now()}
     if previous is None:
         if head and not (staged and staged[-1]["public_commit"] == head):
             raise Refusal.coded("checkout-state", f"{checkout} has commits but the journal records no publication: inspect it first")
@@ -675,6 +918,7 @@ def stage_repo(ctx: Ctx, root: Node, node: Node, journal: dict, results: dict, m
 
 def cmd_stage(ctx: Ctx, rev: str, message: str, extra_secrets: list[str], owner: str | None = None,
               take_over: str | None = None) -> dict:
+    disclosure_refusal(ctx)
     with ctx.lock():
         journal = ctx.read_journal()
         previous = last_stage(journal)
@@ -741,7 +985,7 @@ def cmd_resolve(ctx: Ctx, repo_id: str, note: str, extra_secrets: list[str], own
             subprocess.run(f"git -C '{checkout}' archive {head} | tar -x -C '{out}'", shell=True, check=True)
             findings = check(ctx, out, contract, extra_secrets)
         if findings:
-            raise Refusal.coded("check-failed", "the resolved tree fails the check: " + json.dumps(findings))
+            raise Refusal.coded("check-failed", "the resolved tree fails the check: " + json.dumps(findings, ensure_ascii=False))
         entry.update(status="staged", public_commit=head,
                      public_tree=git(checkout, "rev-parse", f"{head}^{{tree}}").decode().strip(),
                      resolution={"note": note, "at": now(), "files": entry["conflict"]["files"], "commit": head})
@@ -827,6 +1071,7 @@ def push_repo(ctx: Ctx, journal: dict, repo_id: str) -> str:
 
 def cmd_push(ctx: Ctx, stop_before: str | None, owner: str | None = None, operation: str | None = None,
              take_over: str | None = None) -> dict:
+    disclosure_refusal(ctx)
     with ctx.lock():
         journal = ctx.read_journal()
         op = last_stage(journal)
@@ -877,6 +1122,7 @@ def describe(ctx: Ctx, rev: str) -> dict:
 
 
 def cmd_build(ctx: Ctx, rev: str, out: Path, extra_secrets: list[str]) -> dict:
+    disclosure_refusal(ctx)
     journal = ctx.read_journal()
     root = discover(ctx, rev)
     report = {"root": root.id, "problems": validate(ctx, root, journal), "repositories": []}
@@ -889,14 +1135,16 @@ def cmd_build(ctx: Ctx, rev: str, out: Path, extra_secrets: list[str]) -> dict:
                                  public_url(child.contract["destination"], node.contract["destination"]))
         info = build(ctx, node.repo, node.rev, node.contract, out / node.name, links,
                      [s["path"] for s in node.contract.get("submodule", [])])
-        findings = check(ctx, out / node.name, node.contract, extra_secrets)
+        kept: list[dict] = []
+        findings = check(ctx, out / node.name, node.contract, extra_secrets, kept)
         with tempfile.TemporaryDirectory() as tmp:  # the tree id, for comparison with the journal
             git(Path(tmp), "init", "-q")
             tree = tree_of(Path(tmp), out / node.name, [g for g in info["gitlinks"] if g[1]])
         info["gitlinks"] = [(path, commit or "not yet staged") for path, commit in info["gitlinks"]]
         report["repositories"].append({"id": node.id, "source_rev": node.rev, "out": (out / node.name).as_posix(),
                                        "candidate_tree": tree, "files": len(info["files"]), "inputs": info["inputs"],
-                                       "gitlinks": info["gitlinks"], "findings": findings})
+                                       "gitlinks": info["gitlinks"], "findings": findings,
+                                       "private_names": {"searched": sorted(private_projects()), "allowed": kept}})
     return report
 
 

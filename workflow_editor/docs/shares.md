@@ -213,3 +213,14 @@ can still return its own storage or transport error, which publication records.
 
 Retention of inputs and accepted outputs on the share belongs to the person
 or the project, never to incidental cleanup.
+
+## Catalog drafts on a share (user_catalog p6 ex1)
+
+The catalog's drafts (docs/mycatalog.md *Drafts*) may be kept in a share:
+`wfe catalog draft use shared://<share>/<folder>/` creates the folder with a marker
+(`.agdev-catalog-drafts.json`, naming the catalog) and records the reference in
+`catalog.json` `drafts`. Every read resolves the reference through this layer: an
+unmounted or unavailable share, or a folder without its marker, makes drafts
+unavailable (503) and nothing is written to another folder. Drafts are not inputs of
+runs: the summoner's `ask` reads one through `wfe catalog draft show` on the local
+worker, and no share path is put in its request.

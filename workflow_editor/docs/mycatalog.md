@@ -1,4 +1,4 @@
-# The catalog: braindumps, reviews, challenges, summonplans, shared projects (user_catalog p1–p6)
+# The catalog: braindumps, reviews, challenges, summonplans, shared projects (user_catalog p1–p6, p6 ex1–ex2)
 
 agdev's core is the workflow and the record of *why* projects exist. The
 projects themselves (warden, ponderer, aghangout and every other) are outside
@@ -82,6 +82,7 @@ mycatalog/
   projects.yaml                               # ag.projects.v1: the projects this user shares
   braindumps/episodes/<path>/braindump.md     # free text
   braindumps/episodes/<path>/review.md        # free text, optional
+  braindumps/episodes/<path>/metadata.yaml    # ag.braindump-metadata.v1: optional tags
   braindumps/archive/<date>/<path>/…          # archived braindumps with their reviews; README.md lists them. Not read
   challenges/<id>/…                           # the owner's challenges (challenges.md in these docs)
   challenges.md                               # the index of what is not yet real: braindumps and challenges
@@ -121,7 +122,8 @@ and is not read.**
 
 ### Braindumps
 
-Free Markdown. A first-level heading on the first line is its title;
+Free Markdown. A first-level heading on the first line is its title (a line
+of tags only, such as `#public #todo`, above it does not count);
 without one, the path is the title. There is no front matter and no required
 structure, because writing one must cost almost nothing.
 
@@ -129,6 +131,287 @@ Every change is one commit in the catalog. Its Git author is the person or
 agent whose words it holds (`--author`). The committer is `agdev`. Nobody's
 signature is verified: an agent the person asked to write signs by being the
 author.
+
+### Writing a braindump (p6 ex2)
+
+On the Catalog page:
+
+1. Write in the field at the top. It is saved as you type (outside Git; *Saved* says so).
+2. Press **Put it in the catalog**. The text becomes a braindump in one commit in your name. Its
+   path is given by the service from the first line (`# Calm mornings` → `calm-mornings`; a title
+   with fewer than three of `a-z 0-9` → `note-<yyyymmdd>`), never a taken path or one that an
+   archived braindump held (then `-2`, `-3`, …). Words such as `#style` in the text are its tags.
+3. Later, read the review on its card: the summoner is asked by itself (*The follow-up*), and the
+   card shows *the summoner is reading it* meanwhile. Where tags are suggested, answer **OK** (all
+   of them) or **No** on the one line.
+
+**Ask** gives the text to the summoner instead of putting it in (*Asking*, below); the answer
+appears below the field. **Edit** on a card puts
+the braindump's text in the field; the button then reads **Update it** and commits against the
+commit the text was read at (a braindump changed meanwhile is refused, the text is kept, *Put
+mine over it* is offered). Texts not yet in the catalog are listed under the field as
+**Unfinished**. A path of your own, *Register…* with *Preview*, the tag editor, writing a review
+by hand, *Ask for a review*, *Refresh the index*, *Add a braindump directly*, *Rename…*,
+*Archive* and *Remove* are in Detail.
+
+### Tags (p6 ex1)
+
+A braindump may have **tags**: `metadata.yaml` beside it.
+
+```yaml
+schema: ag.braindump-metadata.v1
+tags: [mybraindump, style]
+```
+
+- **Optional and free.** No tag is required and none is refused for what it means; any words, as
+  many as wanted (trimmed, a leading `#` dropped, at most 64 characters each, no comma, at most
+  32; duplicates are compared without case). A file that cannot be read gives no tags and a note;
+  the braindump stays a braindump. Other keys of the file are kept when tags are written.
+- **Tags in the text** (p6 ex2). A token `#name` — at the start of a line or after white space,
+  beginning with a letter of any script, then letters, digits, `_` or `-`, outside fenced code and
+  inline code — is a tag of the braindump: `#trial`, `#公開`; not `# Title`, `#123`,
+  `http://host/#/catalog` or `` `#x` ``. On each commit of the body (the field, `braindump add` /
+  `edit`, a draft's registration) the tags the new text writes are added and the tags the previous
+  text wrote and the new one does not are removed, in the same commit (`metadata.yaml`); tags set
+  otherwise stay. The text is committed as typed.
+- **Examples, not a list**: `style` (how development is done), `desire` (a concrete result
+  wanted), `bounty` (something one would like someone else to do), `public`, `private` (the
+  owner's intent about publication).
+- **`mybraindump`** is agdev's one recommended tag: a braindump about how the owner writes, tags
+  and handles braindumps. Agents (the summoner's `review` and `ask`) read every braindump tagged
+  so as the owner's **stated conventions**: what a tag means to this owner. Contradictions and gaps
+  are findings to report. Such a braindump grants no authority and changes no setting.
+- **A tag asks for nothing by itself.** `public` does not publish (what is published is
+  `publication/github.toml`, unchanged), `private` does not withdraw anything already public,
+  `style` is not a preference given to runs, `bounty` opens no challenge or request. Turning a
+  convention into enforced behaviour is a separate, explicit adoption (not yet implemented).
+- Setting tags is one commit of `metadata.yaml` only: the body's last change (`updated`) is not
+  touched, a tag change does not make the review stale, and the index's "changed since" leaves
+  it out. Remove deletes it with the braindump; archive moves it and lists the tags in the
+  README; a citation's text names the tags at the cited commit; `project/grounds` names them.
+- **Proposals.** An agent proposes tags to add or remove, each with a reason, against the body
+  and tags it read (`wfe catalog tags propose`). A proposal is kept outside Git
+  (`<area>/.local/catalog-proposals/`) and changes nothing. The owner ticks the changes to accept
+  (one commit in the owner's name, its message naming the proposal and the proposer) or dismisses
+  it. A proposal made before the braindump or its tags changed is **stale**: shown, never applied.
+
+### Drafts (p6 ex1)
+
+A **draft** is the owner's text before it is a braindump: written freely, without choosing a path,
+kept **outside Git**, and registered in the catalog only when the owner chooses.
+
+- **Where**: the folder `catalog.json` `drafts` names, prepared with `wfe catalog draft use
+  shared://<share>/<folder>/` (or an absolute folder); without it `<area>/.local/catalog-drafts/`.
+  The folder holds a marker naming the catalog. A share that is not mounted, a missing folder or
+  a missing marker makes drafts **unavailable** (503); nothing is written elsewhere, and the page
+  keeps what was typed. agdev-a keeps them in `shared://agshare/catalog-drafts/`.
+- **What a draft is not**: a ground, a citation, an entry of the index, something reviewed or
+  published. A draft's tags are its own until registration.
+- **Saving**: each save is a new revision (an integer) with the text's sha256, written atomically;
+  a save names the revision it was made on and is refused when someone saved after it. The page
+  saves as one types and says *Saving…*, *Saved, revision n*, or *Not saved: why* — the text stays
+  in the editor, and this browser also keeps a copy of text that never reached the service.
+- **Asking**: *Ask* freezes the saved revision and queues the summoner's workflow `ask` on the
+  area's local worker (where the draft can be read); see *Asking (p7)*. The answer is kept beside
+  the draft, labelled with the revision it read; an answer on an older revision says so. Nothing
+  is registered by asking.
+- **Registering**: the path is optional (p6 ex2): without one the service gives it as in *Writing a
+  braindump*. A draft made with `of: <path>` and `ofBase: <commit>` (the page's *Edit*, `draft new
+  --of`) is a change of that braindump: registering it is an edit against that commit, with the
+  same receipt and trailer; a braindump changed meanwhile answers 409 `changed`. The page's main
+  button is `POST api/catalog/drafts/<id>/put`: save, then register, in one call.
+  Detail's *Register…*: choose a path, preview (the text, tags, problems, a warning when the path was a
+  braindump that is now archived), register. It is one catalog commit of `braindump.md` and
+  `metadata.yaml`, in the owner's name, of exactly the previewed revision. A taken path is refused
+  and the draft is unchanged; an archived path needs a confirmation that it is the same braindump.
+  The draft records a receipt before the commit and is marked registered only after the commit is
+  read back; a retry after an unknown result finds the earlier commit (its `Draft-Registration`
+  trailer) before making one. Registering publishes nothing, maps no project and writes no
+  preference. The draft and its advice stay until the owner removes them.
+- **Records and retention**: the draft, its snapshots and advice are files in the draft folder.
+  The advice run's request, node outcomes and run folder (committed to the summoner's repository)
+  hold ids, hashes and counts only. The model harness's session log on the executing host does
+  keep what the agent read and wrote; it is outside Git, and it is a record of the text.
+- **Limits**: advice runs only on the local worker; with drafts on a share another host could
+  read, a remote worker still does not read them. Drafts have no history beyond their snapshots
+  for advice; removal is final.
+
+### Asking (p7)
+
+The field has a second button, **Ask**. **The button decides what the text is; the service never
+guesses**: *Put it in the catalog* makes the text a braindump; *Ask* gives it to the summoner to
+read and answer, and nothing of it enters the catalog. The text may be an unfinished braindump
+(the answer is advice on it: ambiguities, related braindumps, possible projects, your
+conventions), an instruction ("suggest the links", "rename this braindump", "make my tag
+conventions rules") or a question. A text that holds a wish and an instruction is put and asked
+in two steps.
+
+The summoner's workflow `ask` answers in words and may propose **at most a few actions from a
+fixed list**, each one line under the answer with **Do it** and **No**:
+
+| Action (`do`) | **Do it** carries out |
+| --- | --- |
+| `suggest-links` | asks the summoner to suggest links for the whole catalog (*Links*) |
+| `review` (one braindump, or those that are due), `index` | the request the buttons of Detail make |
+| `tags` | tags of one braindump in one commit in your name, or of the asked text; its line is **OK** / **No** |
+| `rename`, `archive` | *Renaming*, *Archiving*, of the one braindump named |
+| `use-text` | the summoner's rewritten text becomes your text in the field; nothing is put in |
+| `adopt-rule`, `retire-rule` | *Rules* |
+| `hand-over` | a request to the workflow `freework` of the project that holds the `facilitation` role, with your text as the request |
+
+Nothing is done before the click, and the service carries the action out, not the run. An action
+the writer refuses (a path taken meanwhile) says why on its line and can be tried again. What
+fits none of the actions is answered in words only. No action removes a braindump, writes a plan
+entry's `source`, `commit` or `roles`, summons or retires a project, or publishes. The hand-over
+is the way out for everything that is not about the catalog, and **the one action that puts the
+text into Git** (the request of that run): its line says so.
+
+**What stays outside Git**: the asked text and the answer, beside the draft in the drafts folder
+(`<draft>/advice/<ask>.json`, `ag.catalog-ask.v1`: the kind the summoner read the text as, its
+words, each action with its state). The run's request names the draft and the ask by id; its
+record has ids and counts only. The summoner does not read `braindumps/archive/`.
+
+Under the field, after *Unfinished*: **Asked**, one line per asked text with the state of its
+answer and of its actions, until you press **Dismiss**. A text the summoner read as an
+instruction or a question is listed there and not under *Unfinished*, and dismissing its last
+answer removes the text; an unfinished braindump that was asked about stays in *Unfinished*.
+Without a summoner here Ask says so and nothing is recorded.
+
+### Links (p7)
+
+A **link** is one item of a `because`: this braindump is a ground of that project. Links are
+suggested by the summoner and agreed by the owner; nothing else writes them but a person editing
+the plan (and `propose`, when it adds a project).
+
+1. Write braindumps. The page then shows, under *Braindumps and projects*: *N braindumps have no
+   suggested links yet:* **Suggest links** (or ask for it in the field).
+2. The summoner's workflow `ground` reads the whole catalog at one commit and, for every project
+   of this installation's plan and of `projects.yaml`, suggests the braindumps that ground it,
+   each with the sentences of the braindump that say so; links that exist and that it would drop,
+   with why; what no project serves; which projects have no ground. It adds and removes no
+   project, writes no plan and does not read `braindumps/archive/`. Its only write is `wfe
+   catalog links suggest`, kept outside Git (`<area>/.local/catalog-links.json`) with the commit
+   it read; a newer suggestion replaces it. A quote that is not in the braindump at that commit
+   refuses the suggestion.
+3. The diagram draws suggested links dashed. Under it, *Suggested links*: one line per link with
+   the quoted sentence, **OK** and **No**, and **OK to all**. One click is one commit in your
+   name, writing `because` in the plan and, where the project is listed there, in `projects.yaml`
+   (the plan's `grounds` becomes the commit it was written on). A link whose braindump or project
+   is gone by then is dropped, not written. *OK to all* is every suggested addition; a suggested
+   drop is answered on its own line.
+4. The follow-up then asks for the review of the braindumps whose links changed (a review reads
+   the projects its braindump grounds), then for the index.
+
+Links are suggested when you ask, not by themselves. "No project serves this" is one line on the
+braindump's card; a project without a ground stays in Detail's table. Creating a project for a
+wish is `propose` (reachable by the hand-over).
+
+### Rules (p7)
+
+What stays local and what is published follows the five principles of *What stays local, what is published* in the core's docs/external-publication.md; this section does not restate them.
+
+Tags ask for nothing by themselves. A **rule** makes one of your own tag conventions binding: it
+is adopted **by the owner, from a sentence the owner wrote** in a braindump tagged `mybraindump`.
+Reading a convention never activates anything, yours or an imported one.
+
+`rules.yaml` at the catalog's root:
+
+```yaml
+schema: ag.catalog-rules.v1
+rules:
+  - id: private-never-publish          # <tag>-<follows>
+    tag: private
+    follows: never-publish             # or suggest-publish
+    source: {braindump: mybraindump, commit: <40 hex>, sentence: "…"}
+    adopted: {by: <who>, at: <time>}
+```
+
+Two things can follow from a tag, no more:
+
+- **`never-publish`**: the public file list cannot select the braindump or its review. `wfe
+  catalog publication check` (and `status`) refuses a selection that holds either, naming the
+  rule and its source, and reports every other selected file that names the braindump by its path
+  or title (the index, another review) for you to read. `agdev-external-publish` refuses to build
+  such a candidate by the same reading of `rules.yaml` at the pinned revision (it needs PyYAML for
+  a catalog that has rules; a repository without `rules.yaml` is published as before). Adopting
+  the rule does not erase what was public before.
+- **`suggest-publish`**: a braindump so tagged and not in the public list shows **Add to the
+  public list**, which appends its folder as a `[[tree]]` to `publication/github.toml` in one
+  commit (`wfe catalog publication add <path>`). Nothing is pushed by it: publishing stays your
+  act with the publication tool.
+
+A braindump with both tags: `never-publish` wins and its card says so. With neither: nothing
+follows. Other tags have a meaning, not a consequence.
+
+**Adopting**: ask once in the field (for example "make my tag conventions rules"); the summoner
+reads the `mybraindump` braindumps and proposes each rule as an action naming the braindump, its
+commit and the sentence; **Do it** writes it in your name. Or `wfe catalog rules adopt`. The
+service refuses a rule whose braindump is not tagged `mybraindump` or whose sentence is not in
+its text at that commit. **A changed source**: when the source braindump changes after the
+adoption, the rule stays in force and is marked *its source changed*; asking again proposes what
+to adopt again, change or retire. Disclosure is never widened without a click. Simple shows a
+rule only where it acts (a card kept private, a card suggested for the public list) and in an
+answer that proposes one; the adopted rules with their sources and **Retire** are in Detail.
+
+#### Rules on projects, and the default licence (p8)
+
+What a braindump **states about a project's disclosure** becomes a rule the same way, from a
+sentence of any braindump (not only `mybraindump`): `rules.yaml` is `ag.catalog-rules.v2` (v1 is
+still read) and holds two more kinds.
+
+```yaml
+  - id: project-example-never-publish     # project-<project>-<follows>
+    project: example
+    follows: never-publish                # or publish
+    source: {braindump: private_projects, commit: <40 hex>, sentence: "…"}
+    adopted: {by: <who>, at: <time>}
+  - id: default-licence
+    follows: default-licence
+    licence: CC0-1.0                      # an SPDX id
+    share: never                          # the owner's own preference: never part of an imported style
+    source: {braindump: note-20261117-2, commit: <40 hex>, sentence: "…"}
+    adopted: {by: <who>, at: <time>}
+```
+
+- **`never-publish` on a project**: no tool of this installation publishes it.
+  `agdev-external-publish` refuses `build`, `stage` and `push` for the project's workspace (code
+  `rule`, naming the rule and its sentence), and the publisher declines a request for it in
+  `scope`. Retiring the rule does not publish anything; adopting it does not withdraw what was
+  public before (the page says so).
+- **`publish` on a project**: the project is *to be published*; the Catalog page offers **Ask the
+  publisher**, and the request names the rule as the owner's authorization for a new public
+  repository `github.com/<owner>/pj-<id>`. What is worth publishing stays the publisher's
+  judgment.
+- **`default-licence`**: the licence of a project's first publication. The publisher uses it and
+  asks only where the candidate holds another's material or the project states another licence.
+  Existing public repositories keep theirs. `share: never`: a style import never shows or
+  proposes it.
+- **`share: never` on any rule** (improve_publish p1): the rule stays in this installation; it is
+  neither published nor offered by a style import. `wfe catalog rules share <id> never|default`
+  sets or removes it (one commit); the default licence is always `never`. Nothing forces a rule
+  public.
+
+**One `rules.yaml`, published as its public part.** The file on Gitea holds every rule, private
+and public, and is the only one the installation enforces. When it is in the public list, the
+publication tool publishes it in a derived form: the rules whose braindump the list selects, that
+are not `never-publish` on a project and not `share: never`, without `source.commit`, with
+`adopted.by` the public account. It is selected as one plain `[[file]]`; nobody edits or trims it.
+`wfe catalog publication status` (and `check`) prints a `rules` line: which rules are public, and
+for each other one why not.
+
+**Proposed by the summoner, answered by the owner.** The `ground` run (*Links*) also reads what
+each braindump states about each project — *stated private*, *stated public*, or nothing, each
+with its sentence; a tag on a braindump is not a statement about the projects it names — and the
+default licence, and proposes them with the links. They wait under **Waiting for you** with **OK**
+(adopt the rule, one commit) and **No**. A **proposed `never-publish` already refuses**: from the
+proposal on, the tool refuses the project until the owner answers **No**. A proposed `publish`
+does nothing until **OK**. Disclosure is never widened by a reading. Both stated for one project:
+private wins, and the line says so.
+
+`wfe catalog disclosure [<project>]` prints per project *private*, *to be published*, *public*
+(with its repositories, from the workspace's publication journal), *public without a statement*
+or *not stated*, the statement that decides and the default licence; `--json` is what the
+publisher reads. `wfe catalog disclosure agree|decline (<n> | licence)` answers a proposal.
 
 ### Reviews
 
@@ -186,6 +469,15 @@ clear a catalog in order before writing it again; that is a command only.
 tree at all; it stays only in the history, and is refused while a plan names
 it.
 
+### Renaming (p6 ex2)
+
+`wfe catalog braindump move <path> <new path> --author <who>` (*Rename…* in Detail) is one commit:
+the files directly in the braindump's folder move (`braindump.md`, `review.md`, `metadata.yaml`,
+any other file there; folders below it are other braindumps and stay), and every `because` naming
+it in `summonplans/*.yaml` and `projects.yaml` names the new path. A new path that holds a file,
+or that an archived braindump held (unless `--reuse-archived`), is refused. What cited the old
+path shows it removed, as after an archive; the follow-up rewrites the index.
+
 ### Challenges
 
 The owner's challenges are in the catalog, under `challenges/<id>/`, in the
@@ -225,8 +517,9 @@ judged.
 - **"Changed since the index"** is derived from Git: the newest commit under
   `braindumps/episodes/` or under `challenges/` is newer than the index's last change.
   A commit that only moves files does not count. It is shown as a note; the
-  index is rewritten on request (`wfe catalog index request`, **Refresh the
-  index** on the Catalog page), not automatically.
+  index is rewritten by the follow-up after a braindump is put in, changed,
+  renamed, archived or removed (p6 ex2), or on request (`wfe catalog index
+  request`, **Refresh the index** in Detail).
 
 ### Who keeps reviews and the index
 
@@ -238,6 +531,28 @@ catalog review request [<path>]` and `wfe catalog index request`, or from the
 Catalog page. Both write through `wfe catalog`, as `summoner-agent`. Without
 a summoner the requests are refused with the reason; a person can still write
 either by hand.
+
+### The follow-up (p6 ex2)
+
+After a braindump is put in or changed (the field, `braindump add` / `edit`, a draft's
+registration), the service asks the summoner by itself: the **review** of that braindump, then the
+**index** once no review is waiting or open. A rename, an archive and a removal ask for the index
+only. The requests are the ones the buttons make, in the name of the person who made the change,
+and one open request per review or index holds (asking again returns the open run).
+
+- **One round per two minutes**: a round starts two minutes after the first change noted since the
+  last one; later changes join it. A change while its run is open starts the next round when the
+  run ends.
+- **When it is not done**: a run that ends (completed, cancelled, stopped) without a review newer
+  than the braindump is asked once more; after that the card says *not reviewed* and why. A request
+  that is refused (no summoner here, the queue refuses) is not retried. *Ask for a review* and
+  *Refresh the index* in Detail remain; a later change starts over.
+- **Where it is**: `<area>/.local/catalog-followup.json` (paths, names and runs; no text), written
+  by the writers wherever they run on this host, acted on by the WFE service every 15 s. `GET
+  api/catalog` carries it as `followUp`; the card links the run, which is an ordinary run of the
+  summoner, seen and cancelled on its page.
+- **Off**: `"followUp": false` in `<area>/catalog.json`. Nothing is noted, nothing is asked; the
+  buttons work as before. (`WFE_NO_CATALOG_FOLLOWUP=1` keeps a service's loop off.)
 
 ### Preferences
 
@@ -342,6 +657,9 @@ same role: choosing between them is the plan's work.
 
 ## The published part
 
+What stays local and what is published follows the five principles of *What stays local, what is published* in the core's docs/external-publication.md; this part does not restate them. The catalog on Gitea is the one the installation acts on;
+the public `<github user>/mycatalog` is its derivative.
+
 Publication is the owner's choice. The repository always stays on the
 cluster's Gitea. A copy on GitHub, if any, is made with the external
 publication tools (docs/external-publication.md in the core), under the same
@@ -369,8 +687,34 @@ commit (from the journal of the folder the catalog is published from: `wfe
 catalog publication use <folder>` records it in `catalog.json`). The Catalog
 page marks each braindump and challenge **published** or **internal** from
 the same reading. Before a push the publication tool shows the candidate and
-runs the forbidden-word check; nothing else checks a published text for
-private names, so the owner reads it.
+runs the forbidden-word check and the search for the names of private
+projects; the publisher still reads every file. When the owner adopted rules (*Rules*),
+`wfe catalog publication check [--source <folder>]` says what they make of
+the selection and exits 1 on a refusal, and the publication tool refuses a
+candidate that holds a braindump a `never-publish` rule covers.
+
+**What the check reads (p8).** Beside the tag rules: a selected `projects.yaml` whose `because`
+names a braindump a tag rule keeps private is **refused** (an item whose braindump is merely not
+public stays: it says that grounds exist). Every selected file that names a project kept private
+is **refused** by the publication tool (improve_publish p1; `refused … names project` lines) unless
+the contract has an `[[allow]]` for it with `found = "private:<id>"` and why the public text needs
+the name (`project … kept by [[allow]]` lines); `check` exits 1 on a name not allowed. What tells
+more than the name (what the project is, its state, its runs, its files) is removed or generalized
+by the owning agent, never allowed. Braindumps no tag rule covers are listed as
+*not decided*: they stay internal. `rules.yaml` joins the public list with the first braindump
+tagged `mybraindump` (`wfe catalog publication add rules.yaml` adds it alone): it is what makes
+the conventions more than words for a reader.
+
+**Publishing it (p8).** Every publication of the catalog is a `publish` run of the publisher
+(target `mycatalog`): the Catalog page's *The public list changed since the last publication:*
+**Ask the publisher**, `wfe catalog publication request`, or the action `publish` of an answer.
+The publisher reads every selected file, the reviews above all, and delegates the catalog's
+changes to the summoner's workflow `catalog-publication-edit` (the catalog's owning agent), which
+writes them through `wfe catalog publication put | add` and `review put` only; the check runs on
+each written contract and refuses what a rule refuses. The Catalog page's **Public** section
+lists what is public now (the catalog, the projects with their repositories), what waits (the
+list changed, braindumps tagged for the list and not in it, projects to be published), what is
+kept private and by which sentence, and what is not decided.
 
 The owner of this core publishes `iwaag/mycatalog` with `projects.yaml`,
 `mycatalog.yaml` (its `owner` becomes the public account) and a README, and
@@ -422,6 +766,10 @@ Earlier the repository was called the *mind repository*: `mind.yaml`
   `wfe summon style`; its owner migrates and publishes again.
 
 ## Importing a development style
+
+A public catalog, your own included, is a **reference** (principle 1 of docs/external-publication.md
+in the core): importing reads it and proposes; nothing of it is adopted as it stands, and the local
+rules built from it may say the opposite. A rule marked `share: never` is never offered.
 
 A user who publishes `<github user>/mycatalog` on GitHub, public, with a valid
 `projects.yaml` on `main`, has a development style that others can import by
@@ -535,9 +883,31 @@ words, and what of that was already said to be real. `wfe catalog why
 | `wfe catalog braindump edit <path> --file/--text --author [--base <commit>]` | `PUT api/catalog/braindumps/<path> {text, author, base?}` | 409 when changed after `base` |
 | `wfe catalog braindump remove <path> --author [--force]` | `DELETE api/catalog/braindumps/<path> {author, force?}` | refused while a plan's `because` names it, unless forced; removes its review too |
 | `wfe catalog braindump archive (<path> \| --all) --author [--note <text>] [--dry-run]` | `POST api/catalog/braindumps/archive {path?, all?, author, note?, dryRun?}` | one commit: moved to `braindumps/archive/<date>/`, out of every `because`, listed in the folder's README; `--dry-run` prints the moves and each `because` that would change (*Archiving*) |
+| `wfe catalog braindump move <path> <new path> --author [--reuse-archived]` | `POST api/catalog/braindumps/move {from, to, author, reuseArchived?}` | p6 ex2: one commit, `because` rewritten; 409 `taken`, `archived-path` |
+| | `GET api/catalog` `followUp` | p6 ex2: per braindump `{state: waiting \| reading \| not-done, reason?, href?, run?, dueAt?}` and the index's; `openProposals` per braindump |
+| `wfe catalog braindump list --tag <tag>` | (in `GET api/catalog`: `tags`, `metadata`, `proposals`) | braindumps with that tag |
+| `wfe catalog tags show <path>` | (in `GET api/catalog/braindumps/<path>`: `tags`, `metadata`, `proposals`) | |
+| `wfe catalog tags set <path> (--tags \| --add \| --remove) --author [--base <commit>\|none]` | `PUT api/catalog/braindumps/<path>?tags=1 {tags?, add?, remove?, author, base?}` | one commit of `metadata.yaml` |
+| `wfe catalog tags propose <path> --file <json\|-> --author [--run] [--base]` | `POST api/catalog/tag-proposals {braindump, changes, author, run?, note?, base?}` | outside Git |
+| `wfe catalog tags proposals [<path>] [--all]` | `GET api/catalog/tag-proposals[?braindump=&all=1]` | open ones, with `stale` |
+| `wfe catalog tags accept <id> --tags add:a,remove:b --author` / `dismiss <id> --author` | `POST api/catalog/tag-proposals/<id> {accept \| dismiss, author}` | 409 `stale` |
+| `wfe catalog draft list \| where \| use <root>` | `GET api/catalog/drafts` | |
+| `wfe catalog draft new \| show <id> [--revision] \| save <id> --base \| remove <id>` | `POST api/catalog/drafts`, `GET\|PUT\|DELETE api/catalog/drafts/<id>` | 409 `stale` with the present revision |
+| `wfe catalog draft preview <id> [--path]` / `register <id> [--path] --base [--reuse-archived]` | `POST api/catalog/drafts/<id>/preview\|register` | 409 `taken`, `archived-path`, `stale`, `changed` (p6 ex2, a draft `of` a braindump); 502 `unknown` keeps the receipt; no path: the service names it |
+| `wfe catalog draft new --of <path> --of-base <commit>` | `POST api/catalog/drafts {text, of, ofBase, author}` | p6 ex2: a change of a registered braindump |
+| | `POST api/catalog/drafts/<id>/put {text, base, author, path?, ofBase?, reuseArchived?}` | p6 ex2: the page's main button: save, then register |
+| `wfe catalog ask request (<draft> --base \| --file \| --text)` / `list` / `show <draft> <ask>` | `POST api/catalog/ask {draft, base, author}`, `GET api/catalog/ask` | p7: queues `summoner/ask` on the local worker; 409 without a summoner |
+| `wfe catalog ask answer <draft> <ask> --answer --kind [--actions] [--rewrite]` / `fail` | | p7: the run's answer; 400 names each action that cannot be taken |
+| `wfe catalog ask do \| decline <draft> <ask> <n>` / `dismiss <draft> <ask>` | `POST api/catalog/ask/<draft>/<ask>/do\|decline\|dismiss {action, author}` | p7: `ok: false` with the reason when the writer refused |
+| `wfe catalog links show` / `request` | `GET api/catalog/links`, `POST api/catalog/links/request {author}` | p7: the suggestion, the braindumps without one; requests `summoner/ground` (one open request per head) |
+| `wfe catalog links suggest --file --head` | `POST api/catalog/links {suggestion, head, author, run?}` | p7: 400 names each link that cannot be taken |
+| `wfe catalog links agree \| decline (<n>… \| --all)` | `POST api/catalog/links/agree\|decline {numbers \| all, author}` | p7: agree is one commit |
+| `wfe catalog rules list` / `adopt` / `retire <id>` | `GET\|POST api/catalog/rules`, `POST api/catalog/rules/retire {id, author}` | p7 |
+| `wfe catalog publication check [--source <folder>]` / `add <path>` | `GET api/catalog/publication/check`, `POST api/catalog/publication/add {path, author}` | p7: exit 1 on a refusal; 409 `rule` |
 | `wfe catalog review show <path>` | `GET api/catalog/reviews/<path>` | the review, its history, whether the braindump changed after it |
 | `wfe catalog review put <path> --file/--text --author [--base <commit>]` | `PUT api/catalog/reviews/<path> {text, author, base?}` | 404 without the braindump; 409 when changed after `base` |
 | `wfe catalog review request [<path>] --author` | `POST api/catalog/reviews/request {path?, author}` | requests the summoner's `review`; 409 without a summoner |
+| | | p6 ex1: a review, the index or advice asked again while the same one (same target and catalog head; for advice the same revision and question) is still open returns that run (`duplicate: true`) instead of a second one; the page shows "Asked: <run> (open)" in place of the button until the run ends |
 | `wfe catalog preference list` | `GET api/catalog/preferences` | every preference with its text, author and date |
 | `wfe catalog preference show <name>` | `GET api/catalog/preferences/<name>` | the text and its history |
 | `wfe catalog preference put <name> --file/--text --author [--base <commit>]` | `PUT api/catalog/preferences/<name> {text, author, base?}` | creates or replaces; one commit; 409 when changed after `base` |
@@ -571,9 +941,13 @@ same page: Detail adds to what Simple shows.
 
 | Part | Simple | Detail adds |
 | --- | --- | --- |
-| Head | the catalog's title, **New braindump** | the repository and head, the explanation, **Author of changes**, the catalog's problems and issues (Simple says only how many there are) |
+| Drafts (p6 ex1) | **Write a draft**; the drafts with state, tags, revision, who and when; the editor (saved as typed, its status, tags, **Ask for advice**, the advice with its revision, **Register…** with a preview, **Remove the draft**) | the draft folder, the draft's id |
+| Writing (p6 ex2, p7) | the field with **Put it in the catalog** and **Ask**; the summoner's answer with its actions (**Do it** / **No**), **Dismiss**; *Unfinished*; *Asked* | the path, the kind and revision an answer read, its run |
+| Braindumps and projects (p7) | the diagram with suggested links dashed; *N braindumps have no suggested links yet:* **Suggest links**; *Suggested links* with **OK** / **No** / **OK to all** | the suggestion's commit, run and counts, the projects without a ground, **Suggest links again** |
+| Rules (p7) | on a card: *Kept private by your rule*, **Add to the public list**, *No project serves this* | the adopted rules with their sources, *its source changed*, **Retire**, what the check says of the public list |
+| Head | the catalog's title, **Write a draft** | the repository and head, the explanation, **Author of changes**, **Add a braindump directly** (one commit now, not a draft), the catalog's problems and issues (Simple says only how many there are) |
 | Summary | four counts, each a way to its part: braindumps, entries of the index, open challenges, preferences; **Write the index** when there is none | |
-| Braindumps | a grid of cards: title, two lines of excerpt, the grounded projects, one mark (reviewed, not reviewed, changed after its review). Folders are headings, after the braindumps that are in none. An opened card spans the grid: the text, the review, **Talk about this**, **Request work**. With no braindump: one sentence on what a braindump is, and **New braindump** | rows instead of cards; path, author, date, commit, the link to Gitea, published or internal, the cited count; **Edit**, **Archive** (its confirmation names the projects that lose this ground), **Remove**; the archive folders with their counts, linked to Gitea; the review's author and date, **Ask for a review**, **Edit review**; **Cited by** |
+| Braindumps | a grid of cards: title, two lines of excerpt, the grounded projects, one mark (reviewed, not reviewed, changed after its review). Folders are headings, after the braindumps that are in none. Tags as chips, and a row of the tags in use that filters the list. An opened card spans the grid: its tags with **Add tags**/**Edit tags** and the open tag proposals (a box per change, **Accept the ticked**, **Dismiss**), the text, the review, **Talk about this**, **Request work**. With no braindump: one sentence on what a braindump is, and **New braindump** | rows instead of cards; path, author, date, commit, the link to Gitea, published or internal, the cited count; **Edit**, **Archive** (its confirmation names the projects that lose this ground), **Remove**; the archive folders with their counts, linked to Gitea; the review's author and date, **Ask for a review**, **Edit review**; **Cited by** |
 | Not yet real | one line per entry of the index (a list item that links to a braindump or a challenge): its kind as an icon, its title, the rest on one line. An entry opens to its full text with **Talk about this** and **Request work**. One line with **Refresh** when the catalog changed after the index. An index with no such entry is shown whole | the index's whole text as written, its file, author, date and commit; **Refresh the index**, **Ask for the reviews that are due** |
 | Braindumps and projects | the diagram with the braindumps and the projects that have a ground; a project leads to its page. Not shown while there is no braindump | every project, with "no ground" and "not in plan"; a project leads to its row of the table |
 | Challenges | those neither resolved nor withdrawn: title and projects, each linking to its challenge page | the other states, id, trials, who and when, published or internal |

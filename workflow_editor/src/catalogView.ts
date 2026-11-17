@@ -20,13 +20,16 @@
 // (moved to braindumps/archive/<date>/, out of every because); the archive
 // folders are listed at the end of Braindumps; a catalog with no braindump
 // says what one is and leads to writing one. Archiving all is a command.
-import { api, type CatalogBraindump, type CatalogView } from './api.ts'
+import { api, type CatalogBraindump, type CatalogTagProposal, type CatalogView } from './api.ts'
+import { EXAMPLE_TAGS, normalizeTag, RECOMMENDED_TAG, sameTag } from '../shared/catalog.ts'
+import { composePanel } from './catalogCompose.ts'
+import { draftsPanel } from './catalogDrafts.ts'
 import { displayToggle, isSimple, onDisplay, showDetail } from './displayMode.ts'
 import { h, when } from './dom.ts'
 import { icon } from './icons.ts'
 import type { ViewHandle } from './main.ts'
 import { renderMarkdown, type LinkResolver } from './markdown.ts'
-import { conversationHref, hangoutHref, siteLinks } from './site.ts'
+import { conversationHref, forgetWaiting, hangoutHref, siteLinks } from './site.ts'
 
 const SVG = 'http://www.w3.org/2000/svg'
 const AUTHOR_KEY = 'wfe.catalog.author'
@@ -49,7 +52,9 @@ function svg<K extends keyof SVGElementTagNameMap>(tag: K, attrs: Record<string,
 // braindumps.
 export function relationDiagram(v: CatalogView, onPick: (kind: 'braindump' | 'project', id: string) => void, simple = false): SVGSVGElement {
   const bIndex = new Map(v.braindumps.map((b, i) => [b.id, i]))
-  const projects = v.projects.filter(p => !simple || p.braindumps.length).sort((a, b) => {
+  // user_catalog p7: links the summoner suggested and the owner has not answered are drawn dashed.
+  const suggested = (v.links.suggestion?.links ?? []).filter(x => x.state === 'suggested' && x.kind === 'add')
+  const projects = v.projects.filter(p => !simple || p.braindumps.length || suggested.some(x => x.project === p.project)).sort((a, b) => {
     const fa = a.braindumps.length ? Math.min(...a.braindumps.map(x => bIndex.get(x.id) ?? 99)) : 1e3
     const fb = b.braindumps.length ? Math.min(...b.braindumps.map(x => bIndex.get(x.id) ?? 99)) : 1e3
     return fa - fb || a.project.localeCompare(b.project)
@@ -75,6 +80,12 @@ export function relationDiagram(v: CatalogView, onPick: (kind: 'braindump' | 'pr
     const y1 = by(i), y2 = py(pRow.get(p.project)!)
     edges.append(svg('path', { d: `M${bx + bw},${y1} C${bx + bw + 90},${y1} ${px - 90},${y2} ${px},${y2}`, class: 'md-edge', 'data-b': b.id, 'data-p': p.project }))
   }
+  for (const x of suggested) {
+    const i = bIndex.get(x.braindump), j = pRow.get(x.project)
+    if (i === undefined || j === undefined) continue
+    const y1 = by(i), y2 = py(j)
+    edges.append(svg('path', { d: `M${bx + bw},${y1} C${bx + bw + 90},${y1} ${px - 90},${y2} ${px},${y2}`, class: 'md-edge md-suggested', 'data-b': x.braindump, 'data-p': x.project }, svg('title', {}, `Suggested: ${x.braindump} → ${x.project}`)))
+  }
   const highlight = (attr: 'data-b' | 'data-p' | null, id = '') => {
     root.classList.toggle('focus', !!attr)
     for (const e of edges.querySelectorAll('path')) e.classList.toggle('on', !!attr && e.getAttribute(attr) === id)
@@ -95,12 +106,16 @@ export function relationDiagram(v: CatalogView, onPick: (kind: 'braindump' | 'pr
     g.addEventListener('click', () => onPick('braindump', b.id))
     root.append(g)
   })
+  // user_catalog p8: a project's disclosure as a mark on its node.
+  const disc = new Map((v.disclosure?.projects ?? []).map(l => [l.project, l]))
+  const mark = (id: string) => { const l = disc.get(id); return !l ? null : l.state === 'private' ? { c: 'private', t: '🔒', w: `kept private${l.decides?.rule ? ` (rule ${l.decides.rule})` : ' (proposed, not answered)'}: “${l.decides?.sentence ?? ''}”` } : l.state === 'to be published' ? { c: 'topublish', t: '↗', w: `to be published (rule ${l.decides?.rule}): “${l.decides?.sentence ?? ''}”` } : l.state === 'public' || l.state === 'public without a statement' ? { c: 'public', t: '🌐', w: `public: ${l.public.map(x => x.destination).join(', ')}` } : null }
   projects.forEach((p, i) => {
     const none = !p.braindumps.length
+    const m = mark(p.project)
     const g = svg('g', { class: `md-node md-p${none ? ' md-none' : ''}${p.registered ? '' : ' md-unreg'}`, transform: `translate(${px},${py(i) - 11})`, tabindex: 0, 'data-id': p.project, 'data-kind': 'p' },
-      svg('title', {}, `${p.project}${p.registered ? '' : ' (not registered)'}${!p.entry ? ' — not in the plan' : none ? ' — no ground' : ''}${p.entry && Object.keys(p.entry.roles).length ? `\nroles: ${roleText(p.entry.roles)}` : ''}`),
+      svg('title', {}, `${p.project}${p.registered ? '' : ' (not registered)'}${!p.entry ? ' — not in the plan' : none ? ' — no ground' : ''}${p.entry && Object.keys(p.entry.roles).length ? `\nroles: ${roleText(p.entry.roles)}` : ''}${m ? `\n${m.w}` : ''}`),
       svg('rect', { width: pw, height: 22, rx: 6 }),
-      svg('text', { x: 9, y: 15, class: 'md-title' }, p.project),
+      svg('text', { x: 9, y: 15, class: 'md-title' }, m ? `${p.project} ${m.t}` : p.project),
       svg('text', { x: pw - 8, y: 15, class: 'md-sub', 'text-anchor': 'end' }, !p.entry ? 'not in plan' : none ? 'no ground' : p.entry && Object.keys(p.entry.roles).length ? clip(Object.keys(p.entry.roles).join(', '), 30) : ''))
     g.addEventListener('mouseenter', () => highlight('data-p', p.project)); g.addEventListener('mouseleave', () => highlight(null))
     g.addEventListener('focus', () => highlight('data-p', p.project)); g.addEventListener('blur', () => highlight(null))
@@ -122,7 +137,69 @@ const lastSegment = (id: string) => id.split('/').pop()!
 // A challenge that is neither resolved nor withdrawn is shown in Simple.
 const liveState = (kind: string) => kind !== 'resolved' && kind !== 'withdrawn'
 const firstLine = (text: string) => text.split('\n').map(l => l.trim()).find(l => l && !/^#{1,6}\s/.test(l)) ?? ''
-type Editing = { kind: 'new' } | { kind: 'new-preference' } | { kind: 'braindump' | 'review' | 'preference'; id: string } | null
+type Editing = { kind: 'new' } | { kind: 'new-preference' } | { kind: 'braindump' | 'review' | 'preference' | 'tags'; id: string } | null
+
+// user_catalog p6 ex1: optional tags. The input keeps its own DOM (no render
+// while typing); the examples add a tag when clicked and are never preselected.
+const TAG_HINTS: Record<string, string> = {
+  [RECOMMENDED_TAG]: 'Recommended by agdev: a braindump about how you write, tag and handle braindumps. Agents read it as your stated conventions; it changes no setting.',
+  style: 'how you like development to be done', desire: 'a concrete result you want', bounty: 'something you would like someone else to do',
+  public: 'you mean it to be published', private: 'you mean it to stay internal',
+  todo: 'something you mean to do yourself', mystyle: 'how you develop',
+}
+// user_catalog p8 decision 18: the tags offered, each with its meaning in a few words and what a rule makes follow from it.
+export type TagChoice = { tag: string; meaning: string }
+export function tagChoicesOf(v: CatalogView): TagChoice[] {
+  const inUse = new Map<string, { tag: string; n: number }>()
+  for (const b of v.braindumps) for (const t of b.tags) { const k = t.toLowerCase(); inUse.set(k, { tag: inUse.get(k)?.tag ?? t, n: (inUse.get(k)?.n ?? 0) + 1 }) }
+  const order = [...[...inUse.values()].sort((a, b) => b.n - a.n).map(x => x.tag), ...EXAMPLE_TAGS]
+  const seen = new Set<string>(), out: TagChoice[] = []
+  for (const t of order) {
+    const k = t.toLowerCase()
+    if (seen.has(k)) continue
+    seen.add(k)
+    const r = v.rules.find(x => x.kind === 'tag' && x.tag && sameTag(x.tag, t))
+    const follows = r ? (r.follows === 'never-publish' ? 'your rule: never published' : 'your rule: suggested for the public list (nothing is published by it)') : ''
+    const meaning = TAG_HINTS[k] ?? (inUse.has(k) ? `in use on ${inUse.get(k)!.n} braindump${inUse.get(k)!.n === 1 ? '' : 's'}` : 'a tag')
+    out.push({ tag: inUse.get(k)?.tag ?? t, meaning: follows ? `${meaning} — ${follows}` : meaning })
+  }
+  return out
+}
+export const tagChips = (tags: readonly string[]) => tags.length ? h('span.catalog-tags', tags.map(t => h('span.chip.tag', { title: TAG_HINTS[t.toLowerCase()] ?? 'a tag' }, `#${t}`))) : null
+export function tagInput(initial: readonly string[], onChange?: (tags: string[]) => void, choices?: TagChoice[]): { el: HTMLElement; value: () => string[] } {
+  let tags = [...initial]
+  const list = h('span.catalog-tags')
+  const note = h('span.small.muted')
+  const input = h('input', { placeholder: 'add a tag', 'aria-label': 'Add a tag', size: 14 })
+  const examples = h('span.catalog-tag-examples.small')
+  const draw = () => {
+    list.replaceChildren(...tags.map(t => h('span.chip.tag.removable', { title: TAG_HINTS[t.toLowerCase()] ?? '' }, `#${t}`,
+      h('button.icon-btn', { type: 'button', title: `Remove ${t}`, 'aria-label': `Remove ${t}`, onclick: () => { tags = tags.filter(x => x !== t); draw(); onChange?.(tags) } }, '×'))))
+    if (choices) {
+      const left = choices.filter(c => !tags.some(t => sameTag(t, c.tag)))
+      examples.replaceChildren(h('span.muted', 'Choose: '), ...left.map(c => h('button.chip.tag.example', { type: 'button', title: c.meaning, onclick: () => add(c.tag) }, `+${c.tag}`)),
+        h('ul.catalog-tag-meanings', left.map(c => h('li', h('strong', `#${c.tag}`), ` ${c.meaning}`))))
+      return
+    }
+    examples.replaceChildren(h('span.muted', 'Examples: '), ...EXAMPLE_TAGS.filter(e => !tags.some(t => sameTag(t, e))).map(e =>
+      h('button.chip.tag.example', { type: 'button', title: TAG_HINTS[e], onclick: () => add(e) }, `+${e}`, e === RECOMMENDED_TAG ? h('span.muted', ' (recommended)') : null)))
+  }
+  const add = (raw: string) => {
+    for (const part of raw.split(',')) {
+      if (!part.trim()) continue
+      const n = normalizeTag(part)
+      if ('problem' in n) { note.textContent = `Not added: ${n.problem}`; continue }
+      note.textContent = ''
+      if (!tags.some(t => sameTag(t, n.tag))) tags.push(n.tag)
+    }
+    input.value = ''; draw(); onChange?.(tags)
+  }
+  input.addEventListener('keydown', e => { if (e.key === 'Enter' || e.key === ',') { e.preventDefault(); add(input.value) } })
+  input.addEventListener('blur', () => { if (input.value.trim()) add(input.value) })
+  draw()
+  return { el: h('div.catalog-tag-input', h('div.row', h('strong.small', 'Tags'), list, input), examples, note,
+    h('p.small.muted', 'Optional and free: use any words, as many as you like, or none. A tag asks for nothing by itself (public does not publish).')), value: () => { if (input.value.trim()) add(input.value); return [...tags] } }
+}
 
 export function renderCatalogView(root: HTMLElement): ViewHandle {
   let data: Awaited<ReturnType<typeof api.catalog>> | null = null
@@ -134,9 +211,36 @@ export function renderCatalogView(root: HTMLElement): ViewHandle {
   const open = new Set<string>() // braindumps shown in full
   const openEntries = new Set<string>() // entries of the index opened in Simple
   const openPrefs = new Set<string>() // preferences opened in Simple
+  const tagFilter = new Set<string>() // tags (lower case) a braindump must have to be listed
+  const proposalPicks = new Map<string, Set<string>>() // per proposal, the changes ticked (none is ticked first)
   let redrawDiagram: (() => void) | null = null
   const full = new Map<string, CatalogBraindump>() // texts and reviews, read when a braindump is opened
-  let asked: HTMLElement | null = null // the answer to the last request to the summoner
+  // The answer to the last request to the summoner, shown where it was asked: 'index' or 'bd:<path>'.
+  let asked: { place: string; el: HTMLElement } | null = null
+  const askedAt = (place: string) => asked?.place === place ? asked.el : null
+  // user_catalog p6 ex1: a request still open is shown in place of its button
+  // (key: what was asked), checked every 10 s; when its run ends the button is back
+  // and the catalog is read again. The service also returns an open one instead of a second run.
+  const pending = new Map<string, { workspace: string; workflow: string; run: string; href: string } | null>()
+  let pendingPoll: ReturnType<typeof setInterval> | null = null
+  const watchPending = () => {
+    if (pendingPoll) return
+    pendingPoll = setInterval(async () => {
+      let ended = false
+      for (const [key, p] of pending) {
+        if (!p) continue
+        const st = await api.run(p.workspace, p.workflow, p.run).then(r => r.record?.cancelled ? 'cancelled' : r.record?.execution?.state, () => undefined)
+        if (st === 'completed' || st === 'cancelled' || st === 'stopped') { pending.delete(key); ended = true }
+      }
+      if (![...pending.values()].some(Boolean)) { clearInterval(pendingPoll!); pendingPoll = null }
+      if (ended && !disposed) await load(true)
+    }, 10_000)
+  }
+  const askControl = (key: string, button: HTMLElement): HTMLElement => {
+    if (!pending.has(key)) return button
+    const p = pending.get(key)
+    return p ? h('a.chip.warn', { href: p.href, title: 'Asked; this request is still open. Its button comes back when the run has ended.' }, `Asked: ${p.workflow}/${p.run} (open)`) : h('span.chip.muted', 'Asking…')
+  }
   // Request work (user_catalog p4): one form, shown where it was asked for.
   let requesting: (Subject & { at: 'card' | 'index' }) | null = null
   let reqOut: HTMLElement | null = null
@@ -223,20 +327,44 @@ export function renderCatalogView(root: HTMLElement): ViewHandle {
     return false
   }
 
+  // user_catalog p6 ex1: drafts, written without a path and saved outside Git; the card keeps its own DOM.
+  const drafts = draftsPanel({ author: () => author.value.trim(), haveAuthor, authorSlot, registered: () => load(true) })
+  // user_catalog p6 ex2: the writing field, always there; the card keeps its own DOM.
+  const compose = composePanel({ author: () => author.value.trim(), haveAuthor, authorSlot, changed: () => load(true), tagChoices: () => data?.configured ? tagChoicesOf(data) : [] })
+  const editInField = async (b: Bd) => { const fb = await need(b.id); if (!fb) { render(); return } await compose.edit({ id: b.id, title: b.title === b.id ? lastSegment(b.id) : b.title, text: fb.text ?? '', base: b.updated?.commit }) }
+  // user_catalog p6 ex2: while the follow-up is waiting or the summoner is reading, the catalog is read every 15 s.
+  let fuPoll: ReturnType<typeof setInterval> | null = null
+  const followActive = (v: CatalogView) => Object.values(v.followUp.braindumps).some(x => x.state !== 'not-done') || (!!v.followUp.index && v.followUp.index.state !== 'not-done')
+  const quiet = () => editing === null && !(requesting !== null && !!reqText.value.trim())
+  function watchFollowUp() {
+    if (fuPoll || !data?.configured || !followActive(data)) return
+    fuPoll = setInterval(async () => {
+      if (disposed || !data?.configured) return
+      const before = JSON.stringify(data.followUp)
+      const next = await api.catalog().catch(() => null)
+      if (!next?.configured) return
+      const active = followActive(next)
+      if (!active) { clearInterval(fuPoll!); fuPoll = null }
+      if ((JSON.stringify(next.followUp) !== before || !active) && quiet()) await load(true)
+    }, 15_000)
+  }
+
   const header = h('header.topbar', h('div.crumbs', h('a', { href: '#/' }, 'agdev'), h('span.sep', '/'), h('span.muted', 'Catalog')),
-    h('div.top-actions', h('a.button', { href: '#/' }, '← Dashboard'), ...siteLinks(),
+    h('div.top-actions', h('a.button', { href: '#/' }, '← Dashboard'), ...siteLinks('catalog'),
       h('button', { onclick: () => void load(true), title: 'Read the catalog from Gitea now' }, 'Refresh'), displayToggle()))
   const main = h('main.dashboard.catalog-view')
   root.append(header, main)
   const offDisplay = onDisplay(() => redrawDiagram?.())
 
   async function load(refresh = false) {
+    forgetWaiting()
     try { data = await api.catalog(refresh); loadError = '' } catch (e) { loadError = (e as Error).message }
     // summoner p2: whether each plan entry is applied here (docs/summon.md); its absence only hides the indicator.
     applied = data?.configured && data.plan ? await api.summon().catch(() => null) : null
     if (data && data.configured && !author.value && data.person) author.value = data.person
     // What is open is read again; the rest is read when opened.
     if (refresh) { const ids = [...full.keys()]; full.clear(); await Promise.all(ids.map(id => api.catalogBraindump(id).then(b => { full.set(id, b) }, () => { open.delete(id) }))) }
+    if (data?.configured) await Promise.all([drafts.load(), compose.load()])
     if (!disposed) render()
   }
   async function need(id: string): Promise<CatalogBraindump | null> {
@@ -259,10 +387,16 @@ export function renderCatalogView(root: HTMLElement): ViewHandle {
     if (ch) return { href: challengeHref(ch[1]), external: true, data: { challenge: ch[1] } as Record<string, string> }
     return { href: `${v.web}/src/branch/${v.branch}/${path}`, external: true }
   }
-  const ask = async (what: string, f: () => Promise<{ href: string; workspace: string; workflow: string }>) => {
-    if (!haveAuthor('index', () => void ask(what, f))) return
-    asked = h('p.muted.small', 'Requesting…'); render()
-    try { const r = await f(); asked = h('div.banner.ok', `Asked the summoner for ${what} (${r.workspace}/${r.workflow}). `, h('a', { href: r.href }, 'Open the run'), ' It writes to the catalog when it is done; refresh then.') } catch (e) { asked = h('div.banner.error', (e as Error).message) }
+  const ask = async (what: string, f: () => Promise<{ href: string; workspace: string; workflow: string; run: string; duplicate: boolean }>, place = 'index', key = place) => {
+    if (pending.has(key)) return
+    if (!haveAuthor(place, () => void ask(what, f, place, key))) return
+    pending.set(key, null)
+    asked = { place, el: h('p.muted.small', 'Requesting…') }; render()
+    try {
+      const r = await f()
+      pending.set(key, { workspace: r.workspace, workflow: r.workflow, run: r.run, href: r.href }); watchPending()
+      asked = { place, el: h('div.banner.ok', { role: 'status' }, r.duplicate ? `Already asked: ${what} is still open (${r.workspace}/${r.workflow}/${r.run}); no second run was made. ` : `Asked ${r.workspace === 'publisher' ? 'the publisher' : 'the summoner'} for ${what} (${r.workspace}/${r.workflow}/${r.run}). `, h('a', { href: r.href }, 'Open the run'), ' The page reads the catalog again when it has ended.') }
+    } catch (e) { pending.delete(key); asked = { place, el: h('div.banner.error', { role: 'alert' }, (e as Error).message) } }
     render()
   }
 
@@ -278,11 +412,152 @@ export function renderCatalogView(root: HTMLElement): ViewHandle {
   // `place` names the slot where the name is asked when it is not known yet.
   async function change(place: string, f: () => Promise<{ message: string }>) {
     if (!haveAuthor(place, () => void change(place, f))) return
-    try { const r = await f(); message = h('div.banner.ok', r.message); editing = null } catch (e) { message = h('div.banner.error', (e as Error).message) }
+    try { const r = await f(); message = h('div.banner.ok', r.message); editing = null } catch (e) {
+      // A refused change keeps what was typed: the reason is shown where the
+      // change was made, and the page is not drawn again (user_catalog p6).
+      const slot = [...main.querySelectorAll<HTMLElement>('[data-author-slot]')].find(el => el.dataset.authorSlot === place && !!el.parentElement?.checkVisibility())
+      if (slot) { slot.replaceChildren(h('div.banner.error', { role: 'alert' }, (e as Error).message)); slot.scrollIntoView({ block: 'nearest' }); return }
+      message = h('div.banner.error', (e as Error).message)
+    }
     await load(true)
   }
   const cancel = () => h('button', { onclick: () => { editing = null; render() } }, 'Cancel')
-  const newBraindump = () => h('button', { title: 'Write what you want and why, as a new braindump of the catalog', onclick: () => { editing = { kind: 'new' }; render(); go('new') } }, icon('plus', 'icon small'), 'New braindump')
+  // A braindump added directly (one commit now), beside writing a draft (saved outside Git until registered).
+  const newBraindump = () => h('button.d-only', { title: 'Add a braindump to the catalog directly, in one commit now (a draft is saved outside Git until you register it)', onclick: () => { editing = { kind: 'new' }; render(); go('new') } }, icon('plus', 'icon small'), 'Add a braindump directly')
+  const writeDraft = () => h('button.primary.d-only', { title: 'Write freely, saved as you type outside Git; ask for advice; register it when you choose', onclick: () => { drafts.start(); go('drafts') } }, icon('plus', 'icon small'), 'Write a draft')
+
+  // user_catalog p6 ex2: what the follow-up is doing for a braindump, in Simple's words.
+  function followUpWords(v: CatalogView, b: Bd): string | null {
+    const fu = v.followUp.braindumps[b.id]
+    if (!fu) return null
+    if (fu.state === 'reading') return 'The summoner is reading it.'
+    if (fu.state === 'waiting') return `The summoner reads it${fu.dueAt ? ` from ${new Date(fu.dueAt).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}` : ' shortly'}.`
+    return `Not reviewed by itself: ${fu.reason ?? 'no reason given'}. Detail has Ask for a review.`
+  }
+  // user_catalog p6 ex2: a proposal of tags is one line with OK (all of it) and No.
+  function tagLines(b: Bd): HTMLElement | null {
+    if (!b.openProposals.length) return null
+    const place = `bd:${b.id}`
+    return h('div.s-only', b.openProposals.map(p => h('div.catalog-tag-line', { title: `Suggested by ${p.by}` }, h('span.small', 'Suggested tags: '),
+      h('span.catalog-tags', p.changes.map(c => h(`span.chip.tag${c.op === 'remove' ? '.warn' : ''}`, `${c.op === 'add' ? '+' : '−'}${c.tag}`))),
+      h('button.small.primary', { onclick: () => void change(place, () => api.catalogTagDecide(p.id, author.value.trim(), p.changes.map(c => `${c.op}:${c.tag}`))) }, 'OK'),
+      h('button.small', { onclick: () => void change(place, () => api.catalogTagDecide(p.id, author.value.trim(), null)) }, 'No'))))
+  }
+  // user_catalog p7: what an adopted rule says about a braindump, where it acts.
+  function ruleLine(b: Bd, v: CatalogView): HTMLElement | null {
+    if (!b.rule) return null
+    const rule = (id?: string) => v.rules.find(r => r.id === id)
+    const never = rule(b.rule.never), suggest = rule(b.rule.suggest)
+    if (never) return h('p.small.catalog-rule-line', { title: `Rule ${never.id}, adopted from “${never.source.braindump}”: “${never.source.sentence}”` }, icon('lock', 'icon small'),
+      `Kept private by your rule: #${never.tag} is never published.`, suggest ? ` It is also tagged #${suggest.tag}, which you suggest for the public list: private wins.` : '',
+      b.published ? h('span.chip.warn', { title: 'publication/github.toml selects it: the check before a publication refuses this' }, 'in the public list: refused') : null)
+    if (suggest && !b.rule.selected) return h('div.catalog-tag-line.catalog-rule-line', { title: `Rule ${suggest.id}, adopted from “${suggest.source.braindump}”: “${suggest.source.sentence}”` },
+      h('span.small', `Your rule suggests this for the public list (#${suggest.tag}).`),
+      h('button.small.primary', { title: 'Writes it into the public file list in one commit. Nothing is published by it: publishing stays your act.', onclick: () => void change(`bd:${b.id}`, () => api.catalogPublicationAdd(b.id, author.value.trim())) }, 'Add to the public list'))
+    return null
+  }
+  // user_catalog p7: links suggested by the summoner, one line each with OK and No; one click is one commit.
+  const suggestLinks = () => void ask('suggested links', () => api.catalogLinksRequest(author.value.trim()), 'links', 'ground')
+  function linksBlock(v: CatalogView): HTMLElement[] {
+    const s = v.links.suggestion
+    const title = (id: string) => { const b = v.braindumps.find(x => x.id === id); return b && b.title !== b.id ? b.title : id }
+    const open = (s?.links ?? []).filter(x => x.state === 'suggested')
+    const adds = open.filter(x => x.kind === 'add')
+    const n = v.links.pending.length
+    return [
+      n ? h('div.catalog-tag-line.catalog-links-pending', h('span.small', `${n} braindump${n === 1 ? ' has' : 's have'} no suggested links yet: `),
+        askControl('ground', h('button.small.primary', { title: 'The summoner reads every braindump and every project and suggests which braindump grounds which project. Nothing is written until you answer each link.', onclick: suggestLinks }, 'Suggest links')),
+        h('span.small.muted.d-only', v.links.pending.join(', '))) : null,
+      authorSlot('links'), askedAt('links'),
+      open.length ? h('div.catalog-suggested', h('div.row', h('strong.small', 'Suggested links'),
+        adds.length > 1 ? h('button.small.primary', { title: 'Every suggested link, in one commit in your name', onclick: () => void change('links', () => api.catalogLinksAgree(author.value.trim(), 'all')) }, 'OK to all') : null),
+        open.map(x => h('div.catalog-tag-line.catalog-link-line',
+          h('span.small.catalog-link-words', h('strong', title(x.braindump)), x.kind === 'add' ? ' → ' : ' no longer grounds ', h('strong', x.project),
+            x.quote ? h('span.catalog-link-quote', ` “${x.quote}”`) : null, x.why ? h('span.muted', ` ${x.why}`) : null),
+          h('button.small.primary', { onclick: () => void change('links', () => api.catalogLinksAgree(author.value.trim(), [x.n])) }, 'OK'),
+          h('button.small', { onclick: () => void change('links', () => api.catalogLinksDecline(author.value.trim(), [x.n])) }, 'No')))) : null,
+      s ? h('p.small.muted.d-only', `Suggestion ${s.id} by ${s.by}${s.run ? ` (${s.run})` : ''}, ${when(s.at)}, on catalog ${s.head.slice(0, 7)}${s.behind ? ' (the catalog moved on since)' : ''}: ${s.links.filter(x => x.state === 'agreed').length} agreed, ${s.links.filter(x => x.state === 'declined').length} declined, ${s.links.filter(x => x.state === 'gone').length} gone, ${open.length} open${s.existing ? `; ${s.existing} existed already` : ''}.${s.ungrounded.length ? ` Without a ground: ${s.ungrounded.join(', ')}.` : ''}${s.note ? ` ${s.note}` : ''}`) : null,
+      h('div.row.d-only', askControl('ground', h('button.small', { onclick: suggestLinks }, s ? 'Suggest links again' : 'Suggest links'))),
+    ].filter((x): x is HTMLElement => !!x)
+  }
+  // user_catalog p8 decision 17: what waits for you, at the top of the page; its count is on the navigation.
+  const askPublisher = (target: string | undefined, place: string) => void ask(target ? `a publication of ${target}` : 'a publication of the catalog', () => api.catalogPublicationRequest(target, author.value.trim()), place, `publish:${target ?? 'mycatalog'}`)
+  const publisherButton = (target: string | undefined, place: string, label = 'Ask the publisher') => askControl(`publish:${target ?? 'mycatalog'}`, h('button.small.primary', { title: target ? `The publisher reads ${target}, edits and assesses what is worth publishing, and publishes it; "nothing worth publishing now" is a valid answer. Its questions come back on its run.` : 'The publisher reads what the public list selects, has the summoner change the catalog where needed, and publishes it. Its questions come back on its run.', onclick: () => askPublisher(target, place) }, label))
+  function waitingCard(v: CatalogView): HTMLElement | null {
+    const w = v.waiting
+    if (!w?.items.length) return null
+    const line = (i: CatalogView['waiting']['items'][number]) => {
+      const words = h('span.small.catalog-link-words', h('strong', i.title), i.detail ? h('span.muted', ` ${i.detail}`) : null)
+      const buttons = i.kind === 'answer' && i.ask ? [h('button.small.primary', { onclick: () => void compose.openAsked(i.ask!.draft) }, 'Open the answer')]
+        : i.kind === 'links' ? [h('button.small', { onclick: () => go('relations') }, 'Answer them')]
+        : (i.kind === 'disclosure' || i.kind === 'licence') && i.n !== undefined ? [
+          h('button.small.primary', { title: 'Adopt it as your rule: one commit of rules.yaml in your name', onclick: () => void change('waiting', () => api.catalogDisclosureAnswer(i.n!, true, author.value.trim())) }, 'OK'),
+          h('button.small', { title: 'Nothing follows from this sentence', onclick: () => void change('waiting', () => api.catalogDisclosureAnswer(i.n!, false, author.value.trim())) }, 'No')]
+        : i.kind === 'publication' ? [publisherButton(undefined, 'waiting')]
+        : i.href ? [h('a.button.small', { href: i.href }, 'Open the run')] : []
+      return h(`div.catalog-tag-line.catalog-waiting-line.${i.kind}`, words, ...buttons)
+    }
+    return h('section.card.catalog-waiting', { dataset: { section: 'waiting' } },
+      h('div.card-head', h('h2', 'Waiting for you'), h('span.chip.warn', String(w.count))),
+      w.items.map(line), authorSlot('waiting'), askedAt('waiting'))
+  }
+  // user_catalog p8: what is public, what waits for a publication, what is kept private and by which sentence, what is not decided.
+  function publicCard(v: CatalogView): HTMLElement | null {
+    const d = v.disclosure, c = v.publicationCheck
+    if (!d && !v.publication) return null
+    const repo = (url: string) => { const u = url.replace(/\.git$/, ''); return h('a', { href: u, target: '_blank', rel: 'noopener' }, u.replace(/^https:\/\//, '')) }
+    const pubB = v.braindumps.filter(b => b.published)
+    const pubP = (d?.projects ?? []).filter(l => l.public.length)
+    const toPublish = (d?.projects ?? []).filter(l => l.state === 'to be published')
+    const privP = (d?.projects ?? []).filter(l => l.state === 'private')
+    const privB = v.braindumps.filter(b => b.rule?.never)
+    const add = (c?.suggestions ?? []).map(x => x.braindump)
+    const sentence = (l: { decides?: { rule?: string; braindump: string; sentence: string } }) => l.decides ? h('span.muted', ` ${l.decides.rule ? '' : '(proposed, not answered) '}from ${l.decides.braindump}: “${l.decides.sentence}”`) : null
+    const title = (id: string) => v.braindumps.find(b => b.id === id)?.title ?? id
+    return h('section.card.catalog-public', { dataset: { section: 'public' } },
+      h('div.card-head', h('h2', 'Public'), v.publication ? h('span.muted.small', v.publication.last ? `last published ${v.publication.last.at.slice(0, 10)} from ${v.publication.last.sourceRev.slice(0, 7)}` : 'not published yet') : null),
+      h('h3.small', 'Public now'),
+      h('ul.small', v.publication?.destination ? h('li', 'The catalog: ', repo(v.publication.destination), pubB.length ? ` — ${pubB.length} braindump${pubB.length === 1 ? '' : 's'} in its public list: ${pubB.map(b => b.title).join(', ')}` : ' — no braindump in its public list') : null,
+        pubP.map(l => h('li', h('strong', l.project), ' ', ...l.public.flatMap((p, i) => [i ? ', ' : '', repo(p.destination)]), l.state === 'public without a statement' ? h('span.muted', ' (no braindump states it)') : sentence(l)))),
+      v.publication?.changedSince || add.length || toPublish.length || c?.rulesFile === 'suggested' ? [h('h3.small', 'Waiting for a publication'),
+        v.publication?.changedSince ? h('div.catalog-tag-line', h('span.small', v.publication.last ? 'The public list changed since the last publication.' : 'The catalog\'s public list is not published yet.'), publisherButton(undefined, 'public')) : null,
+        add.map(id => h('div.catalog-tag-line', h('span.small', `“${title(id)}” is tagged for the public list and is not in it.`), h('button.small', { onclick: () => void change('public', () => api.catalogPublicationAdd(id, author.value.trim())) }, 'Add to the public list'))),
+        c?.rulesFile === 'suggested' ? h('div.catalog-tag-line', h('span.small', 'Your conventions are in the public list; the rules adopted from them (rules.yaml) are not.'), h('button.small', { onclick: () => void change('public', () => api.catalogPublicationAdd('rules.yaml', author.value.trim())) }, 'Add rules.yaml')) : null,
+        toPublish.map(l => h('div.catalog-tag-line', h('span.small', h('strong', l.project), ' is to be published', sentence(l)), publisherButton(l.project, 'public')))] : null,
+      privP.length || privB.length ? [h('h3.small', 'Kept private'), h('ul.small',
+        privP.map(l => h('li', h('strong', l.project), sentence(l), l.note ? h('span.muted', ` — ${l.note}`) : null)),
+        privB.map(b => h('li', `“${b.title}”`, h('span.muted', ` tagged #${v.rules.find(r => r.id === b.rule!.never)?.tag ?? 'private'}`))))] : null,
+      c?.undecided.length ? [h('h3.small', 'Not decided'), h('p.small', 'No rule covers these braindumps: they stay internal until you tag them. ', c.undecided.map(title).join(', '))] : null,
+      c?.projectMentions.some(m => m.allowed === undefined) ? h('p.small', `Files of the public list that name a private project; the publication tool refuses them until the text is generalized or the contract records why the name is needed: ${[...new Set(c.projectMentions.filter(m => m.allowed === undefined).map(m => `${m.path} (${m.project})`))].join(', ')}.`) : null,
+      c?.projectMentions.some(m => m.allowed !== undefined) ? h('p.small.muted.d-only', `A private project's name kept where the public text needs it: ${[...new Set(c.projectMentions.filter(m => m.allowed !== undefined).map(m => `${m.path} (${m.project}: ${m.allowed})`))].join(', ')}.`) : null,
+      d?.licence?.rule ? h('p.small.muted', `Default licence of a first publication: ${d.licence.rule.licence}, from “${d.licence.rule.source.braindump}”: “${d.licence.rule.source.sentence}”. Your own preference: never shared as style.`) : null,
+      authorSlot('public'), askedAt('public'))
+  }
+  // Detail: the adopted rules with their sources.
+  function rulesCard(v: CatalogView): HTMLElement | null {
+    if (!v.rules.length) return null
+    return h('section.card.catalog-rules.d-only', { dataset: { section: 'rules' } }, h('div.card-head', h('h2', 'Rules'), h('span.muted.small', `${v.rules.length} · rules.yaml`)),
+      h('p.muted.small', 'What you adopted from your own words: tag rules from your conventions (the braindumps tagged mybraindump), rules on projects and the default licence from any braindump\'s sentence. A rule is adopted from an answer of the summoner (Ask), from OK on a statement under Waiting for you, or with wfe catalog rules adopt; reading a sentence never activates one.'),
+      v.rules.map(r => h('div.catalog-rule', h('div.entry-head', h('strong', r.kind === 'tag' ? `#${r.tag}` : r.kind === 'project' ? `project ${r.project}` : `licence ${r.licence}`),
+        h('span', r.kind === 'licence' ? 'is the default licence of a first publication (never shared as style)' : r.follows === 'never-publish' ? 'is never published' : r.follows === 'publish' ? 'is to be published' : 'is suggested for the public list'), h('code', r.id),
+        r.sourceChanged ? h('span.chip.warn', { title: r.sourceNote ?? '' }, 'its source changed') : null,
+        h('button.small', { title: 'Nothing follows from it any more. Nothing becomes public by it, and nothing public is withdrawn.', onclick: () => { if (confirm(`Retire the rule ${r.id}? Nothing follows from it afterwards.`)) void change('rules', () => api.catalogRuleRetire(r.id, author.value.trim())) } }, 'Retire')),
+        h('p.small', `From “${r.source.braindump}” at ${r.source.commit.slice(0, 7)}: “${r.source.sentence}”`),
+        h('p.small.muted', `Adopted by ${r.adopted.by}, ${when(r.adopted.at)}.${r.sourceChanged ? ` ${r.sourceNote}. The rule stays in force; ask the summoner what to adopt, change or retire.` : ''}`))),
+      authorSlot('rules'),
+      v.publicationCheck && (v.publicationCheck.refusals.length || v.publicationCheck.mentions.length) ? h('div.banner.warn', h('strong', 'The public list: '),
+        h('ul', v.publicationCheck.refusals.map(x => h('li.small', `${x.path} is selected, and #${x.tag} is never published (rule ${x.rule}): a publication is refused.`)),
+          v.publicationCheck.mentions.map(x => h('li.small', `${x.path} is selected and names “${x.braindump}” (kept private by rule ${x.rule}) by its ${x.by}.`)))) : null)
+  }
+  // user_catalog p6 ex2: renaming (Detail): the files move and every because is rewritten, in one commit.
+  async function rename(b: Bd) {
+    const place = `bd:${b.id}`
+    if (!haveAuthor(place, () => void rename(b))) return
+    const to = prompt(`New path for ${b.id} (below braindumps/episodes/). Its review and tags move with it; plans that name it are rewritten; what cited the old path shows it removed.`, b.id)?.trim().replace(/^\/+|\/+$/g, '')
+    if (!to || to === b.id) return
+    open.delete(b.id); full.delete(b.id)
+    await change(place, () => api.catalogMove(b.id, to, author.value.trim()))
+  }
 
   // Archive (user_catalog p6): asked first without changing anything, so that
   // the confirmation names the projects that lose this ground.
@@ -301,13 +576,17 @@ export function renderCatalogView(root: HTMLElement): ViewHandle {
   }
 
   function editor(b?: Bd): HTMLElement {
-    const id = h('input', { value: '', placeholder: 'folder path: a-thought, or group/phase', 'aria-label': 'Braindump path', size: 40 })
+    const id = h('input', { value: '', placeholder: 'folder path: a-thought, or group/phase', 'aria-label': 'Braindump path', size: 40, oninput: () => id.setCustomValidity('') })
     const text = h('textarea', { rows: 16, value: b ? full.get(b.id)?.text ?? '' : '# Title\n\nWhat I want, and why.\n', 'aria-label': 'Braindump text' })
     return h('div.catalog-editor',
       b ? null : h('label.small', 'Path below braindumps/episodes/ (it is the identity) ', id),
       text,
       authorSlot(b ? `bd:${b.id}` : 'new'),
-      h('div.row', h('button.primary', { onclick: () => void change(b ? `bd:${b.id}` : 'new', () => b ? api.catalogEdit(b.id, text.value, author.value.trim(), b.updated?.commit) : api.catalogAdd(id.value.trim().replace(/^\/+|\/+$/g, ''), text.value, author.value.trim())) }, b ? 'Commit the change' : 'Add the braindump'),
+      h('div.row', h('button.primary', { onclick: () => {
+        // The path is asked for before anything is sent; the text stays as typed.
+        if (!b && !id.value.trim()) { id.setCustomValidity('Give the braindump a path: a folder name such as a-thought, or group/phase.'); id.reportValidity(); id.focus(); return }
+        void change(b ? `bd:${b.id}` : 'new', () => b ? api.catalogEdit(b.id, text.value, author.value.trim(), b.updated?.commit) : api.catalogAdd(id.value.trim().replace(/^\/+|\/+$/g, ''), text.value, author.value.trim()))
+      } }, b ? 'Commit the change' : 'Add the braindump'),
         cancel(),
         h('span.small.muted', b ? `Refused if someone changed it after ${b.updated?.commit.slice(0, 7) ?? 'its last commit'}.` : 'One commit in the catalog. Group braindumps in folders as you like.')))
   }
@@ -316,19 +595,21 @@ export function renderCatalogView(root: HTMLElement): ViewHandle {
   function reviewBlock(b: Bd, v: CatalogView): HTMLElement {
     const r = b.review
     const text = full.get(b.id)?.review?.text ?? ''
-    const askButton = h('button.small.d-only', { title: 'The summoner reads the braindump, the projects that name it and their records, and writes review.md as its own author', onclick: () => void ask(`a review of ${b.id}`, () => api.catalogReviewRequest(author.value.trim(), b.id)) }, 'Ask for a review')
+    const askButton = askControl(`review:${b.id}`, h('button.small.d-only', { title: 'The summoner reads the braindump, the projects that name it and their records, and writes review.md as its own author', onclick: () => void ask(`a review of ${b.id}`, () => api.catalogReviewRequest(author.value.trim(), b.id), `bd:${b.id}`, `review:${b.id}`) }, 'Ask for a review'))
     if (editing?.kind === 'review' && editing.id === b.id) {
       const area = h('textarea', { rows: 10, value: text, placeholder: 'Free text: what of this became real, where, and what did not.', 'aria-label': 'Review text' })
       return h('div.catalog-review.catalog-editor', h('strong.small', 'Review'), area,
         h('div.row', h('button.primary', { onclick: () => void change(`bd:${b.id}`, () => api.catalogReviewPut(b.id, area.value, author.value.trim(), r?.updated?.commit)) }, 'Commit the review'), cancel(),
           h('span.small.muted', 'Free text about the braindump; no form is required. You sign it as the author.')))
     }
-    if (!r) return h('div.catalog-review.none', h('span.small.muted', 'No review yet. '), askButton, h('button.small.d-only', { onclick: () => { editing = { kind: 'review', id: b.id }; render() } }, 'Write a review'))
+    if (!r) return h('div.catalog-review.none', h('span.small.muted', followUpWords(v, b) ?? 'No review yet. '), askButton, h('button.small.d-only', { onclick: () => { editing = { kind: 'review', id: b.id }; render() } }, 'Write a review'), askedAt(`bd:${b.id}`))
     return h('div.catalog-review',
       h('div.entry-head', h('strong.small', 'Review'), r.updated ? h('span.muted.small.d-only', `${r.updated.author} · ${when(r.updated.at)} · ${r.updated.commit.slice(0, 7)}`) : null, publishedChip(r.published),
-        b.changedAfterReview ? h('span.small.stale.d-only', { title: `The braindump's last change (${b.updated?.commit.slice(0, 7)}) is newer than this review.` }, 'The braindump changed after this review') : null),
+        b.changedAfterReview ? h('span.small.stale.d-only', { title: `The braindump's last change (${b.updated?.commit.slice(0, 7)}) is newer than this review.` }, 'The braindump changed after this review') : null,
+        b.changedAfterReview && followUpWords(v, b) ? h('span.small.muted.s-only', followUpWords(v, b)!) : null),
       renderMarkdown(text, linker(v, `braindumps/episodes/${b.id}`)),
-      h('div.row.d-only', askButton, h('button.small', { onclick: () => { editing = { kind: 'review', id: b.id }; render() } }, 'Edit review')))
+      h('div.row.d-only', askButton, h('button.small', { onclick: () => { editing = { kind: 'review', id: b.id }; render() } }, 'Edit review')),
+      askedAt(`bd:${b.id}`))
   }
 
   // Closed: the title, an excerpt and whether it is reviewed. Opened: the
@@ -347,6 +628,42 @@ export function renderCatalogView(root: HTMLElement): ViewHandle {
         c.changed ? h('span.chip.warn', { title: 'The braindump\'s text is not what it was at the cited commit. What was cited stays as it was.' }, 'changed since') : null)))
         : h('span.small.muted', ' Nothing yet. A message or a request that cites this braindump is listed here.'))
   }
+  // Tags of an opened braindump: shown, edited in place, and the open proposals
+  // of agents with a box per change (none ticked first); accepting the ticked
+  // ones is one commit in your name. A stale proposal is shown, not applied.
+  function tagsBlock(b: Bd): HTMLElement {
+    const fb = full.get(b.id)
+    const proposals: CatalogTagProposal[] = fb?.proposals ?? []
+    const place = `bd:${b.id}`
+    if (editing?.kind === 'tags' && editing.id === b.id) {
+      const t = tagInput(b.tags, undefined, data?.configured ? tagChoicesOf(data) : undefined)
+      return h('div.catalog-editor.catalog-tags-edit', t.el,
+        h('div.row', h('button.primary', { onclick: () => void change(place, () => api.catalogTags(b.id, t.value(), author.value.trim(), b.metadata?.updated?.commit ?? 'none')) }, 'Commit the tags'), cancel(),
+          h('span.small.muted', 'One commit of metadata.yaml beside the braindump; its text is not touched.')))
+    }
+    // user_catalog p8: the tags and their control in Simple as in Detail; the agents' proposals with boxes are Detail's (Simple has the OK / No line).
+    return h('div.catalog-tags-block',
+      h('div.row', tagChips(b.tags) ?? h('span.small.muted', 'No tags.'), h('button.small', { onclick: () => { editing = { kind: 'tags', id: b.id }; render() } }, b.tags.length ? 'Edit tags' : 'Add tags'),
+        b.metadata?.problem ? h('span.chip.warn', { title: b.metadata.problem }, 'metadata.yaml cannot be read') : null),
+      h('div.d-only', proposals.map(p => {
+        const picks = proposalPicks.get(p.id) ?? new Set<string>()
+        proposalPicks.set(p.id, picks)
+        return h(`div.catalog-proposal${p.stale ? '.stale' : ''}`,
+          h('div.small', h('strong', 'Proposed tags'), ` by ${p.by}${p.run ? ` (${p.run})` : ''} · ${when(p.at)}`, p.stale ? h('span.chip.warn', { title: p.staleReason }, 'stale') : null),
+          p.stale ? h('p.small.stale', `${p.staleReason}. It is not applied; read the braindump again, set the tags yourself, or dismiss it.`) : null,
+          h('ul', p.changes.map(c => {
+            const key = `${c.op}:${c.tag}`
+            const box = h('input', { type: 'checkbox', disabled: p.stale, checked: picks.has(key), onchange: () => { if (box.checked) picks.add(key); else picks.delete(key) } })
+            return h('li.small', h('label', box, ' ', h(`span.chip.tag${c.op === 'remove' ? '.warn' : ''}`, `${c.op === 'add' ? '+' : '−'}${c.tag}`), ' ', c.reason))
+          })),
+          p.note ? h('p.small.muted', p.note) : null,
+          h('div.row', p.stale ? null : h('button.primary.small', { onclick: () => {
+            if (!picks.size) { alert('Tick the changes you accept, or dismiss the proposal.'); return }
+            void change(place, () => api.catalogTagDecide(p.id, author.value.trim(), [...picks]))
+          } }, 'Accept the ticked'), h('button.small', { onclick: () => void change(place, () => api.catalogTagDecide(p.id, author.value.trim(), null)) }, 'Dismiss')))
+      })))
+  }
+
   // Titles that repeat within one folder (the two "思索") are told apart in
   // Simple by the last segment of the path, which Simple otherwise leaves out.
   let repeated = new Set<string>()
@@ -357,7 +674,10 @@ export function renderCatalogView(root: HTMLElement): ViewHandle {
     const subject: Subject = { kind: 'braindump', id: b.id }
     const reviewNote = !b.review ? h('span.chip.muted.d-only', 'not reviewed') : b.changedAfterReview ? h('span.chip.warn.d-only', 'changed after its review') : h('span.chip.d-only', { title: b.review.updated ? `${b.review.updated.author} · ${when(b.review.updated.at)}` : '' }, 'reviewed')
     // Simple: one mark for the state, its words in the title text.
-    const [markIcon, markTone, markText] = !b.review ? ['pending', 'muted', 'Not reviewed'] : b.changedAfterReview ? ['alert', 'warn', 'Changed after its review'] : ['check', 'ok', 'Reviewed']
+    const fu = v.followUp.braindumps[b.id]
+    const [markIcon, markTone, markText] = fu && fu.state !== 'not-done' ? ['history', 'warn', followUpWords(v, b)!]
+      : fu ? ['alert', 'warn', followUpWords(v, b)!]
+        : !b.review ? ['pending', 'muted', 'Not reviewed'] : b.changedAfterReview ? ['alert', 'warn', 'Changed after its review'] : ['check', 'ok', 'Reviewed']
     const pathTitle = b.title === b.id
     return h(`article.catalog-bd${whole ? '.open' : ''}${pathTitle ? '' : '.titled'}`, { dataset: { braindump: b.id } },
       h('div.entry-head', h('a.catalog-bd-title', { href: '#/catalog', onclick: (e: Event) => { e.preventDefault(); void toggle(b.id) }, title: whole ? 'Close' : 'Open the text and its review' },
@@ -366,6 +686,9 @@ export function renderCatalogView(root: HTMLElement): ViewHandle {
         h('code.d-only', b.id),
         reviewNote, publishedChip(b.published),
         b.cited ? h('span.chip.d-only', { title: 'Messages and requests that cited this braindump; open it to see them' }, `cited ${b.cited}`) : null,
+        whole ? h('span.s-only', tagChips(b.tags)) : tagChips(b.tags),
+        fu ? h(`${fu.href ? 'a' : 'span'}.chip.warn`, { ...(fu.href ? { href: fu.href } : {}), title: fu.reason ?? markText }, fu.state === 'not-done' ? 'not reviewed' : 'the summoner is reading it') : null,
+        b.proposals ? h('span.chip.warn.d-only', { title: 'An agent proposed tags; open the braindump to accept or dismiss them' }, `${b.proposals} tag proposal${b.proposals === 1 ? '' : 's'}`) : null,
         b.updated ? h('span.muted.small.d-only', `${b.updated.author} · ${when(b.updated.at)} · ${b.updated.commit.slice(0, 7)}`) : null,
         h('a.small.d-only', { href: `${v.web}/src/branch/${v.branch}/${b.path}`, target: '_blank', rel: 'noopener' }, 'on Gitea'),
         h(`span.catalog-mark.s-only.${markTone}`, { title: markText, role: 'img', 'aria-label': markText }, icon(markIcon, 'icon small')),
@@ -373,14 +696,19 @@ export function renderCatalogView(root: HTMLElement): ViewHandle {
       h('div.chips', h('span.small.muted.d-only', 'grounds '), b.projects.length
         ? b.projects.map(id => { const p = v.projects.find(x => x.project === id); const href = p && projectHref(p); return href ? h('a.chip', { href }, id) : h('span.chip', id) })
         : h('span.chip.muted.d-only', `no project in ${v.plan || 'the plan'}`)),
+      whole && !edit ? tagsBlock(b) : null,
+      edit ? null : tagLines(b),
+      b.uncovered ? h('p.small.muted.catalog-uncovered', { title: b.uncovered }, icon('pending', 'icon small'), 'No project serves this.', h('span.d-only', ` ${b.uncovered}`)) : null,
+      ruleLine(b, v),
       edit ? editor(b) : whole ? renderMarkdown(full.get(b.id)!.text ?? '', linker(v, `braindumps/episodes/${b.id}`)) : h('div.catalog-excerpt', b.excerpt),
       edit ? null : authorSlot(`bd:${b.id}`),
       !whole || edit ? null : h('div.row.d-only',
-        h('button', { onclick: () => { editing = { kind: 'braindump', id: b.id }; render() } }, 'Edit'),
+        h('button', { title: 'Edit the text here and commit it at once (Edit puts it in the writing field instead)', onclick: () => { editing = { kind: 'braindump', id: b.id }; render() } }, 'Edit directly'),
+        h('button', { title: 'Give this braindump another path: its files move, every because naming it is rewritten, in one commit', onclick: () => void rename(b) }, 'Rename…'),
         h('button', { title: 'Move this braindump and its review to braindumps/archive/<date>/ and take it out of every because: it stays readable in the repository and is no braindump any more', onclick: () => void archive(b) }, 'Archive'),
         h('button.danger', { title: 'Delete the files; they stay only in the repository\'s history. To keep the text readable, archive instead.', onclick: () => { if (confirm(`Remove braindump ${b.id}${b.review ? ' and its review' : ''}? They stay in the repository's history.${b.projects.length ? `\nIt grounds ${b.projects.join(', ')}: the plan's because lists must drop it first.` : ''}`)) void change(`bd:${b.id}`, () => api.catalogRemove(b.id, author.value.trim())) } }, 'Remove')),
       whole ? reviewBlock(b, v) : null,
-      !whole || edit ? null : h('div.row.catalog-bd-actions', ...startActions(subject, 'card')),
+      !whole || edit ? null : h('div.row.catalog-bd-actions', h('button', { title: 'Put its text in the writing field above; Update it commits the change', onclick: () => void editInField(b) }, 'Edit'), ...startActions(subject, 'card')),
       whole && !edit && isRequesting(subject, 'card') ? requestForm(subject) : null,
       whole ? citedByBlock(b) : null)
   }
@@ -427,20 +755,23 @@ export function renderCatalogView(root: HTMLElement): ViewHandle {
   }
 
   // The index (challenges.md): what is not yet real, written by the summoner's workflow index.
-  const askIndex = () => void ask('the index', () => api.catalogIndexRequest(author.value.trim()))
+  const askIndex = () => void ask('the index', () => api.catalogIndexRequest(author.value.trim()), 'index', 'index')
   function indexCard(v: CatalogView, body: HTMLElement | null): HTMLElement {
     const x = v.index
+    const fi = v.followUp.index
+    const fuIndex = !fi ? null : fi.state === 'not-done' ? `Not rewritten by itself: ${fi.reason ?? 'no reason given'}. Detail has Refresh the index.` : fi.state === 'reading' ? 'The summoner is rewriting this list.' : 'The summoner rewrites this list after reading what changed.'
     return h('section.card.catalog-index', { dataset: { section: 'index' } },
       h('div.card-head', h('h2', 'Not yet real'),
         h('span.muted.small.d-only', x.updated ? `${x.path} · ${x.updated.author} · ${when(x.updated.at)} · ${x.updated.commit.slice(0, 7)}` : x.path)),
       h('p.muted.small.d-only', 'The index of what is not yet real, from both origins: a braindump that was not carried out, and a challenge (a problem found during work) that is not resolved. An agent writes it by reading the braindumps with their reviews and the challenges; it is a reading, not a state kept by hand.'),
-      x.text === null ? h('p.muted', 'No index yet.') : null,
+      x.text === null ? h('p.muted', 'No list yet.', fuIndex ? ` ${fuIndex}` : '') : null,
       x.stale.length ? h('div.banner.warn.d-only', x.note) : null,
-      x.stale.length ? h('p.small.muted.catalog-stale.s-only', icon('history', 'icon small'), 'The catalog changed after this list was written.', h('button.small', { title: 'Ask the summoner to write the list again', onclick: askIndex }, 'Refresh')) : null,
-      h(`div.row${x.text === null ? '' : '.d-only'}`, h('button', { title: 'The summoner reads every braindump with its review and every challenge that is not resolved or withdrawn, and rewrites challenges.md', onclick: askIndex }, x.text === null ? 'Write the index' : 'Refresh the index'),
-        h('button.d-only', { title: 'The summoner reviews every braindump with no review or changed after its review', onclick: () => void ask('reviews of the braindumps that need one', () => api.catalogReviewRequest(author.value.trim())) }, 'Ask for the reviews that are due')),
+      x.text !== null && (x.stale.length || fuIndex) ? h('p.small.muted.catalog-stale.s-only', icon('history', 'icon small'), fuIndex ?? 'The catalog changed after this list was written.') : null,
+      fuIndex ? h('p.small.muted.d-only', `Follow-up: ${fuIndex}${v.followUp.index?.run ? ` (${v.followUp.index.run})` : ''}`) : null,
+      h('div.row.d-only', askControl('index', h('button', { title: 'The summoner reads every braindump with its review and every challenge that is not resolved or withdrawn, and rewrites challenges.md', onclick: askIndex }, x.text === null ? 'Write the index' : 'Refresh the index')),
+        askControl('reviews', h('button.d-only', { title: 'The summoner reviews every braindump with no review or changed after its review', onclick: () => void ask('reviews of the braindumps that need one', () => api.catalogReviewRequest(author.value.trim()), 'index', 'reviews') }, 'Ask for the reviews that are due'))),
       authorSlot('index'),
-      asked,
+      askedAt('index'),
       body)
   }
 
@@ -548,24 +879,37 @@ export function renderCatalogView(root: HTMLElement): ViewHandle {
       h('div.card-head', h('h2', v.title || 'Catalog'),
         h('div.row', h('a.small.d-only', { href: v.web, target: '_blank', rel: 'noopener' }, `${v.repository} @ ${v.head.slice(0, 7)}`),
           h('label.small.d-only', 'Author of changes ', author),
-          newBraindump())),
+          writeDraft(), newBraindump())),
       h('p.muted.small.d-only', `Braindumps are free text on what you want and why: the grounds of the projects here. A review is free text about a braindump: what became real, where, what did not. Which projects each braindump grounds is recorded in this installation's summonplan (${v.plan ? `summonplans/${v.plan}.yaml` : 'none named'}), not in the projects.`),
       message,
+      !v.followUp.enabled ? h('p.small.muted.d-only', 'The follow-up is off (catalog.json "followUp": false): reviews and the index are asked for with the buttons only.') : null,
       trouble ? h('p.small.s-only.catalog-trouble', icon('alert', 'icon small'), h('a', { href: '#/catalog', onclick: (e: Event) => { e.preventDefault(); showDetail(() => window.scrollTo(0, 0)) } }, `${trouble} problem${trouble === 1 ? '' : 's'} with the catalog: see Detail`)) : null,
       ...v.problems.map(p => h('div.banner.warn.d-only', p)),
       v.issues.length ? h('ul.issues.d-only', v.issues.map(x => h(`li.${x.issue.severity}`, `${x.where}: ${x.issue.message}`))) : null))
+    const wc = waitingCard(v)
+    if (wc) main.append(wc)
+    main.append(compose.card)
     // The summary: four counts, each a way to its part.
     const stat = (name: string, n: string | number, label: string, section: string) => h('a.catalog-stat', { href: '#/catalog', onclick: (e: Event) => { e.preventDefault(); go(section) } }, icon(name), h('strong', String(n)), h('span', label))
     main.append(h('nav.catalog-summary', { 'aria-label': 'What the catalog holds' },
       stat('doc', v.braindumps.length, v.braindumps.length === 1 ? 'braindump' : 'braindumps', 'braindumps'),
-      !index ? h('div.catalog-stat', icon('pending'), h('span', 'no index of what is not yet real'), h('button.small', { onclick: () => { go('index'); askIndex() } }, 'Write the index'))
+      !index ? h('div.catalog-stat', icon('pending'), h('span', 'no index of what is not yet real'), h('button.small.d-only', { onclick: () => { go('index'); askIndex() } }, 'Write the index'))
         : stat('pending', index.entries || '', index.entries ? 'not yet real' : 'what is not yet real', 'index'),
       stat('flag', live, live === 1 ? 'open challenge' : 'open challenges', 'challenges'),
       stat('settings', v.preferences.length, v.preferences.length === 1 ? 'preference' : 'preferences', 'preferences')))
+    main.append(drafts.card)
     if (editing?.kind === 'new') main.append(h('section.card', { dataset: { section: 'new' } }, h('h2', 'New braindump'), editor()))
     const reviewed = v.braindumps.filter(b => b.review).length
-    main.append(h('section.card', { dataset: { section: 'braindumps' } }, h('div.card-head', h('h2', 'Braindumps'), h('span.muted.small.d-only', `${reviewed} of ${v.braindumps.length} reviewed · ${v.braindumps.filter(b => b.published).length} published`)), v.braindumps.length ? h('div.catalog-bds', tree(v.braindumps, v))
-      : h('div.catalog-empty', h('p', 'No braindumps yet. A braindump is free text on what you want and why: it is what the projects here stand on.'), editing?.kind === 'new' ? null : h('div.row', newBraindump())),
+    // user_catalog p6 ex1: a row of the tags in use filters the list (a braindump with every chosen tag).
+    const inUse = new Map<string, { tag: string; n: number }>()
+    for (const b of v.braindumps) for (const t of b.tags) { const k = t.toLowerCase(); inUse.set(k, { tag: inUse.get(k)?.tag ?? t, n: (inUse.get(k)?.n ?? 0) + 1 }) }
+    for (const k of [...tagFilter]) if (!inUse.has(k)) tagFilter.delete(k)
+    const shown = tagFilter.size ? v.braindumps.filter(b => [...tagFilter].every(k => b.tags.some(t => t.toLowerCase() === k))) : v.braindumps
+    const filterRow = inUse.size ? h('div.catalog-tag-filter.row', { role: 'group', 'aria-label': 'Filter by tag' }, h('span.small.muted', 'Tags:'),
+      [...inUse].sort(([a], [b]) => a.localeCompare(b)).map(([k, x]) => h(`button.chip.tag${tagFilter.has(k) ? '.on' : ''}`, { 'aria-pressed': String(tagFilter.has(k)), onclick: () => { if (!tagFilter.delete(k)) tagFilter.add(k); render() } }, `#${x.tag}`, h('span.muted', ` ${x.n}`))),
+      tagFilter.size ? h('button.small', { onclick: () => { tagFilter.clear(); render() } }, `Show all ${v.braindumps.length}`) : null) : null
+    main.append(h(`section.card${v.braindumps.length ? '' : '.d-only'}`, { dataset: { section: 'braindumps' } }, h('div.card-head', h('h2', 'Braindumps'), h('span.muted.small.d-only', `${reviewed} of ${v.braindumps.length} reviewed · ${v.braindumps.filter(b => b.published).length} published`)), filterRow, v.braindumps.length ? h('div.catalog-bds', shown.length ? tree(shown, v) : h('p.muted', 'No braindump has every chosen tag.'))
+      : h('div.catalog-empty', h('p', 'No braindumps yet. A braindump is free text on what you want and why: it is what the projects here stand on.'), editing?.kind === 'new' ? null : h('div.row', writeDraft(), newBraindump())),
       v.archived.length ? h('p.small.muted.d-only.catalog-archived', { title: 'Archived braindumps are kept in the repository to be read. They ground nothing, are not reviewed or indexed, and cannot be cited.' }, 'Archived: ',
         v.archived.map((a, i) => [i ? ' · ' : '', h('a', { href: a.web, target: '_blank', rel: 'noopener' }, a.name), ` (${a.braindumps} braindump${a.braindumps === 1 ? '' : 's'}, on Gitea)`])) : null))
     main.append(indexCard(v, index?.el ?? null))
@@ -582,8 +926,10 @@ export function renderCatalogView(root: HTMLElement): ViewHandle {
     // With no braindump there is nothing to relate: Detail still shows the projects, Simple nothing.
     main.append(h(`section.card.catalog-relations${v.braindumps.length ? '' : '.d-only'}`, { dataset: { section: 'relations' } },
       h('div.card-head', h('h2', 'Braindumps and projects'), h('span.muted.small.d-only', `${v.braindumps.length} braindumps · ${grounded} of ${v.projects.length} projects grounded`)),
-      h('p.muted.small.d-only', 'Hover or focus a box to follow its edges; click to jump to it below.'),
-      diagram))
+      h('p.muted.small.d-only', 'Hover or focus a box to follow its edges; click to jump to it below. A dashed line is a suggested link you have not answered.'),
+      diagram, ...linksBlock(v)))
+    const pc = publicCard(v)
+    if (pc) main.append(pc)
     // Side by side in Simple where there is room.
     main.append(h('div.catalog-pair', challengesCard(v), preferencesCard(v)))
     main.append(h('section.card.d-only', h('h2', 'Projects and why they are here'),
@@ -593,7 +939,10 @@ export function renderCatalogView(root: HTMLElement): ViewHandle {
           h('td', !p.entry ? h('span.muted', 'not in the plan') : p.braindumps.length ? h('div.chips', p.braindumps.map(b => h('a.chip', { href: '#/catalog', onclick: (e: Event) => { e.preventDefault(); pick('braindump', b.id) }, title: b.title }, b.id + (b.missing ? ' (missing)' : '')))) : h('span.chip.warn', 'no ground')),
           h('td.small', p.entry ? roleText(p.entry.roles) : ''),
           h('td.small.muted', appliedChip(p.project), p.entry ? `${p.entry.state} · ${p.entry.commit.slice(0, 7)}${p.entry.note ? ` · ${p.entry.note}` : ''}` : '')))))))
+    const rc = rulesCard(v)
+    if (rc) main.append(rc)
     main.append(styleCard())
+    watchFollowUp()
   }
 
   // summoner p5 ex1: naming a GitHub user who publishes <user>/mycatalog is
@@ -624,7 +973,7 @@ export function renderCatalogView(root: HTMLElement): ViewHandle {
 
   render()
   void load()
-  return { dispose: () => { disposed = true; offDisplay() }, isDirty: () => editing !== null || (requesting !== null && !!reqText.value.trim()) }
+  return { dispose: () => { disposed = true; offDisplay(); drafts.dispose(); compose.dispose(); if (pendingPoll) clearInterval(pendingPoll); if (fuPoll) clearInterval(fuPoll) }, isDirty: () => editing !== null || (requesting !== null && !!reqText.value.trim()) || drafts.isDirty() || compose.isDirty() }
 }
 
 // The project page's section (#/ws/<workspace>): why this project exists.

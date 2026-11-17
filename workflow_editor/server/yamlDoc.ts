@@ -8,7 +8,7 @@ import {
 import {
   acceptsRequests, projectFromData, workflowFromData, type Project, type ShapeIssue, type Workflow,
 } from '../shared/model.ts'
-import { mycatalogFromData, projectsFromData, summonplanFromData, type CatalogDoc, type ProjectsDoc, type Summonplan } from '../shared/catalog.ts'
+import { METADATA_SCHEMA, normalizeTags, mycatalogFromData, projectsFromData, summonplanFromData, type CatalogDoc, type ProjectsDoc, type Summonplan } from '../shared/catalog.ts'
 
 export const STRINGIFY: ToStringOptions = { lineWidth: 0, minContentWidth: 0, flowCollectionPadding: false }
 
@@ -115,6 +115,58 @@ export function dropBecause(text: string, listKey: 'entries' | 'projects', gone:
     because.flow = true
     changed.push({ entry: String(item.get('project') ?? ''), before, after: because.items.map(x => value(x) ?? '') })
   }
+  return { text: changed.length ? r.doc.toString(STRINGIFY) : text, changed }
+}
+
+// user_catalog p6 ex2: a renamed braindump. Every `because` item naming `from`
+// names `to` instead, in place; the rest of the document is kept as it is.
+export function renameBecause(text: string, listKey: 'entries' | 'projects', from: string, to: string): { text: string; changed: BecauseChange[] } | null {
+  const r = parseSubset(text)
+  if (!r.ok) return null
+  const seq = r.doc.get(listKey, true)
+  const changed: BecauseChange[] = []
+  if (isSeq(seq)) for (const item of seq.items) {
+    if (!isMap(item)) continue
+    const because = item.get('because', true)
+    if (!isSeq(because)) continue
+    const value = (x: unknown) => isScalar(x) ? String(x.value) : null
+    const before = because.items.map(x => value(x) ?? '')
+    if (!before.includes(from)) continue
+    for (const x of because.items) if (isScalar(x) && String(x.value) === from) x.value = to
+    changed.push({ entry: String(item.get('project') ?? ''), before, after: because.items.map(x => value(x) ?? '') })
+  }
+  return { text: changed.length ? r.doc.toString(STRINGIFY) : text, changed }
+}
+
+// user_catalog p7: links agreed by the owner. For each project named, the
+// braindump paths in `add` are appended to its `because` (once) and those in
+// `drop` are taken out, on the document itself; a project that is not listed
+// is left alone and not reported.
+export function changeBecause(text: string, listKey: 'entries' | 'projects', add: ReadonlyMap<string, readonly string[]>, drop: ReadonlyMap<string, readonly string[]>, grounds?: string): { text: string; changed: BecauseChange[] } | null {
+  const r = parseSubset(text)
+  if (!r.ok) return null
+  const seq = r.doc.get(listKey, true)
+  const changed: BecauseChange[] = []
+  if (isSeq(seq)) for (const item of seq.items) {
+    if (!isMap(item)) continue
+    const project = String(item.get('project') ?? '')
+    const plus = add.get(project) ?? [], minus = new Set(drop.get(project) ?? [])
+    if (!plus.length && !minus.size) continue
+    let because = item.get('because', true)
+    const value = (x: unknown) => isScalar(x) ? String(x.value) : null
+    const before = isSeq(because) ? because.items.map(x => value(x) ?? '') : []
+    const after = [...before.filter(b => !minus.has(b)), ...plus.filter(p => !before.includes(p))]
+    if (JSON.stringify(after) === JSON.stringify(before)) continue
+    if (!isSeq(because)) { because = r.doc.createNode([]) as never; item.set('because', because) }
+    if (isSeq(because)) {
+      because.items = because.items.filter(x => { const v = value(x); return v === null || !minus.has(v) })
+      for (const p of plus) if (!before.includes(p)) because.items.push(r.doc.createNode(p) as never)
+      because.flow = true
+    }
+    changed.push({ entry: project, before, after })
+  }
+  // The plan now follows the braindumps as they are at this commit.
+  if (changed.length && grounds && r.doc.has('grounds')) r.doc.set('grounds', grounds)
   return { text: changed.length ? r.doc.toString(STRINGIFY) : text, changed }
 }
 
@@ -344,4 +396,35 @@ export function newProjectText(p: Project): string {
   const doc = new Document({})
   doc.commentBefore = ' Project definition (ag.project.v2). Repositories come from .gitmodules.'
   return renderProject(doc, p)
+}
+
+// ---- a braindump's metadata.yaml (user_catalog p6 ex1) --------------------------
+//
+// Read: the tags, and a problem when the file cannot be read (then no tags, and
+// the braindump stays a braindump). Write: tags set on the same document so that
+// any other key the owner keeps there survives; null when nothing is left to keep.
+export function readBraindumpMetadata(text: string | null): { tags: string[]; problem?: string } {
+  if (text === null || !text.trim()) return { tags: [] }
+  const r = parseSubset(text)
+  if (!r.ok) return { tags: [], problem: r.problem.message }
+  const raw = r.doc.toJS() as unknown
+  if (typeof raw !== 'object' || raw === null || Array.isArray(raw)) return { tags: [], problem: 'not a mapping' }
+  const t = (raw as Record<string, unknown>).tags
+  if (t === undefined || t === null) return { tags: [] }
+  if (!Array.isArray(t)) return { tags: [], problem: 'tags is not a list' }
+  const { tags, problems } = normalizeTags(t.filter(x => typeof x === 'string' || typeof x === 'number').map(String))
+  return problems.length ? { tags, problem: problems.join('; ') } : { tags }
+}
+export function writeBraindumpMetadata(text: string | null, tags: readonly string[]): string | null {
+  const parsed = text !== null && text.trim() ? parseSubset(text) : null
+  const doc = parsed?.ok ? parsed.doc : new Document({ schema: METADATA_SCHEMA })
+  if (!doc.has('schema')) doc.set('schema', METADATA_SCHEMA)
+  if (tags.length) {
+    const seq = doc.createNode([...tags]) as import('yaml').YAMLSeq
+    seq.flow = true
+    doc.set('tags', seq)
+  } else doc.delete('tags')
+  const raw = doc.toJS() as Record<string, unknown>
+  if (Object.keys(raw).every(k => k === 'schema')) return null
+  return doc.toString(STRINGIFY)
 }

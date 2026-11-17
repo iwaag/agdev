@@ -769,8 +769,9 @@ export function createHandler(config: ServiceConfig) {
           const input = await body(req) as Record<string, unknown>
           const author = str(input.author, 'author')
           const r = await m.upkeepRequest(ctx, { kind, id: text(input.path) || undefined })
-          const q = await needExec().request({ workspace: r.workspace, workflow: r.workflow, text: r.text, author, receipt: r.receipt, via: 'browser' })
-          return send(res, 201, { ...r, request: q, href: `#/ws/${encodeURIComponent(r.workspace)}/run/${encodeURIComponent(q.ref.workflow)}/${encodeURIComponent(q.ref.run)}` })
+          // user_catalog p6 ex1: the same review or index at the same head, still open, is that run (duplicate).
+          const q = await needExec().requestOnce({ workspace: r.workspace, workflow: r.workflow, text: r.text, author, receipt: r.receipt, via: 'browser' })
+          return send(res, q.duplicate ? 200 : 201, { ...r, request: q, duplicate: q.duplicate, run: q.ref.run, href: `#/ws/${encodeURIComponent(r.workspace)}/run/${encodeURIComponent(q.ref.workflow)}/${encodeURIComponent(q.ref.run)}` })
         }
         if (wsId === 'index') {
           if (!id && method === 'GET') return send(res, 200, await m.index(ctx, { maxAgeMs: fresh }))
@@ -794,6 +795,17 @@ export function createHandler(config: ServiceConfig) {
             const dryRun = input.dryRun === true
             return send(res, 200, await m.archiveBraindumps(ctx, { id: text(input.path) || undefined, all: input.all === true, author: dryRun ? text(input.author) ?? '' : str(input.author, 'author'), note: text(input.note), dryRun }))
           }
+          // user_catalog p6 ex2: renaming a braindump: POST api/catalog/braindumps/move {from, to}.
+          if (id === 'move' && method === 'POST') {
+            const input = await body(req) as Record<string, unknown>
+            return send(res, 200, await m.moveBraindump(ctx, { from: str(input.from, 'from'), to: str(input.to, 'to'), author: str(input.author, 'author'), reuseArchived: input.reuseArchived === true }))
+          }
+          // user_catalog p6 ex1: a braindump's tags (metadata.yaml), set alone: PUT api/catalog/braindumps/<path>?tags=1.
+          if (id && method === 'PUT' && url.searchParams.get('tags') === '1') {
+            const input = await body(req) as Record<string, unknown>
+            const list = (v: unknown) => Array.isArray(v) ? v.map(String) : undefined
+            return send(res, 200, await m.setTags(ctx, { id, tags: list(input.tags), add: list(input.add), remove: list(input.remove), author: str(input.author, 'author'), base: text(input.base), message: text(input.message) }))
+          }
           if (id && method === 'GET') return send(res, 200, await m.braindump(ctx, id))
           if (id && method === 'PUT') {
             const input = await body(req) as Record<string, unknown>
@@ -802,6 +814,88 @@ export function createHandler(config: ServiceConfig) {
           if (id && method === 'DELETE') {
             const input = await body(req) as Record<string, unknown>
             return send(res, 200, await m.changeBraindump(ctx, { op: 'remove', id, author: str(input.author, 'author'), force: input.force === true }))
+          }
+        }
+        // user_catalog p6 ex1: drafts, outside Git (server/catalogDrafts.ts).
+        if (wsId === 'drafts') {
+          const d = await import('./catalogDrafts.ts')
+          const [did, sub] = parts.slice(3)
+          const input = method === 'GET' ? {} : await body(req) as Record<string, unknown>
+          const num = (v: unknown, k: string) => { if (typeof v !== 'number' || !Number.isInteger(v)) throw new RequestError(400, `${k} must be a revision number`); return v }
+          if (!did && method === 'GET') return send(res, 200, await d.listDrafts(ctx))
+          if (!did && method === 'POST') return send(res, 201, await d.createDraft(ctx, { text: text(input.text), tags: input.tags, path: input.path, of: input.of, ofBase: input.ofBase, by: str(input.author, 'author') }))
+          if (did && !sub && method === 'GET') { const r = url.searchParams.get('revision'); return send(res, 200, await d.readDraft(ctx, did, { revision: r ? Number(r) : undefined })) }
+          if (did && !sub && method === 'PUT') return send(res, 200, await d.saveDraft(ctx, did, { text: input.text, tags: input.tags, path: input.path, ofBase: input.ofBase, base: num(input.base, 'base'), by: str(input.author, 'author') }))
+          // user_catalog p6 ex2: the main button: save the text on the screen, then register it as one commit.
+          if (did && sub === 'put' && method === 'POST') return send(res, 200, await d.putDraft(ctx, did, { text: input.text, base: num(input.base, 'base'), by: str(input.author, 'author'), path: input.path, ofBase: input.ofBase, reuseArchived: input.reuseArchived === true }))
+          if (did && !sub && method === 'DELETE') return send(res, 200, await d.removeDraft(ctx, did, { by: str(input.author, 'author') }))
+          if (did && sub === 'preview' && method === 'POST') return send(res, 200, await d.previewRegistration(ctx, did, { path: input.path }))
+          if (did && sub === 'register' && method === 'POST') return send(res, 200, await d.registerDraft(ctx, did, { path: input.path, base: num(input.base, 'base'), by: str(input.author, 'author'), reuseArchived: input.reuseArchived === true }))
+        }
+        // user_catalog p7: asking the summoner from the field; its answer's actions (server/catalogAsk.ts).
+        if (wsId === 'ask') {
+          const k = await import('./catalogAsk.ts')
+          const d = await import('./catalogDrafts.ts')
+          const [did, aid, verb] = parts.slice(3)
+          const input = method === 'GET' ? {} : await body(req) as Record<string, unknown>
+          const request = (o: { workspace: string; workflow: string; text: string; author: string; receipt: string; node?: string }) => needExec().requestOnce({ ...o, via: 'browser' })
+          if (!did && method === 'GET') return send(res, 200, { asked: await d.listAsked(ctx) })
+          if (!did && method === 'POST') { const r = await k.ask(ctx, { draft: text(input.draft), base: typeof input.base === 'number' ? input.base : undefined, text: text(input.text), by: str(input.author, 'author'), request }); return send(res, r.duplicate ? 200 : 201, r) }
+          if (did && aid && verb === 'do' && method === 'POST') return send(res, 200, await k.doAction(ctx, did, aid, Number(input.action), { by: str(input.author, 'author'), request }))
+          if (did && aid && verb === 'decline' && method === 'POST') return send(res, 200, await k.declineAction(ctx, did, aid, Number(input.action), { by: str(input.author, 'author') }))
+          if (did && aid && verb === 'dismiss' && method === 'POST') return send(res, 200, await d.dismissAsk(ctx, did, aid, { by: str(input.author, 'author') }))
+        }
+        // user_catalog p7: links suggested by the summoner, agreed by the owner (server/catalogLinks.ts).
+        if (wsId === 'links') {
+          const l = await import('./catalogLinks.ts')
+          const input = method === 'GET' ? {} : await body(req) as Record<string, unknown>
+          const numbers = Array.isArray(input.numbers) ? input.numbers.map(Number).filter(Number.isInteger) : undefined
+          if (!id && method === 'GET') return send(res, 200, await l.links(ctx, { maxAgeMs: fresh }))
+          if (!id && method === 'POST') return send(res, 201, await l.suggestLinks(ctx, { suggestion: input.suggestion, head: str(input.head, 'head'), by: str(input.author, 'author'), run: text(input.run) }))
+          if (id === 'request' && method === 'POST') {
+            const author = str(input.author, 'author')
+            const r = await l.linksRequest(ctx, { by: author })
+            const q = await needExec().requestOnce({ workspace: r.workspace, workflow: r.workflow, text: r.text, author, receipt: r.receipt, via: 'browser' })
+            return send(res, q.duplicate ? 200 : 201, { ...r, kind: 'ground', request: q, duplicate: q.duplicate, run: q.ref.run, href: `#/ws/${encodeURIComponent(r.workspace)}/run/${encodeURIComponent(q.ref.workflow)}/${encodeURIComponent(q.ref.run)}` })
+          }
+          if (id === 'agree' && method === 'POST') return send(res, 200, await l.agreeLinks(ctx, { numbers, all: input.all === true, author: str(input.author, 'author') }))
+          // user_catalog p8: OK / No on a statement on disclosure (its number) or on the default licence (n: "licence").
+          if (id === 'disclosure' && method === 'POST') return send(res, 200, await l.answerDisclosure(ctx, { n: input.n === 'licence' ? 'licence' : Number(input.n), agree: input.agree === true, author: str(input.author, 'author') }))
+          if (id === 'decline' && method === 'POST') return send(res, 200, await l.declineLinks(ctx, { numbers, all: input.all === true, author: str(input.author, 'author') }))
+        }
+        // user_catalog p7: rules adopted from the owner's tag conventions, and what they say about the public list (server/catalogRules.ts).
+        if (wsId === 'rules') {
+          const r = await import('./catalogRules.ts')
+          if (!id && method === 'GET') return send(res, 200, await r.rules(ctx, { maxAgeMs: fresh }))
+          const input = await body(req) as Record<string, unknown>
+          if (!id && method === 'POST') return send(res, 200, await r.adoptRule(ctx, { tag: input.tag, project: input.project, licence: input.licence, follows: input.follows, source: input.source, author: str(input.author, 'author') }))
+          if (id === 'retire' && method === 'POST') return send(res, 200, await r.retireRule(ctx, { id: str(input.id, 'id'), author: str(input.author, 'author') }))
+        }
+        // user_catalog p8: what the owner's words make of each project; asking the publisher.
+        if (wsId === 'waiting' && method === 'GET') return send(res, 200, await m.waitingCount(ctx))
+        if (wsId === 'disclosure' && method === 'GET') return send(res, 200, await (await import('./catalogRules.ts')).disclosure(ctx, { maxAgeMs: fresh, project: id || undefined }))
+        if (wsId === 'publication' && id === 'request' && method === 'POST') {
+          const input = await body(req) as Record<string, unknown>
+          const author = str(input.author, 'author')
+          const r = await (await import('./catalogRules.ts')).publicationRequest(ctx, { target: text(input.target), by: author })
+          const q = await needExec().requestOnce({ workspace: r.workspace, workflow: r.workflow, text: r.text, author, receipt: r.receipt, via: 'browser' })
+          return send(res, q.duplicate ? 200 : 201, { ...r, kind: 'publish', request: q, duplicate: q.duplicate, run: q.ref.run, href: `#/ws/${encodeURIComponent(r.workspace)}/run/${encodeURIComponent(q.ref.workflow)}/${encodeURIComponent(q.ref.run)}` })
+        }
+        if (wsId === 'publication' && id === 'check' && method === 'GET') return send(res, 200, await (await import('./catalogRules.ts')).publicationCheck(ctx, { maxAgeMs: fresh }))
+        if (wsId === 'publication' && id === 'add' && method === 'POST') {
+          const input = await body(req) as Record<string, unknown>
+          return send(res, 200, await (await import('./catalogRules.ts')).publicationAdd(ctx, { id: str(input.path, 'path'), author: str(input.author, 'author') }))
+        }
+        // user_catalog p6 ex1: tag proposals (outside Git until accepted).
+        if (wsId === 'tag-proposals') {
+          if (!id && method === 'GET') return send(res, 200, { proposals: await m.tagProposals(ctx, { id: url.searchParams.get('braindump') || undefined, all: url.searchParams.get('all') === '1' }) })
+          if (!id && method === 'POST') {
+            const input = await body(req) as Record<string, unknown>
+            return send(res, 201, await m.proposeTags(ctx, { id: str(input.braindump, 'braindump'), changes: Array.isArray(input.changes) ? input.changes as { op?: string; tag?: string; reason?: string }[] : [], by: str(input.author, 'author'), run: text(input.run), note: text(input.note), base: text(input.base) }))
+          }
+          if (id && method === 'POST') {
+            const input = await body(req) as Record<string, unknown>
+            return send(res, 200, await m.decideTagProposal(ctx, { proposal: id, accept: Array.isArray(input.accept) ? input.accept.map(String) : undefined, dismiss: input.dismiss === true, author: str(input.author, 'author') }))
           }
         }
         // user_catalog p3: the owner's standing preferences (preferences/<name>.md).

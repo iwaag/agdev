@@ -21,8 +21,8 @@ What it reads is tracked content. Ignored folders (deliveries a project
 installs, .local/), shares and what runs on a host are not in it, so a tree
 or a search that finds nothing is no evidence that a feature is absent: read
 the project's entry (README.md, its cooperation and adoption records) for
-what it has (tidy p1: ponderer reported protoprey's adopted wolf mouth scene
-as missing after searching its tree for GLB, Node3D and SepRig).
+what it has (tidy p1: ponderer reported another project's adopted scene as missing
+after searching that project's tree for its file types).
 
 list    every project (name, intent, devdocs mode, root repository and its
         current commit, submodules it uses, workspaces here) and every shared

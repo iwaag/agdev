@@ -8,6 +8,30 @@ repositories have their own histories, and every transfer between them is explic
 Tool: `install/agdev-external-publish` (Python 3.11+ standard library), installed with each
 activation as `<installation>/config/install/agdev-external-publish`. `--help` lists the commands.
 
+## What stays local, what is published
+
+Five principles. Every publication tool and agent guide of agdev refers to this section and does
+not restate it.
+
+1. **The local repository is the authority; a public repository is a derivative.** This holds
+   for the catalog as for a project. The installation acts on its Gitea catalog only. A public
+   catalog, the owner's own included, is a reference: reading it adopts nothing, and a local rule
+   may say the opposite of what a public one says.
+2. **Private unless decided.** What no decision covers stays local. Widening what is public is
+   decided by the owner, or by Omni on the concrete change; narrowing needs no decision.
+3. **One chain of grounds.** A braindump states a policy; a rule adopts a sentence of it; a
+   contract selects files; a journal records what was published. Each link names the one before
+   it. These are the only three places that carry disclosure (tags with their rules, the
+   catalog's `rules.yaml`, one contract per repository); there is no fourth store and no per-file
+   attribute.
+4. **Nothing is more public than what it names.** A rule, a review, a run record or a comment
+   that names or quotes something private is private in that place. The public `rules.yaml` of a
+   catalog is therefore derived (*The owner's words*, below), and a name of a private project in
+   any candidate stops it unless the contract records why the name is needed.
+5. **Agents propose, the owner or Omni decides.** The owner is not asked per item: an agent reads
+   the stated policy and proposes; the answer is given on the proposal as a whole. An agent never
+   widens what is public on its own reading.
+
 ## Where things live
 
 | What | Where | Versioned with |
@@ -38,6 +62,11 @@ forbidden = ["internal-host", "/Users/"]   # literal, case-insensitive
 file = "NOTICE.md"
 found = "internal-host"
 why = "…"
+
+[[allow]]                                  # the name of a project kept private, where the text needs it
+file = "docs/packs.md"
+found = "private:example"
+why = "the name of a pack made for it; nothing else of the project"
 
 [[tree]]                                   # a directory: every file under it, minus exclusions
 public = ""                                # where it goes in the public tree ("" = the root)
@@ -121,7 +150,7 @@ Stagings without an owner (by hand) behave as before.
 
 **Stop codes.** Every refusal prints `agdev-external-publish [<code>]: <reason>` and exits 1:
 `conflict`, `stale-public-head`, `unavailable-source`, `child-not-public`, `graph`, `contract`,
-`check-failed`, `checkout-state`, `owner`, `busy`, `infrastructure`, `usage`. A workflow maps them to
+`check-failed`, `checkout-state`, `owner`, `busy`, `infrastructure`, `usage`, `rule`. A workflow maps them to
 its next action; the code is a category, the reason says what to look at.
 
 ## Procedures
@@ -180,7 +209,44 @@ tool with `--workspace <target workspace> --source <draft clone>`, so the target
 edited, and stages with its run as owner. See the publisher project's `agent/publish.md`.
 
 A target project needs a `publication-edit` workflow (the project's own agent, the publisher's
-`agent/source-change.md` guide) for the delegation; the core has one too.
+`agent/source-change.md` guide) for the delegation; the core has one too. A project without one
+gets it with its first publication, delegated to its `freework`.
+
+**The owner's words (user_catalog p8).** On an installation with a catalog, the tool refuses
+`build`, `stage` and `push` for the workspace of a project the owner's braindumps keep private: an
+adopted rule `project: <id>, follows: never-publish` in the catalog's `rules.yaml`, or such a
+statement the summoner proposed that the owner has not declined (code `rule`; it names the rule or
+the proposal and its sentence). The tool finds the installation's area through `$WFE_AREA`, the
+folder of `$WFE_REGISTRY`, or `<root>/data/area` beside the installed tool, reads `catalog.json`
+there, `rules.yaml` at `HEAD` of the service's clone and the open proposals; an installation
+without a catalog, or a catalog without such a rule, is not affected. The publisher reads the same
+facts with `wfe catalog disclosure` and declines in `scope`; a `publish` rule authorizes a new
+repository, a `default-licence` rule its licence.
+
+**A private name is a forbidden word the installation supplies (improve_publish p1).** On the same
+installation, `build`, `stage` and `resolve` of *any* workspace search every candidate file for the
+id of each project kept private (the same reading), case-insensitive, as a word: the characters
+around it are not `[A-Za-z0-9]`, so `pj-<id>`, `<id>_pack` and `<id>/run-001` are found. A finding is
+labelled `private:<id>`; it stops `stage` (`check-failed`) and makes `build` exit 1, as a forbidden
+word does, unless the contract has an `[[allow]]` for that file with `found = "private:<id>"` and the
+reason the public text needs the name. No contract lists the words. An `[[allow]]` covers the name
+only: what tells more (run ids, states, contents of the project) is generalized, and the publisher
+still reads every allowed place. The journal records per staging the ids searched and each allowed
+place with its reason (`checks.private_names`).
+
+**The public `rules.yaml` of a catalog is derived.** In a repository with `mycatalog.yaml` at its
+root, a selected `rules.yaml` from the source's root is replaced, at build time, by its public
+form: the rules whose source braindump the same candidate selects, that are not `never-publish` on
+a project (such a rule names what is private) and not `share: never` (the default licence always
+is); `source.commit` is dropped (an internal commit), `adopted.by` becomes the destination's
+account. Nothing says that rules were left out. It takes no `[[file.edit]]` (code `contract`): no
+agent edits it, so it cannot be stale. `wfe catalog publication status` prints which rules are
+public and why the others are not.
+
+**The catalog as a target.** The publisher's target `mycatalog` is the owner's catalog, published
+from the folder `wfe catalog publication status` names; its owning agent is the summoner (workflow
+`catalog-publication-edit`), which writes the catalog through `wfe catalog`. Omni or a person no
+longer publishes the catalog by hand.
 
 ## What is public, and where
 
@@ -202,8 +268,7 @@ keeps its internal one; nothing compares the two histories.
 **Publishing an update** of a project: request `publisher/publish` for it ("update", with what
 changed). The publisher builds from the integrated `main`, and the public history continues. A new
 public commit of a role project is then a change of `projects.yaml` (its `commit`) in the catalog, and
-`mycatalog` is republished by hand with this tool from a clone of the catalog outside the
-service's (`build`, read, `stage`, `push`). Installations that summoned the project move to it by a
+`mycatalog` is republished by a `publish` run with the target `mycatalog`. Installations that summoned the project move to it by a
 plan revision (fast-forward).
 
 **The catalog's file list.** In `mycatalog`, `publication/github.toml` chooses what is public per

@@ -198,7 +198,7 @@ export function evaluate(b: Boundary, f: Facts): Reminder[] {
   }
 
   // A documentation step completed while its document does not exist (tidy
-  // p1: protoprey freework/run-006's `sed … && cat > report.md` failed at the
+  // p1: a freework run's `sed … && cat > report.md` failed at the
   // sed, _final-report completed "Report written", and the requester was told
   // the audit was in report.md). The file layer records a document only when
   // it is a file of the run folder, so its absence here is observed, not guessed.

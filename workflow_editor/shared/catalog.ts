@@ -62,6 +62,86 @@ export const isPreferenceName = (name: string): boolean => SEGMENT_PATTERN.test(
 export const braindumpPath = (id: string) => `${EPISODES_DIR}/${id}/${BRAINDUMP_FILE}`
 export const reviewPath = (id: string) => `${EPISODES_DIR}/${id}/${REVIEW_FILE}`
 export const summonplanPath = (name: string) => `${SUMMONPLAN_DIR}/${name}.yaml`
+
+// user_catalog p6 ex1: optional tags of a braindump, in a small sidecar beside it
+// (metadata.yaml, ag.braindump-metadata.v1). Absent means no tags. Tags are free
+// text: none is required, none is refused for its meaning, and the examples are
+// not a closed list. `mybraindump` is agdev's one recommended tag: the owner's own
+// writing, tagging and handling conventions, read by agents as stated conventions
+// (it grants no authority to change anything).
+export const METADATA_FILE = 'metadata.yaml'
+export const METADATA_SCHEMA = 'ag.braindump-metadata.v1'
+export const metadataPath = (id: string) => `${EPISODES_DIR}/${id}/${METADATA_FILE}`
+export const RECOMMENDED_TAG = 'mybraindump'
+export const EXAMPLE_TAGS = [RECOMMENDED_TAG, 'style', 'desire', 'bounty', 'public', 'private'] as const
+export const MAX_TAGS = 32
+export const MAX_TAG_LENGTH = 64
+// One tag as written: trimmed, a leading # dropped. null with a reason when it cannot be stored.
+export function normalizeTag(raw: string): { tag: string } | { problem: string } {
+  const tag = String(raw).trim().replace(/^#+/, '').trim()
+  if (!tag) return { problem: 'an empty tag' }
+  if (tag.length > MAX_TAG_LENGTH) return { problem: `"${tag.slice(0, 20)}…" is longer than ${MAX_TAG_LENGTH} characters` }
+  // eslint-disable-next-line no-control-regex
+  if (/[\u0000-\u001f\u007f,]/.test(tag)) return { problem: `"${tag}" holds a comma or a control character` }
+  return { tag }
+}
+// A list of tags as stored: normalized, without duplicates (compared without case), in the order given.
+export function normalizeTags(raw: readonly string[]): { tags: string[]; problems: string[] } {
+  const tags: string[] = [], problems: string[] = []
+  for (const r of raw) {
+    const n = normalizeTag(r)
+    if ('problem' in n) { problems.push(n.problem); continue }
+    if (!tags.some(t => t.toLowerCase() === n.tag.toLowerCase())) tags.push(n.tag)
+  }
+  if (tags.length > MAX_TAGS) problems.push(`at most ${MAX_TAGS} tags (${tags.length} given)`)
+  return { tags, problems }
+}
+export const sameTag = (a: string, b: string) => a.toLowerCase() === b.toLowerCase()
+
+// user_catalog p6 ex2: tags written in the text. A token #name — at the start
+// of a line or after white space, beginning with a letter of any script, then
+// letters, digits, "_" or "-" — outside fenced code and inline code spans.
+// "# Title", "#123", "http://host/#/x" and `#x` are not tags; "#公開" is.
+const TEXT_TAG = /(^|\s)#(\p{L}[\p{L}\p{N}_-]*)/gu
+export function textTags(text: string): string[] {
+  const found: string[] = []
+  let fence: string | null = null
+  for (const line of text.split('\n')) {
+    const f = /^\s{0,3}(`{3,}|~{3,})/.exec(line)
+    if (fence) { if (f && f[1][0] === fence[0] && f[1].length >= fence.length) fence = null; continue }
+    if (f) { fence = f[1]; continue }
+    const plain = line.replace(/(`+)[^`]*?\1/g, m => ' '.repeat(m.length))
+    for (const m of plain.matchAll(TEXT_TAG)) { const t = m[2].replace(/[-_]+$/, ''); if (t) found.push(t) }
+  }
+  return normalizeTags(found).tags.slice(0, MAX_TAGS)
+}
+// The tags after a body changes from `before` (null: a new braindump) to `after`:
+// tags the old text wrote and the new one does not are removed, tags the new
+// text writes are added, tags set otherwise stay.
+export function tagsAfterText(present: readonly string[], before: string | null, after: string): string[] {
+  const was = before === null ? [] : textTags(before), now = textTags(after)
+  const gone = was.filter(t => !now.some(n => sameTag(n, t)))
+  const next = present.filter(t => !gone.some(g => sameTag(g, t)))
+  for (const t of now) if (!next.some(x => sameTag(x, t))) next.push(t)
+  return next.slice(0, MAX_TAGS)
+}
+// The first line that says something: blank lines and lines that hold only
+// tags ("#public #todo") are passed over, so that tags written above the
+// title take neither the title nor the name.
+const tagsOnly = (line: string) => line.trim() !== '' && line.replace(TEXT_TAG, ' ').trim() === ''
+const firstTextIndex = (lines: string[]) => lines.findIndex(l => l.trim() !== '' && !tagsOnly(l))
+const firstTextLine = (lines: string[]) => lines[firstTextIndex(lines)]
+// user_catalog p6 ex2: the name the service gives a braindump, from its first
+// heading or line (tags left out): a-z 0-9 "-", at least three characters, or
+// note-<yyyymmdd>. Whether it is free is the caller's question.
+export function nameFromText(text: string, date: Date = new Date()): string {
+  const line = firstTextLine(text.split('\n'))?.trim() ?? ''
+  const words = line.replace(TEXT_TAG, ' ').replace(/^#+\s*/, '')
+  let slug = words.normalize('NFKD').replace(/[̀-ͯ]/g, '').toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '')
+  if (slug.length > 48) slug = slug.slice(0, 48).replace(/-[^-]*$/, '') || slug.slice(0, 48)
+  if (slug.length >= 3) return slug
+  return `note-${date.getFullYear()}${String(date.getMonth() + 1).padStart(2, '0')}${String(date.getDate()).padStart(2, '0')}`
+}
 // braindumps/episodes/<id>/braindump.md → <id>; anything else → null.
 export const braindumpIdOfPath = (path: string): string | null => {
   const pre = `${EPISODES_DIR}/`, post = `/${BRAINDUMP_FILE}`
@@ -113,10 +193,11 @@ export interface SharedProject { project: string; source: string; commit?: strin
 export interface ProjectsDoc { schema: string; owner: string; projects: SharedProject[] }
 
 // A braindump as read: free Markdown. Its title is the first-level heading on
-// its first line, otherwise its identity.
+// its first line (lines of tags only and blank lines above it do not count),
+// otherwise its identity.
 export interface Braindump { id: string; path: string; title: string; text: string }
 export function braindumpTitle(id: string, text: string): string {
-  const m = /^#\s+(.+?)\s*#*\s*$/.exec(text.split('\n', 1)[0] ?? '')
+  const m = /^#\s+(.+?)\s*#*\s*$/.exec(firstTextLine(text.split('\n')) ?? '')
   return m ? m[1] : id
 }
 // The first lines after the title, for listings. A first paragraph that is
@@ -125,8 +206,8 @@ export function braindumpTitle(id: string, text: string): string {
 // own first words (user_catalog p5).
 export function braindumpExcerpt(text: string, chars = 480): string {
   const lines = text.split('\n')
-  const start = lines.findIndex(l => l.trim() !== '')
-  let body = (start >= 0 && /^#\s/.test(lines[start]) ? lines.slice(start + 1) : lines).join('\n').trim()
+  const start = firstTextIndex(lines)
+  let body = (start >= 0 ? lines.slice(/^#\s/.test(lines[start]) ? start + 1 : start) : lines).join('\n').trim()
   const para = /^[\s\S]*?(?=\n[ \t]*\n|$)/.exec(body)![0].trim()
   const inner = /^_(\S[\s\S]*\S|\S)_$/.exec(para)?.[1] ?? /^\*([^*\s][^*]*)\*$/.exec(para)?.[1]
   // One emphasis, not several: no closing mark inside it.
@@ -314,10 +395,10 @@ export function validateProjects(c: ProjectsDoc, ctx: CatalogRefs = {}): Issue[]
 // selects from the source: [[file]] from = "source:<path>" and [[tree]] from =
 // "source:<dir>" minus its exclude globs. Only those keys are read here; the
 // publication tool is the authority on the contract.
-export interface PublicationSelection { destination: string; files: { public: string; from: string }[]; trees: { public: string; from: string; exclude: string[] }[] }
+export interface PublicationSelection { destination: string; files: { public: string; from: string }[]; trees: { public: string; from: string; exclude: string[] }[]; allows: { file: string; found: string; why: string }[] }
 
 export function readPublicationContract(text: string): PublicationSelection {
-  const out: PublicationSelection = { destination: '', files: [], trees: [] }
+  const out: PublicationSelection = { destination: '', files: [], trees: [], allows: [] }
   let cur: Record<string, unknown> | null = null
   const lines = text.split('\n')
   for (let i = 0; i < lines.length; i++) {
@@ -327,6 +408,7 @@ export function readPublicationContract(text: string): PublicationSelection {
       cur = {}
       if (line.startsWith('[[file]]')) out.files.push(cur as never)
       else if (line.startsWith('[[tree]]')) out.trees.push(Object.assign(cur, { exclude: [] }) as never)
+      else if (line.startsWith('[[allow]]')) out.allows.push(cur as never)
       continue
     }
     const kv = /^([A-Za-z0-9_-]+)\s*=\s*(.*)$/.exec(line)
@@ -344,12 +426,15 @@ export function readPublicationContract(text: string): PublicationSelection {
     destination: out.destination,
     files: out.files.flatMap(f => src(f.from) !== null && typeof f.public === 'string' ? [{ public: f.public, from: src(f.from)! }] : []),
     trees: out.trees.flatMap(t => src(t.from) !== null ? [{ public: typeof t.public === 'string' ? t.public.replace(/^\.?\/+|\/+$/g, '').replace(/^\.$/, '') : '', from: src(t.from)!, exclude: Array.isArray(t.exclude) ? t.exclude.filter((x): x is string => typeof x === 'string') : [] }] : []),
+    allows: out.allows.flatMap(a => typeof a.file === 'string' && typeof a.found === 'string' ? [{ file: a.file, found: a.found, why: typeof a.why === 'string' ? a.why : '' }] : []),
   }
 }
 
 // A glob as the publication tool reads it: `*` crosses "/"; a glob that
 // matches a directory excludes everything below it.
 const globRe = (g: string) => new RegExp(`^${g.replace(/[.+^${}()|\\]/g, '\\$&').replace(/\*/g, '.*').replace(/\?/g, '.')}$`)
+// fnmatch as the publication tool matches an [[allow]]'s file glob.
+export const globMatch = (path: string, glob: string) => globRe(glob).test(path)
 const excluded = (rel: string, patterns: string[]) => patterns.some(p => globRe(p).test(rel) || globRe(`${p.replace(/\/+$/, '')}/*`).test(rel))
 
 // The public path of each source path the contract selects (source path → public path).

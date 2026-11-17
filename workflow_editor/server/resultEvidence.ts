@@ -13,8 +13,8 @@ import type { Workspace } from './workspace.ts'
 
 // Where a run's result starts going back:
 // - `start <step>` of its final-report step (the report is about to be
-//   written: protoprey freework/run-006 wrote "Report written" for a report
-//   that did not exist, and run-007 reported a test count its new test was
+//   written: a freework run wrote "Report written" for a report
+//   that did not exist, and the next reported a test count its new test was
 //   not part of);
 // - the completion after which only reporting is left (documentation steps,
 //   present, cleanup, review, the result confirmation), when no final-report

@@ -117,7 +117,7 @@ export interface AttemptExecution { agent: string; profile: string | null; backe
 // run's folder" in a request or a node's description was resolved against
 // the copy's root about half the time, so root report.md / answer.md /
 // review.md files read as the project's own and each run overwrote the last.
-export const runFolderLine = (r: RunRef) => `Run folder: ${runDir(r)}/ (relative to your working directory, the copy's root). The run's own documents go there: its plan and reports, an answer or review notes, whatever the request or a node asks to write "in the run folder". A file of the same name at the project root reads as the project's own and the next run overwrites it (tidy p1: protoprey freework/run-003 wrote its final report as the root report.md, replacing another run's; agops recover runs did the same eleven times). Saving a file there is enough: WFE publishes the folder itself, so leave it out of your own git commands (git refuses them there, improve_wfrun p2).`
+export const runFolderLine = (r: RunRef) => `Run folder: ${runDir(r)}/ (relative to your working directory, the copy's root). The run's own documents go there: its plan and reports, an answer or review notes, whatever the request or a node asks to write "in the run folder". A file of the same name at the project root reads as the project's own and the next run overwrites it (tidy p1: a freework run wrote its final report as the root report.md, replacing another run's; agops recover runs did the same eleven times). Saving a file there is enough: WFE publishes the folder itself, so leave it out of your own git commands (git refuses them there, improve_wfrun p2).`
 
 // Deliver the built-in contract even while the node follows the initial talk.
 // It must not depend on an optional guide read or an editable local catalog.
@@ -576,6 +576,28 @@ export class ExecStore {
   // `attachments` (challenge p1): challenges the words carried, each with its
   // file's text at the attached commit, written into the new run's folder.
   // `standing` (p18): the run is created as a conversation's standing conductor.
+  // user_catalog p6 ex1: one open request per key. A key (the work and what it is
+  // asked on, e.g. a review of one braindump at one catalog head) is sent as
+  // receipts key, key.2, …: while the run of the newest is not completed,
+  // cancelled or stopped, asking again returns it (duplicate); once it is, the
+  // next receipt makes a new run.
+  async requestOnce(o: Parameters<ExecStore['request']>[0]): Promise<{ job: JobRow; ref: RunRef; duplicate: boolean }> {
+    for (let n = 1; n <= 50; n++) {
+      const receipt = n === 1 ? o.receipt : `${o.receipt}.${n}`
+      const seen = this.one<JobRow>('SELECT * FROM jobs WHERE receipt = ?', `request:${receipt}`)
+      if (!seen) return this.request({ ...o, receipt })
+      const state = await this.runState(seen.workspace, { workflow: seen.workflow, run: seen.run })
+      if (state !== 'completed' && state !== 'cancelled' && state !== 'stopped') return { job: seen, ref: { workflow: seen.workflow, run: seen.run }, duplicate: true }
+    }
+    throw new RequestError(409, `asked 50 times already: ${o.receipt}`)
+  }
+
+  // A run's execution state as a request sees it ('cancelled' for a cancelled run; undefined when it cannot be read).
+  async runState(workspace: string, ref: RunRef): Promise<string | undefined> {
+    const ws = await this.workspace(workspace)
+    return readRun(ws, ref).then(r => r.record?.cancelled ? 'cancelled' : r.record?.execution?.state, () => undefined)
+  }
+
   async request(o: { workspace: string; workflow: string; text: string; author: string; receipt: string; by?: string; via: string; predecessor?: RunRef; node?: string; source?: import('../shared/intake.ts').SourceRef; input?: Extract<import('./runs.ts').CreateRunOptions['input'], { from: 'agent' }>; attachments?: import('./runs.ts').PinnedAttachment[]; standing?: { conversation: string; replaces?: string }; trial?: import('./runs.ts').CreateRunOptions['trial'] }): Promise<{ job: JobRow; ref: RunRef; duplicate: boolean }> {
     if (!/^[A-Za-z0-9:._/#-]{8,200}$/.test(o.receipt)) throw new RequestError(400, 'a request needs a receipt id (8–200 of A-Z a-z 0-9 : . _ / # -)')
     const seen = this.one<JobRow>('SELECT * FROM jobs WHERE receipt = ?', `request:${o.receipt}`)

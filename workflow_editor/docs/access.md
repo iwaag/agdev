@@ -89,7 +89,7 @@ Every result carries a provenance block:
 ```json
 {
   "schema": "ag.wfe-access.v1",
-  "project": "rts-vs-bot",
+  "project": "example",
   "source": "committed",
   "repository": {"key": "gitea:130", "fullName": "<owner>/study-rts", "path": "study/study-rts", "category": "study", "registered": true, "defaultBranch": "main"},
   "revision": {"selector": "pinned", "commit": "<sha>", "pinnedBy": {"repository": "<owner>/pj-example", "commit": "<sha>"}},

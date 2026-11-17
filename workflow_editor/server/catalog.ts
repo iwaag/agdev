@@ -15,7 +15,7 @@
 // (written by an agent, stored and shown here, never parsed), and
 // publication/github.toml says which braindumps and challenges are in the
 // published part.
-import { createHash } from 'node:crypto'
+import { createHash, randomBytes } from 'node:crypto'
 import { mkdir, readdir, rename, rm, stat, writeFile } from 'node:fs/promises'
 import { basename, dirname, join, resolve } from 'node:path'
 import type { Issue } from '../shared/model.ts'
@@ -23,7 +23,7 @@ import type { BraindumpAttachmentRef } from '../shared/intake.ts'
 import { citationCounts, citations, type Citation } from './citations.ts'
 import {
   ARCHIVE_DIR, braindumpExcerpt, braindumpPath, braindumpTitle, BRAINDUMP_DIR, BRAINDUMP_FILE, CATALOG_FILE, CATALOG_REPOSITORY, CHALLENGES_DIR, EPISODES_DIR, INDEX_PATH, isBraindumpId,
-  isPreferenceName, MAX_BRAINDUMP_DEPTH, MYCATALOG_SCHEMA, OLD_LAYOUT, OLD_LAYOUT_PROBLEM, PLAN_NAME_PATTERN, preferencePath, PREFERENCES_DIR, PROJECTS_PATH, PROJECTS_SCHEMA, PUBLICATION_CONTRACT, publishedPaths, readPublicationContract, REVIEW_FILE, reviewPath,
+  isPreferenceName, MAX_BRAINDUMP_DEPTH, METADATA_FILE, metadataPath, nameFromText, normalizeTag, normalizeTags, sameTag, tagsAfterText, MYCATALOG_SCHEMA, OLD_LAYOUT, OLD_LAYOUT_PROBLEM, PLAN_NAME_PATTERN, preferencePath, PREFERENCES_DIR, PROJECTS_PATH, PROJECTS_SCHEMA, PUBLICATION_CONTRACT, publishedPaths, readPublicationContract, REVIEW_FILE, reviewPath,
   SEGMENT_PATTERN, summonplanPath, SUMMONPLAN_DIR, validateMycatalog, validateProjects, validateSummonplan,
   type CatalogDoc, type ProjectsDoc, type SummonEntry, type Summonplan,
 } from '../shared/catalog.ts'
@@ -34,12 +34,14 @@ import { loadChallengeConfig, type ChallengeStore } from './challenges.ts'
 import { withLock } from './lock.ts'
 import { loadRegistry, registerRepository } from './registry.ts'
 import { RequestError } from './workspace.ts'
-import { dropBecause, parseMycatalog, parseProjects, parseSummonplan } from './yamlDoc.ts'
+import { noteFollowUp } from './catalogFollowUp.ts'
+import { dropBecause, renameBecause, parseMycatalog, parseProjects, parseSummonplan, readBraindumpMetadata, writeBraindumpMetadata } from './yamlDoc.ts'
 
 export const CATALOG_SETTING = 'catalog.json'
 // publicationWorkspace: where the owner publishes the catalog from (the folder
 // agdev-external-publish works in); only its journal is read, for the last public commit.
-export interface CatalogSetting { repository: { id: number; owner: string; name: string }; branch: string; plan: string; publicationWorkspace?: string }
+// drafts (user_catalog p6 ex1): where drafts are kept, outside Git: shared://<share>/<folder>/ or an absolute folder; absent: <area>/.local/catalog-drafts/.
+export interface CatalogSetting { repository: { id: number; owner: string; name: string }; branch: string; plan: string; publicationWorkspace?: string; drafts?: string; followUp?: boolean }
 // challenges: the service's own challenge store; without it one is opened for the read.
 export interface CatalogContext { area: string; registryFile: string; gitea?: Gitea; giteaProblem?: string; challenges?: ChallengeStore }
 
@@ -68,7 +70,9 @@ export async function loadCatalogSetting(area: string): Promise<CatalogSetting |
   const r = isObj(raw) && isObj(raw.repository) ? raw.repository : null
   if (!isObj(raw) || !r || typeof r.id !== 'number' || typeof r.owner !== 'string' || typeof r.name !== 'string') throw new RequestError(500, `${settingFile(area)} needs {"repository": {"id", "owner", "name"}, "branch", "plan"}`)
   return { repository: { id: r.id, owner: r.owner, name: r.name }, branch: typeof raw.branch === 'string' && raw.branch ? raw.branch : 'main', plan: typeof raw.plan === 'string' ? raw.plan : '',
-    ...(typeof raw.publicationWorkspace === 'string' && raw.publicationWorkspace ? { publicationWorkspace: raw.publicationWorkspace } : {}) }
+    ...(typeof raw.publicationWorkspace === 'string' && raw.publicationWorkspace ? { publicationWorkspace: raw.publicationWorkspace } : {}),
+    ...(typeof raw.drafts === 'string' && raw.drafts ? { drafts: raw.drafts } : {}),
+    ...(typeof raw.followUp === 'boolean' ? { followUp: raw.followUp } : {}) }
 }
 
 const needGitea = (ctx: CatalogContext): Gitea => {
@@ -120,7 +124,7 @@ export interface CatalogChange { path: string; text: string | null } // null: re
 // that loses a race is tried once more on Gitea's new head; `check` runs on
 // the fresh clone before each try and may refuse. Changes may be computed from
 // the fresh clone.
-async function commitChanges(ctx: CatalogContext, s: CatalogSetting, changes: CatalogChange[] | ((dir: string) => Promise<CatalogChange[]>), author: string, message: string | (() => string), check?: (dir: string) => Promise<void>): Promise<{ commit: string; changed: boolean }> {
+async function commitChanges(ctx: CatalogContext, s: CatalogSetting, changes: CatalogChange[] | ((dir: string) => Promise<CatalogChange[]>), author: string, message: string | (() => string), check?: (dir: string) => Promise<void>, after?: (dir: string) => Promise<void>): Promise<{ commit: string; changed: boolean }> {
   if (!author.trim()) throw new RequestError(400, 'a change to the catalog needs its author: the person or agent whose words it holds (--author)')
   const g = needGitea(ctx)
   const dir = checkoutDir(ctx.area)
@@ -134,6 +138,8 @@ async function commitChanges(ctx: CatalogContext, s: CatalogSetting, changes: Ca
         else { await mkdir(dirname(file), { recursive: true }); await writeFile(file, c.text) }
       }
       await gitOk(dir, ['add', '-A'])
+      // after: a check of the changed tree; a refusal leaves the clone as it was.
+      if (after) try { await after(dir) } catch (e) { await git(dir, ['reset', '-q', '--hard', 'HEAD']); await git(dir, ['clean', '-qfd']); throw e }
       if ((await git(dir, ['diff', '--cached', '--quiet'])).code === 0) return { commit: (await gitOk(dir, ['rev-parse', 'HEAD'])).trim(), changed: false }
       await gitOk(dir, ['commit', '-q', '--author', authorLine(author.trim()), '-m', typeof message === 'function' ? message() : message], { config: { 'user.name': 'agdev', 'user.email': 'agdev@agdev.invalid' } })
       const p = await git(dir, ['push', '-q', '--', g.cloneUrl(s.repository.owner, s.repository.name), `HEAD:refs/heads/${s.branch}`], { env: await wrap(() => g.gitEnv()), timeoutMs: 120_000 })
@@ -181,6 +187,11 @@ export interface BraindumpInfo {
   review: ReviewInfo | null
   // Derived from Git: the braindump's newest change is newer than its review's.
   changedAfterReview: boolean
+  // user_catalog p6 ex1: optional tags (metadata.yaml beside it). The body's
+  // last change is `updated`; the metadata's is its own fact. A tag change does
+  // not make the review stale: tags do not change what became real.
+  tags: string[]
+  metadata: { path: string; updated: Change | null; problem?: string } | null
 }
 // A preference (user_catalog p3): preferences/<name>.md, how the owner wants work done.
 export interface PreferenceInfo { name: string; path: string; title: string; text: string; updated: Change | null; published: boolean }
@@ -215,8 +226,9 @@ async function lastChange(dir: string, path: string): Promise<Change | null> {
 }
 
 // The newest commit that changed what a directory says (not one that only moved files).
+// Tags (metadata.yaml) are left out: they do not change what is or is not real (user_catalog p6 ex1).
 async function lastChangeUnder(dir: string, under: string): Promise<Change | null> {
-  const r = await git(dir, ['log', '-1', '-M100%', '--diff-filter=AMD', '--format=%H%x09%aI%x09%an', '--', under])
+  const r = await git(dir, ['log', '-1', '-M100%', '--diff-filter=AMD', '--format=%H%x09%aI%x09%an', '--', under, `:(exclude,glob)${under}/**/${METADATA_FILE}`])
   const [commit, at, author] = r.stdout.trim().split('\n')[0].split('\t')
   return commit ? { commit, at, author } : null
 }
@@ -277,7 +289,10 @@ async function readBraindump(dir: string, id: string, withText: boolean, publish
   const review: ReviewInfo | null = rt === null ? null : { path: reviewPath(id), ...(withText ? { text: rt } : {}), updated: await lastChange(dir, reviewPath(id)), published: published.has(reviewPath(id)) }
   const changedAfterReview = !!(updated && review?.updated && updated.commit !== review.updated.commit
     && (await git(dir, ['merge-base', '--is-ancestor', review.updated.commit, updated.commit])).code === 0)
-  return { id, path, title: braindumpTitle(id, text), excerpt: braindumpExcerpt(text), ...(withText ? { text } : {}), updated, published: published.has(path), review, changedAfterReview }
+  const mt = await readTextOrNull(join(dir, metadataPath(id)))
+  const md = readBraindumpMetadata(mt)
+  const metadata = mt === null ? null : { path: metadataPath(id), updated: await lastChange(dir, metadataPath(id)), ...(md.problem ? { problem: md.problem } : {}) }
+  return { id, path, title: braindumpTitle(id, text), excerpt: braindumpExcerpt(text), ...(withText ? { text } : {}), updated, published: published.has(path), review, changedAfterReview, tags: md.tags, metadata }
 }
 
 // Every preferences/<name>.md, sorted by name. They are few and short, and
@@ -338,7 +353,21 @@ export interface CatalogView {
   title: string
   person: string | null
   // cited (user_catalog p4): how many times it was cited by a message or a request here.
-  braindumps: (BraindumpInfo & { projects: string[]; cited: number })[]
+  // openProposals (user_catalog p6 ex2): the open proposals that can be applied, one line each on the card.
+  // uncovered, rule (user_catalog p7): what the last link suggestion says no project serves; what an adopted rule says about it.
+  braindumps: (BraindumpInfo & { projects: string[]; cited: number; proposals: number; openProposals: { id: string; by: string; changes: { op: 'add' | 'remove'; tag: string }[] }[]; uncovered?: string; rule?: { never?: string; suggest?: string; selected: boolean } })[]
+  // user_catalog p7: asked texts (null when the drafts folder is not there), the link suggestion, the adopted rules.
+  asked: import('./catalogDrafts.ts').AskedLine[] | null
+  links: import('./catalogLinks.ts').LinksView
+  rules: import('./catalogRules.ts').RuleView[]
+  publicationCheck: import('./catalogRules.ts').PublicationCheck | null
+  // user_catalog p8: what the owner's words make of each project, and the default licence; what waits for the owner (one list, its count).
+  disclosure: import('./catalogRules.ts').Disclosure | null
+  waiting: WaitingView
+  // user_catalog p8: the published part in one line each: last publication, and whether the public list changed since.
+  publication: { workspace: string | null; last: { publicCommit: string; sourceRev: string; at: string } | null; changedSince: boolean; destination: string } | null
+  // user_catalog p6 ex2: what the follow-up is doing (server/catalogFollowUp.ts).
+  followUp: import('./catalogFollowUp.ts').FollowUpView
   preferences: PreferenceInfo[]
   projects: ProjectGround[]
   plans: { name: string; intent: string; entries: number; problem?: string; errors: number; warnings: number }[]
@@ -348,6 +377,10 @@ export interface CatalogView {
   issues: { where: string; issue: Issue }[]
   problems: string[]
 }
+
+// user_catalog p8 decision 17: everything that waits for the owner, at the top of the page; the count is on the navigation.
+export interface WaitingItem { kind: 'answer' | 'links' | 'disclosure' | 'licence' | 'publisher' | 'publication'; title: string; detail?: string; href?: string; ask?: { draft: string; id: string }; n?: number | 'licence' }
+export interface WaitingView { count: number; items: WaitingItem[] }
 
 // The owner's challenges as the Catalog page lists them; the challenge pages
 // and api/challenges are where a challenge is read and written.
@@ -390,6 +423,62 @@ export function relate(snap: CatalogSnapshot, reg: Known): { braindumps: (Braind
   return { braindumps, projects }
 }
 
+// The last publication of the catalog (its journal) and whether a selected file changed since.
+async function publicationBrief(ctx: CatalogContext, snap: CatalogSnapshot): Promise<CatalogView['publication']> {
+  const ws = snap.setting.publicationWorkspace ?? null
+  const dir = checkoutDir(ctx.area)
+  const p = await withLock(settingFile(ctx.area), () => readPublished(dir), { what: 'the catalog' })
+  if (!p.contract) return null
+  let last: NonNullable<CatalogView['publication']>['last'] = null
+  if (ws) try {
+    const j = JSON.parse((await readTextOrNull(join(ws, '.agdev', 'publication', 'github.json'))) ?? 'null') as { repositories?: Record<string, { publications?: { status?: string; public_commit?: string; source_rev?: string; published_at?: string }[] }> } | null
+    const l = Object.values(j?.repositories ?? {}).flatMap(r => r.publications ?? []).filter(x => x.status === 'published' && x.public_commit).sort((a, b) => (a.published_at ?? '').localeCompare(b.published_at ?? '')).at(-1)
+    if (l) last = { publicCommit: l.public_commit!, sourceRev: l.source_rev ?? '', at: l.published_at ?? '' }
+  } catch { /* no journal */ }
+  let changedSince = !last
+  if (last?.sourceRev) changedSince = await withLock(settingFile(ctx.area), async () => {
+    const d = await git(dir, ['diff', '--name-only', last!.sourceRev, 'HEAD'])
+    if (d.code !== 0) return true
+    return d.stdout.split('\n').filter(Boolean).some(f => p.paths.has(f) || f.startsWith('publication/'))
+  }, { what: 'the catalog' })
+  return { workspace: ws, last, changedSince, destination: p.destination }
+}
+
+async function waitingView(ctx: CatalogContext, o: { asked: import('./catalogDrafts.ts').AskedLine[] | null; links: import('./catalogLinks.ts').LinksView; disclosure: import('./catalogRules.ts').Disclosure | null; pub: CatalogView['publication'] }): Promise<WaitingView> {
+  const items: WaitingItem[] = []
+  for (const a of o.asked ?? []) {
+    const open = a.actions.filter(x => x.state === 'proposed').length
+    if (a.state === 'written' && (open || !a.actions.length)) items.push({ kind: 'answer', title: a.title, detail: open ? `${open} action${open === 1 ? '' : 's'} wait for Do it / No` : 'the summoner answered', ask: { draft: a.draft, id: a.id }, ...(a.run ? { href: a.run.href } : {}) })
+  }
+  const s = o.links.suggestion
+  if (s?.open) items.push({ kind: 'links', title: `${s.open} suggested link${s.open === 1 ? '' : 's'}`, detail: 'OK / No under Braindumps and projects' })
+  for (const x of s?.disclosure ?? []) if (x.state === 'suggested') items.push({ kind: 'disclosure', n: x.n, title: x.follows === 'never-publish' ? `${x.project}: stated private` : `${x.project}: stated public`, detail: `from ${x.braindump}: “${x.quote}”${x.follows === 'never-publish' ? ' — kept private from now on unless you answer No' : ' — nothing follows until you answer OK'}` })
+  if (s?.licence?.state === 'suggested') items.push({ kind: 'licence', n: 'licence', title: `Default licence ${s.licence.licence}`, detail: `from ${s.licence.braindump}: “${s.licence.quote}”` })
+  if (o.pub?.changedSince) items.push({ kind: 'publication', title: 'The public list changed since the last publication', detail: o.pub.last ? `last published from ${o.pub.last.sourceRev.slice(0, 7)} at ${o.pub.last.at.slice(0, 10)}` : 'not published yet' })
+  // A publisher run that waits on a question: its focus card is where it is answered.
+  try {
+    const reg = await loadRegistry(ctx.registryFile)
+    const w = reg.workspaces.find(x => x.project === 'publisher') ?? reg.workspaces.find(x => x.id === 'publisher')
+    if (w) {
+      const { listRuns } = await import('./runs.ts')
+      const { Workspace } = await import('./workspace.ts')
+      for (const r of await listRuns(new Workspace(w as never), 'publish')) if (r.waiting?.length && r.execution !== 'completed') items.push({ kind: 'publisher', title: `The publisher asks (${r.ref})`, detail: r.title ?? '', href: `#/ws/${encodeURIComponent(w.id)}/run/${encodeURIComponent(r.workflow)}/${encodeURIComponent(r.run)}` })
+    }
+  } catch { /* the publisher's runs cannot be read: not listed */ }
+  return { count: items.length, items }
+}
+
+// The count alone, for the navigation (user_catalog p8 decision 17); no catalog: 0.
+export async function waitingCount(ctx: CatalogContext): Promise<{ count: number }> {
+  if (!await loadCatalogSetting(ctx.area)) return { count: 0 }
+  const snap = await catalogSnapshot(ctx)
+  const asked = await (await import('./catalogDrafts.ts')).listAsked(ctx).catch(() => null)
+  const links = await (await import('./catalogLinks.ts')).linksView(ctx, snap)
+  const disclosure = await (await import('./catalogRules.ts')).disclosure(ctx).catch(() => null)
+  const pub = snap.published.size ? await publicationBrief(ctx, snap).catch(() => null) : null
+  return { count: (await waitingView(ctx, { asked, links, disclosure, pub })).count }
+}
+
 export async function catalogView(ctx: CatalogContext, o: { maxAgeMs?: number } = {}): Promise<CatalogView | { configured: false; reason: string }> {
   if (!await loadCatalogSetting(ctx.area)) return { configured: false, reason: `no catalog is attached (no ${CATALOG_SETTING}); run wfe catalog init` }
   // Excerpts only: a braindump's text and review are read when it is opened (braindump()).
@@ -406,11 +495,25 @@ export async function catalogView(ctx: CatalogContext, o: { maxAgeMs?: number } 
     ...snap.plans.flatMap(p => p.issues.map(issue => ({ where: p.path, issue }))),
   ]
   const cited = citationCounts(ctx.area)
+  const open = new Map<string, { id: string; by: string; changes: { op: 'add' | 'remove'; tag: string }[] }[]>()
+  for (const p of await tagProposals(ctx, { snap })) if (!p.stale) open.set(p.braindump, [...(open.get(p.braindump) ?? []), { id: p.id, by: p.by, changes: p.changes.map(c => ({ op: c.op, tag: c.tag })) }])
+  const linksView = await (await import('./catalogLinks.ts')).linksView(ctx, snap)
+  const rm = await import('./catalogRules.ts')
+  const ruleList = await rm.rules(ctx).catch(e => { problems.push(`rules.yaml: ${(e as Error).message}`); return { rules: [] as import('./catalogRules.ts').RuleView[], problem: undefined as string | undefined } })
+  if (ruleList.problem) problems.push(`rules.yaml cannot be read (${ruleList.problem}): no rule is in force until it is corrected`)
+  const check = ruleList.rules.length ? await rm.publicationCheck(ctx).catch(() => null) : null
+  const asked = await (await import('./catalogDrafts.ts')).listAsked(ctx).catch(() => null)
+  const uncovered = new Map((linksView.suggestion?.uncovered ?? []).map(u => [u.braindump, u.why || 'no project serves this']))
+  const disclosure = await rm.disclosure(ctx).catch(e => { problems.push(`disclosure: ${(e as Error).message}`); return null })
+  const pub = snap.published.size ? await publicationBrief(ctx, snap).catch(() => null) : null
+  const waiting = await waitingView(ctx, { asked, links: linksView, disclosure, pub })
   return {
     configured: true,
     repository: `${snap.setting.repository.owner}/${snap.setting.repository.name}`, web: snap.web, branch: snap.setting.branch, head: snap.head, plan: snap.setting.plan,
     title: snap.catalog.doc?.title ?? '', person: await personOf(ctx.area),
-    ...(r => ({ projects: r.projects, braindumps: r.braindumps.map(b => ({ ...b, cited: cited.get(b.id) ?? 0 })) }))(relate(snap, reg)),
+    ...(r => ({ projects: r.projects, braindumps: r.braindumps.map(b => ({ ...b, cited: cited.get(b.id) ?? 0, proposals: open.get(b.id)?.length ?? 0, openProposals: open.get(b.id) ?? [], ...(uncovered.has(b.id) && !b.projects.length ? { uncovered: uncovered.get(b.id)! } : {}), ...(check?.braindumps[b.id] ? { rule: check.braindumps[b.id] } : {}) })) }))(relate(snap, reg)),
+    asked, links: linksView, rules: ruleList.rules, publicationCheck: check, disclosure, waiting, publication: pub,
+    followUp: await (await import('./catalogFollowUp.ts')).followUpView(ctx.area),
     preferences: snap.preferences,
     plans: snap.plans.map(p => ({ name: p.name, intent: p.plan?.intent ?? '', entries: p.plan?.entries.length ?? 0, ...(p.problem ? { problem: p.problem } : {}), errors: p.issues.filter(i => i.severity === 'error').length, warnings: p.issues.filter(i => i.severity === 'warning').length })),
     index: snap.index, archived: snap.archived, challenges: await challengesBrief(ctx, snap.setting, snap.published),
@@ -438,7 +541,8 @@ export async function braindump(ctx: CatalogContext, id: string) {
   const reg = await loadRegistry(ctx.registryFile)
   const projects = relate(snap, reg).braindumps.find(x => x.id === id)?.projects ?? []
   const plans = snap.plans.filter(p => p.plan?.entries.some(e => e.because.includes(b.path))).map(p => p.name)
-  return { ...b, head: snap.head, web: `${snap.web}/src/branch/${snap.setting.branch}/${b.path}`, history: await historyOf(checkoutDir(ctx.area), b.path), projects, plans, citedBy: await citedBy(ctx, id) }
+  return { ...b, head: snap.head, web: `${snap.web}/src/branch/${snap.setting.branch}/${b.path}`, history: await historyOf(checkoutDir(ctx.area), b.path), projects, plans, citedBy: await citedBy(ctx, id),
+    proposals: await tagProposals(ctx, { id, snap }) }
 }
 
 // ---- citing a braindump (user_catalog p4) ------------------------------------------
@@ -516,6 +620,7 @@ export async function citedText(ctx: CatalogContext, ref: BraindumpAttachmentRef
     const written = await log(path)
     const review = await showAt(dir, ref.commit, reviewPath(ref.id))
     const reviewed = review === null ? null : await log(reviewPath(ref.id))
+    const tags = readBraindumpMetadata(await showAt(dir, ref.commit, metadataPath(ref.id))).tags
     const pt = s.plan ? await showAt(dir, ref.commit, summonplanPath(s.plan)) : null
     const pp = pt === null ? null : parseSummonplan(pt)
     const projects = pp?.ok ? pp.model.entries.filter(e => e.because.includes(path)).map(e => e.project) : []
@@ -527,6 +632,7 @@ export async function citedText(ctx: CatalogContext, ref: BraindumpAttachmentRef
       `A later edit never changes this file. The present text: \`wfe catalog braindump show ${ref.id}\`.`, '',
       `- Path: \`${path}\`${written ? `; last changed by ${written.author}, ${written.at.slice(0, 10)} (${written.commit.slice(0, 12)})` : ''}`,
       `- Projects this installation's plan${s.plan ? ` (${s.plan})` : ''} grounded on it then: ${projects.length ? projects.join(', ') : 'none'}`,
+      ...(tags.length ? [`- Tags then (the owner's optional labels, ${METADATA_FILE}; they ask for nothing by themselves): ${tags.join(', ')}`] : []),
       `- Review: ${reviewed ? `by ${reviewed.author}, ${reviewed.at.slice(0, 10)} (${reviewed.commit.slice(0, 12)}); below` : review !== null ? 'below' : 'none existed at this commit'}`, '',
       '---', '', '## The braindump', '', text.trimEnd(), '',
       ...(review !== null ? ['---', '', `## Its review${reviewed ? ` (${reviewed.author}, ${reviewed.at.slice(0, 10)})` : ''}`, '', 'A review is free text about the braindump: what of it became real, where, what did not.', '', review.trimEnd(), ''] : []),
@@ -580,17 +686,33 @@ async function refuseIfChangedSince(dir: string, path: string, base: string | un
 }
 
 export type BraindumpOp = 'add' | 'edit' | 'remove'
-export async function changeBraindump(ctx: CatalogContext, o: { op: BraindumpOp; id: string; text?: string; author: string; base?: string; message?: string; force?: boolean }) {
+// user_catalog p6 ex2: tags written in the text are the braindump's tags
+// (shared/catalog.ts textTags): on every commit of a body, what the new text
+// writes is added and what the old text wrote and the new one does not is
+// removed, in the same commit; tags set otherwise stay. The text is kept as typed.
+export async function changeBraindump(ctx: CatalogContext, o: { op: BraindumpOp; id: string; text?: string; author: string; base?: string; message?: string; force?: boolean; tags?: string[]; trailer?: string }) {
   const s = await needSetting(ctx)
   needId(o.id)
   const path = braindumpPath(o.id)
   if (o.op !== 'remove' && (typeof o.text !== 'string' || !o.text.trim())) throw new RequestError(400, 'a braindump needs its text')
   const text = o.op === 'remove' ? null : o.text!.endsWith('\n') ? o.text! : `${o.text}\n`
-  // Removing a braindump removes its review with it; other files of the folder are the owner's and stay.
-  const changes: CatalogChange[] = [{ path, text }, ...(o.op === 'remove' ? [{ path: reviewPath(o.id), text: null }] : [])]
-  const r = await commitChanges(ctx, s, changes, o.author, o.message?.trim() || `${o.op === 'add' ? 'Add' : o.op === 'edit' ? 'Edit' : 'Remove'} braindump ${o.id}`, async dir => {
+  const given = o.op === 'add' && o.tags?.length ? needTags(o.tags) : []
+  let tagNote = ''
+  // Removing a braindump removes its review and its metadata with it; other files of the folder are the owner's and stay.
+  const changes = async (dir: string): Promise<CatalogChange[]> => {
+    if (o.op === 'remove') return [{ path, text }, { path: reviewPath(o.id), text: null }, { path: metadataPath(o.id), text: null }]
+    const meta = o.op === 'add' ? null : await readTextOrNull(join(dir, metadataPath(o.id)))
+    const present = o.op === 'add' ? given : readBraindumpMetadata(meta).tags
+    const next = needTags(tagsAfterText(present, o.op === 'add' ? null : await readTextOrNull(join(dir, path)), text!))
+    const before = o.op === 'add' ? [] : present
+    const add = next.filter(t => !before.some(b => sameTag(b, t))), rm = before.filter(t => !next.some(n => sameTag(n, t)))
+    tagNote = add.length || rm.length ? tagWords(add, rm) : ''
+    return [{ path, text }, ...(add.length || rm.length ? [{ path: metadataPath(o.id), text: next.length || meta !== null ? writeBraindumpMetadata(meta, next) : null }] : [])]
+  }
+  const r = await commitChanges(ctx, s, changes, o.author, () => [o.message?.trim() || `${o.op === 'add' ? 'Add' : o.op === 'edit' ? 'Edit' : 'Remove'} braindump ${o.id}`,
+    ...(tagNote ? ['', `Tags from the text: ${tagNote}`] : []), ...(o.trailer ? ['', o.trailer] : [])].join('\n'), async dir => {
     const present = await exists(join(dir, path))
-    if (o.op === 'add' && present) throw new RequestError(409, `braindump "${o.id}" already exists; edit it instead`)
+    if (o.op === 'add' && present) throw new RequestError(409, `braindump "${o.id}" already exists; edit it instead`, { code: 'taken' })
     if (o.op !== 'add' && !present) throw new RequestError(404, `no braindump "${o.id}"`)
     if (o.op !== 'add') await refuseIfChangedSince(dir, path, o.base, `braindump "${o.id}"`)
     if (o.op === 'remove' && !o.force) {
@@ -602,7 +724,265 @@ export async function changeBraindump(ctx: CatalogContext, o: { op: BraindumpOp;
       if (users.length) throw new RequestError(409, `braindump "${o.id}" grounds entries of ${users.join(', ')}; remove it from their because lists first, or remove it anyway (--force; the plans then name a braindump that only their grounds commit holds)`)
     }
   })
-  return { ok: true, message: r.changed ? `${o.op === 'add' ? 'Added' : o.op === 'edit' ? 'Changed' : 'Removed'} braindump ${o.id} (${r.commit.slice(0, 7)}).` : `Braindump ${o.id} is unchanged.`, commit: r.commit, changed: r.changed, path }
+  if (r.changed) await noteFollowUp(ctx.area, o.op === 'remove' ? { drop: o.id, index: true, by: o.author.trim() } : { review: o.id, by: o.author.trim() })
+  return { ok: true, message: r.changed ? `${o.op === 'add' ? 'Added' : o.op === 'edit' ? 'Changed' : 'Removed'} braindump ${o.id} (${r.commit.slice(0, 7)})${tagNote ? `; tags from the text: ${tagNote}` : ''}.` : `Braindump ${o.id} is unchanged.`, commit: r.commit, changed: r.changed, path }
+}
+
+// user_catalog p6 ex2: the path the service gives a new braindump (decision 3
+// of the plan): the name from its first line, never one that is taken or that
+// any braindumps/archive/*/ held; then -2, -3, …
+export async function freePath(ctx: CatalogContext, text: string): Promise<string> {
+  const base = nameFromText(text)
+  const snap = await catalogSnapshot(ctx, { maxAgeMs: 0 })
+  const taken = (p: string) => snap.braindumps.some(b => b.id === p || b.id.startsWith(`${p}/`))
+  for (let n = 1; n < 1000; n++) {
+    const p = n === 1 ? base : `${base}-${n}`
+    if (!taken(p) && !(await archivedAt(ctx, p)).length) return p
+  }
+  throw new RequestError(409, `no free path near ${base}`)
+}
+
+// user_catalog p6 ex2: renaming a braindump. The files directly in its folder
+// move (folders below it are other braindumps or the owner's, and stay); every
+// because naming it names the new path; one commit. What cited the old path
+// shows it removed, as after an archive.
+export async function moveBraindump(ctx: CatalogContext, o: { from: string; to: string; author: string; reuseArchived?: boolean }) {
+  const s = await needSetting(ctx)
+  needId(o.from); needId(o.to)
+  if (o.from === o.to) throw new RequestError(400, 'the new path is the present one')
+  if (o.to.startsWith(`${o.from}/`)) throw new RequestError(400, `${o.to} is inside ${o.from}: choose a path outside it`)
+  if (!o.reuseArchived) {
+    const archived = await archivedAt(ctx, o.to)
+    if (archived.length) throw new RequestError(409, `${archived.join(', ')} held a braindump at ${o.to}: a braindump there takes that old identity. Choose another path (or --reuse-archived if it is the same braindump)`, { code: 'archived-path', archived })
+  }
+  const fromPath = braindumpPath(o.from), toPath = braindumpPath(o.to)
+  let moved: string[] = [], stayed: string[] = [], because: { file: string; entry: string }[] = []
+  const r = await commitChanges(ctx, s, async dir => {
+    const src = join(dir, EPISODES_DIR, o.from)
+    const entries = await readdir(src, { withFileTypes: true })
+    moved = entries.filter(e => e.isFile()).map(e => e.name).sort()
+    stayed = entries.filter(e => e.isDirectory()).map(e => e.name).sort()
+    const out: CatalogChange[] = []
+    for (const f of moved) out.push({ path: `${EPISODES_DIR}/${o.from}/${f}`, text: null }, { path: `${EPISODES_DIR}/${o.to}/${f}`, text: (await readTextOrNull(join(src, f))) ?? '' })
+    because = []
+    const rewrite = async (file: string, key: 'entries' | 'projects') => {
+      const t = await readTextOrNull(join(dir, file))
+      if (t === null) return
+      const x = renameBecause(t, key, fromPath, toPath)
+      if (!x) { if (t.includes(fromPath)) throw new RequestError(409, `${file} cannot be read as YAML and names ${fromPath}: nothing was moved`); return }
+      if (x.changed.length) { out.push({ path: file, text: x.text }); for (const c of x.changed) because.push({ file, entry: c.entry }) }
+    }
+    for (const f of (await readdir(join(dir, SUMMONPLAN_DIR)).catch(() => [] as string[])).filter(f => f.endsWith('.yaml')).sort()) await rewrite(`${SUMMONPLAN_DIR}/${f}`, 'entries')
+    await rewrite(PROJECTS_PATH, 'projects')
+    return out
+  }, o.author, () => [`Rename braindump ${o.from} to ${o.to}`, '', `Moved ${moved.join(', ')}${because.length ? `; because rewritten in ${because.map(b => `${b.file} (${b.entry})`).join(', ')}` : ''}.`].join('\n'), async dir => {
+    if (!await exists(join(dir, fromPath))) throw new RequestError(404, `no braindump "${o.from}"`)
+    const there = (await readdir(join(dir, EPISODES_DIR, o.to), { withFileTypes: true }).catch(() => [])).filter(e => e.isFile())
+    if (there.length) throw new RequestError(409, `the path "${o.to}" holds ${there.map(e => e.name).join(', ')}: choose another path`, { code: 'taken' })
+  })
+  await noteFollowUp(ctx.area, { rename: { from: o.from, to: o.to }, index: true, by: o.author.trim() })
+  return { ok: true, message: `Renamed braindump ${o.from} to ${o.to} (${r.commit.slice(0, 7)}): moved ${moved.join(', ')}${because.length ? `; because rewritten for ${because.map(b => b.entry).join(', ')}` : ''}${stayed.length ? `; folders below it stayed: ${stayed.join(', ')}` : ''}. What cited ${o.from} shows it removed.`, commit: r.commit, from: o.from, to: o.to, moved, because, stayed }
+}
+
+// ---- tags (user_catalog p6 ex1) ------------------------------------------------------
+//
+// A braindump's optional tags are metadata.yaml beside it. Setting them is one
+// commit of that file only: the body is not touched and its last change stays
+// what it was. Tags are never required and never refused for what they mean.
+const needTags = (raw: string[]) => {
+  const n = normalizeTags(raw)
+  if (n.problems.length) throw new RequestError(400, `tags: ${n.problems.join('; ')}`)
+  return n.tags
+}
+// base for metadata: the metadata's last commit read, or "none" when it had no metadata.
+async function refuseIfMetadataChanged(dir: string, id: string, base: string | undefined) {
+  if (!base) return
+  const last = await lastChange(dir, metadataPath(id))
+  if (base === 'none') { if (last && await exists(join(dir, metadataPath(id)))) throw new RequestError(409, `the tags of "${id}" were set since you read them (by ${last.author} at ${last.at}, ${last.commit.slice(0, 7)}); read them again`, { code: 'stale' }); return }
+  await refuseIfChangedSince(dir, metadataPath(id), base, `the tags of "${id}"`)
+}
+const tagWords = (add: string[], remove: string[]) => [...add.map(t => `+${t}`), ...remove.map(t => `-${t}`)].join(' ')
+
+export async function setTags(ctx: CatalogContext, o: { id: string; tags?: string[]; add?: string[]; remove?: string[]; author: string; base?: string; message?: string; trailer?: string }) {
+  const s = await needSetting(ctx)
+  needId(o.id)
+  if (!o.tags && !o.add?.length && !o.remove?.length) throw new RequestError(400, 'give the tags (tags), or tags to add or remove')
+  const path = metadataPath(o.id)
+  let before: string[] = [], after: string[] = []
+  const r = await commitChanges(ctx, s, async dir => {
+    const cur = await readTextOrNull(join(dir, path))
+    before = readBraindumpMetadata(cur).tags
+    let next = o.tags ? needTags(o.tags) : [...before]
+    for (const t of o.add?.length ? needTags(o.add) : []) if (!next.some(x => sameTag(x, t))) next.push(t)
+    for (const t of o.remove ?? []) next = next.filter(x => !sameTag(x, t.replace(/^#+/, '').trim()))
+    after = needTags(next)
+    return [{ path, text: writeBraindumpMetadata(cur, after) }]
+  }, o.author, () => {
+    const add = after.filter(t => !before.some(b => sameTag(b, t))), rm = before.filter(t => !after.some(a => sameTag(a, t)))
+    return [o.message?.trim() || `Tags of braindump ${o.id}: ${tagWords(add, rm) || 'reordered'}`, ...(o.trailer ? ['', o.trailer] : [])].join('\n')
+  }, async dir => {
+    if (!await exists(join(dir, braindumpPath(o.id)))) throw new RequestError(404, `no braindump "${o.id}"`)
+    await refuseIfMetadataChanged(dir, o.id, o.base)
+  })
+  return { ok: true, message: r.changed ? `Tags of ${o.id}: ${after.join(', ') || 'none'} (${r.commit.slice(0, 7)}).` : `The tags of ${o.id} are unchanged.`, commit: r.commit, changed: r.changed, path, tags: after, before }
+}
+
+// ---- tag proposals ------------------------------------------------------------------
+//
+// An agent (or a person) proposes tags to add or remove, each with its reason,
+// against the versions it read: the body's and the metadata's last commits. A
+// proposal is not metadata: it is kept outside Git, in the service's area
+// (<area>/.local/catalog-proposals/<id>.json), and changes nothing until the
+// owner accepts chosen changes of it, which is one catalog commit in the
+// owner's name naming the proposal and its proposer. When the braindump or its
+// tags changed after the proposal, it is stale: shown, never applied.
+export interface TagChange { op: 'add' | 'remove'; tag: string; reason: string }
+export interface TagProposal {
+  schema: 'ag.catalog-tag-proposal.v1'
+  id: string; braindump: string; changes: TagChange[]; by: string; at: string; run?: string; note?: string
+  base: { body: string | null; metadata: string | null; head: string }
+  state: 'open' | 'applied' | 'dismissed'
+  decided?: { by: string; at: string; accepted: TagChange[]; commit?: string }
+}
+export type TagProposalView = TagProposal & { stale: boolean; staleReason?: string }
+const proposalDir = (area: string) => join(area, '.local', 'catalog-proposals')
+const PROPOSAL_ID = /^tp-[0-9]{8}-[0-9a-f]{8}$/
+const newId = (prefix: string) => `${prefix}-${localDate().replace(/-/g, '')}-${randomBytes(4).toString('hex')}`
+
+async function readProposal(area: string, id: string): Promise<TagProposal> {
+  if (!PROPOSAL_ID.test(id)) throw new RequestError(400, `"${id}" is not a tag proposal id`)
+  const t = await readTextOrNull(join(proposalDir(area), `${id}.json`))
+  if (t === null) throw new RequestError(404, `no tag proposal ${id}`)
+  return JSON.parse(t) as TagProposal
+}
+async function listProposals(area: string): Promise<TagProposal[]> {
+  const out: TagProposal[] = []
+  for (const f of (await readdir(proposalDir(area)).catch(() => [] as string[])).filter(f => f.endsWith('.json')).sort()) {
+    try { out.push(JSON.parse((await readTextOrNull(join(proposalDir(area), f))) ?? 'null') as TagProposal) } catch { /* a broken file is not a proposal */ }
+  }
+  return out.filter(p => p && p.schema === 'ag.catalog-tag-proposal.v1')
+}
+const staleness = (p: TagProposal, b: BraindumpInfo | undefined): { stale: boolean; staleReason?: string } => {
+  if (!b) return { stale: true, staleReason: 'the braindump is no longer in the catalog' }
+  if ((b.updated?.commit ?? null) !== p.base.body) return { stale: true, staleReason: `the braindump's text changed after the proposal (${b.updated?.commit.slice(0, 7) ?? 'none'})` }
+  const m = b.metadata?.updated?.commit ?? null
+  if (m !== p.base.metadata && !(m === null && !b.metadata)) return { stale: true, staleReason: `its tags changed after the proposal (${m?.slice(0, 7) ?? 'none'})` }
+  if (p.base.metadata !== null && !b.metadata) return { stale: true, staleReason: 'its tags were removed after the proposal' }
+  return { stale: false }
+}
+
+export async function proposeTags(ctx: CatalogContext, o: { id: string; changes: { op?: string; tag?: string; reason?: string }[]; by: string; run?: string; note?: string; base?: string }) {
+  needId(o.id)
+  if (!o.by.trim()) throw new RequestError(400, 'a proposal needs its proposer (--author)')
+  if (!Array.isArray(o.changes) || !o.changes.length) throw new RequestError(400, 'a proposal needs at least one change: {"op": "add"|"remove", "tag", "reason"}')
+  if (o.changes.length > 32) throw new RequestError(400, 'at most 32 changes in one proposal')
+  const changes: TagChange[] = o.changes.map((c, i) => {
+    if (c.op !== 'add' && c.op !== 'remove') throw new RequestError(400, `change ${i + 1}: op is "add" or "remove"`)
+    const n = normalizeTag(String(c.tag ?? ''))
+    if ('problem' in n) throw new RequestError(400, `change ${i + 1}: ${n.problem}`)
+    const reason = String(c.reason ?? '').trim()
+    if (!reason) throw new RequestError(400, `change ${i + 1} (${n.tag}): give the reason, from the braindump's text`)
+    return { op: c.op, tag: n.tag, reason: reason.slice(0, 2000) }
+  })
+  const snap = await catalogSnapshot(ctx, { maxAgeMs: 0 })
+  const b = snap.braindumps.find(x => x.id === o.id)
+  if (!b) throw new RequestError(404, `no braindump "${o.id}"`)
+  if (o.base && b.updated && !b.updated.commit.startsWith(o.base) && o.base !== snap.head) throw new RequestError(409, `braindump "${o.id}" changed since ${o.base.slice(0, 7)} (now ${b.updated.commit.slice(0, 7)}); read it again before proposing`, { code: 'stale' })
+  const p: TagProposal = { schema: 'ag.catalog-tag-proposal.v1', id: newId('tp'), braindump: o.id, changes, by: o.by.trim(), at: new Date().toISOString(),
+    ...(o.run ? { run: o.run } : {}), ...(o.note?.trim() ? { note: o.note.trim().slice(0, 2000) } : {}),
+    base: { body: b.updated?.commit ?? null, metadata: b.metadata?.updated?.commit ?? null, head: snap.head }, state: 'open' }
+  await mkdir(proposalDir(ctx.area), { recursive: true })
+  await atomicWrite(join(proposalDir(ctx.area), `${p.id}.json`), `${JSON.stringify(p, null, 1)}\n`)
+  return { ok: true, message: `Proposed for ${o.id}: ${tagWords(changes.filter(c => c.op === 'add').map(c => c.tag), changes.filter(c => c.op === 'remove').map(c => c.tag))} (proposal ${p.id}). Nothing is changed until the owner accepts.`, proposal: p }
+}
+
+export async function tagProposals(ctx: CatalogContext, o: { id?: string; all?: boolean; snap?: CatalogSnapshot } = {}): Promise<TagProposalView[]> {
+  const list = (await listProposals(ctx.area)).filter(p => (!o.id || p.braindump === o.id) && (o.all || p.state === 'open'))
+  if (!list.length) return []
+  const snap = o.snap ?? await catalogSnapshot(ctx)
+  return list.map(p => ({ ...p, ...(p.state === 'open' ? staleness(p, snap.braindumps.find(b => b.id === p.braindump)) : { stale: false }) }))
+}
+
+// accept: the changes accepted, as "add:<tag>" / "remove:<tag>" (or the tag alone); the rest are declined.
+export async function decideTagProposal(ctx: CatalogContext, o: { proposal: string; accept?: string[]; dismiss?: boolean; author: string }) {
+  if (!o.author.trim()) throw new RequestError(400, 'deciding a proposal needs your name (--author)')
+  return withLock(join(proposalDir(ctx.area), o.proposal), async () => {
+    const p = await readProposal(ctx.area, o.proposal)
+    if (p.state !== 'open') throw new RequestError(409, `proposal ${p.id} was already ${p.state} (by ${p.decided?.by ?? '?'})`)
+    const write = (next: TagProposal) => atomicWrite(join(proposalDir(ctx.area), `${next.id}.json`), `${JSON.stringify(next, null, 1)}\n`)
+    if (o.dismiss) {
+      const next: TagProposal = { ...p, state: 'dismissed', decided: { by: o.author.trim(), at: new Date().toISOString(), accepted: [] } }
+      await write(next)
+      return { ok: true, message: `Dismissed proposal ${p.id}; the tags of ${p.braindump} are unchanged.`, proposal: next, commit: null as string | null }
+    }
+    const keys = new Set((o.accept ?? []).map(k => k.includes(':') ? k : `add:${k}`).map(k => k.toLowerCase()))
+    const accepted = p.changes.filter(c => keys.has(`${c.op}:${c.tag}`.toLowerCase()))
+    if (!accepted.length) throw new RequestError(400, `choose the changes to accept (${p.changes.map(c => `${c.op}:${c.tag}`).join(', ')}), or dismiss the proposal`)
+    const s = await needSetting(ctx)
+    const path = metadataPath(p.braindump)
+    let after: string[] = []
+    const r = await commitChanges(ctx, s, async dir => {
+      const cur = await readTextOrNull(join(dir, path))
+      let next = readBraindumpMetadata(cur).tags
+      for (const c of accepted) next = c.op === 'add' ? next.some(t => sameTag(t, c.tag)) ? next : [...next, c.tag] : next.filter(t => !sameTag(t, c.tag))
+      after = needTags(next)
+      return [{ path, text: writeBraindumpMetadata(cur, after) }]
+    }, o.author, () => [`Tags of braindump ${p.braindump}: ${tagWords(accepted.filter(c => c.op === 'add').map(c => c.tag), accepted.filter(c => c.op === 'remove').map(c => c.tag))}`, '',
+      `Proposed by ${p.by}${p.run ? ` (${p.run})` : ''}, proposal ${p.id}; accepted by ${o.author.trim()}${accepted.length < p.changes.length ? ` (${accepted.length} of ${p.changes.length} changes)` : ''}.`].join('\n'), async dir => {
+      if (!await exists(join(dir, braindumpPath(p.braindump)))) throw new RequestError(409, `braindump "${p.braindump}" is no longer in the catalog: the proposal cannot be applied`, { code: 'stale' })
+      const body = await lastChange(dir, braindumpPath(p.braindump))
+      if ((body?.commit ?? null) !== p.base.body) throw new RequestError(409, `braindump "${p.braindump}" changed after this proposal (${body?.commit.slice(0, 7)}): it is not applied; read the braindump again, set the tags yourself or ask for a new proposal`, { code: 'stale' })
+      await refuseIfMetadataChanged(dir, p.braindump, p.base.metadata ?? 'none').catch(e => { throw new RequestError(409, `the tags of "${p.braindump}" changed after this proposal: it is not applied (${(e as Error).message})`, { code: 'stale' }) })
+    })
+    const next: TagProposal = { ...p, state: 'applied', decided: { by: o.author.trim(), at: new Date().toISOString(), accepted, commit: r.commit } }
+    await write(next)
+    return { ok: true, message: `Accepted ${accepted.length} of ${p.changes.length} proposed change${p.changes.length === 1 ? '' : 's'} for ${p.braindump}: tags ${after.join(', ') || 'none'} (${r.commit.slice(0, 7)}).`, proposal: next, commit: r.commit as string | null }
+  }, { what: `tag proposal ${o.proposal}` })
+}
+
+// ---- registering a draft (user_catalog p6 ex1, server/catalogDrafts.ts) ----------------
+//
+// A draft becomes a braindump through the same writer: braindump.md and its
+// metadata.yaml in one commit, marked with the registration's operation id so
+// that a retry after an unknown result finds what was committed.
+export const REGISTRATION_TRAILER = 'Draft-Registration'
+export async function registerBraindump(ctx: CatalogContext, o: { id: string; text: string; tags: string[]; author: string; operation: string; draft: string; revision: number }) {
+  const s = await needSetting(ctx)
+  needId(o.id)
+  if (!o.text.trim()) throw new RequestError(400, 'a braindump needs its text')
+  const text = o.text.endsWith('\n') ? o.text : `${o.text}\n`
+  const tags = needTags(tagsAfterText(needTags(o.tags), null, text))
+  const r = await commitChanges(ctx, s, [{ path: braindumpPath(o.id), text }, ...(tags.length ? [{ path: metadataPath(o.id), text: writeBraindumpMetadata(null, tags) }] : [])], o.author,
+    [`Add braindump ${o.id}`, '', `Registered from a draft (revision ${o.revision}).`, '', `${REGISTRATION_TRAILER}: ${o.operation}`].join('\n'), async dir => {
+      if (await exists(join(dir, braindumpPath(o.id)))) throw new RequestError(409, `the path "${o.id}" is taken: braindump ${braindumpPath(o.id)} exists. Choose another path; the draft is kept`, { code: 'taken' })
+    })
+  if (r.changed) await noteFollowUp(ctx.area, { review: o.id, by: o.author.trim() })
+  return { commit: r.commit, changed: r.changed, path: braindumpPath(o.id), tags }
+}
+// The commit on the catalog's branch that carries this registration, with what it holds now.
+export async function findRegistration(ctx: CatalogContext, operation: string): Promise<{ commit: string; id: string | null; text: string | null; tags: string[] } | null> {
+  const s = await needSetting(ctx)
+  return withLock(settingFile(ctx.area), async () => {
+    await sync(ctx, s, 0)
+    const dir = checkoutDir(ctx.area)
+    const commit = (await git(dir, ['log', '-1', '--format=%H', '--fixed-strings', `--grep=${REGISTRATION_TRAILER}: ${operation}`, 'HEAD'])).stdout.trim()
+    if (!commit) return null
+    const files = (await git(dir, ['diff-tree', '--no-commit-id', '--name-only', '-r', commit])).stdout.split('\n').filter(Boolean)
+    const path = files.find(f => f.startsWith(`${EPISODES_DIR}/`) && f.endsWith(`/${BRAINDUMP_FILE}`))
+    const id = path ? braindumpIdOf(path) : null
+    const text = path ? await showAt(dir, commit, path) : null
+    const mt = id ? await showAt(dir, commit, metadataPath(id)) : null
+    return { commit, id, text, tags: readBraindumpMetadata(mt).tags }
+  }, { what: 'the catalog' })
+}
+// Archive folders that hold a braindump at this path: a new braindump there would take an old identity.
+export async function archivedAt(ctx: CatalogContext, id: string): Promise<string[]> {
+  needId(id)
+  const snap = await catalogSnapshot(ctx)
+  const dir = checkoutDir(ctx.area)
+  const out: string[] = []
+  for (const a of snap.archived) if (await exists(join(dir, a.path, id, BRAINDUMP_FILE))) out.push(`${a.path}/${id}`)
+  return out
 }
 
 // ---- archiving (user_catalog p6) ----------------------------------------------------
@@ -617,7 +997,7 @@ export async function changeBraindump(ctx: CatalogContext, o: { op: BraindumpOp;
 // which projects named it. A tag archive/<date> marks the commit before: the
 // last state with the braindumps in place. Citation records are not touched:
 // what was cited keeps its text at its commit.
-export interface ArchiveMove { id: string; title: string; from: string; to: string; review: boolean; updated: Change | null; named: { where: string; projects: string[] }[] }
+export interface ArchiveMove { id: string; title: string; from: string; to: string; review: boolean; metadata?: boolean; updated: Change | null; named: { where: string; projects: string[] }[] }
 export interface ArchiveBecause { file: string; entry: string; before: string[]; after: string[] }
 interface ArchivePlan { date: string; folder: string; tag: string; parent: string; moves: ArchiveMove[]; because: ArchiveBecause[]; warnings: string[]; changes: CatalogChange[] }
 
@@ -682,7 +1062,7 @@ async function planArchive(ctx: CatalogContext, s: CatalogSetting, dir: string, 
   const lines: string[] = []
   for (const id of ids) {
     let to = id
-    for (let n = 2; taken.has(to) || await exists(join(dir, folder, to, BRAINDUMP_FILE)) || await exists(join(dir, folder, to, REVIEW_FILE)); n++) to = `${id}.${n}`
+    for (let n = 2; taken.has(to) || await exists(join(dir, folder, to, BRAINDUMP_FILE)) || await exists(join(dir, folder, to, REVIEW_FILE)) || await exists(join(dir, folder, to, METADATA_FILE)); n++) to = `${id}.${n}`
     taken.add(to)
     const text = (await readTextOrNull(join(dir, braindumpPath(id)))) ?? ''
     const review = await readTextOrNull(join(dir, reviewPath(id)))
@@ -690,12 +1070,17 @@ async function planArchive(ctx: CatalogContext, s: CatalogSetting, dir: string, 
     const reviewed = review === null ? null : await lastChange(dir, reviewPath(id))
     changes.push({ path: braindumpPath(id), text: null }, { path: `${folder}/${to}/${BRAINDUMP_FILE}`, text })
     if (review !== null) changes.push({ path: reviewPath(id), text: null }, { path: `${folder}/${to}/${REVIEW_FILE}`, text: review })
-    const m: ArchiveMove = { id, title: braindumpTitle(id, text), from: `${EPISODES_DIR}/${id}`, to: `${folder}/${to}`, review: review !== null, updated, named: named.get(braindumpPath(id)) ?? [] }
+    // Its tags go with it (user_catalog p6 ex1): metadata.yaml is agdev's, not an unrelated file of the folder.
+    const meta = await readTextOrNull(join(dir, metadataPath(id)))
+    if (meta !== null) changes.push({ path: metadataPath(id), text: null }, { path: `${folder}/${to}/${METADATA_FILE}`, text: meta })
+    const tags = readBraindumpMetadata(meta).tags
+    const m: ArchiveMove = { id, title: braindumpTitle(id, text), from: `${EPISODES_DIR}/${id}`, to: `${folder}/${to}`, review: review !== null, metadata: meta !== null, updated, named: named.get(braindumpPath(id)) ?? [] }
     moves.push(m)
     const say = (c: Change | null) => c ? `\`${c.commit.slice(0, 12)}\` (${c.author}, ${c.at.slice(0, 10)})` : 'not committed'
     lines.push(`- [\`${id}\`](${to}/${BRAINDUMP_FILE})${m.title === id ? '' : `: ${m.title}`}`,
       `  - last change: ${say(updated)}`,
       `  - review: ${review === null ? 'none' : `[${REVIEW_FILE}](${to}/${REVIEW_FILE}), ${say(reviewed)}`}`,
+      ...(tags.length ? [`  - tags: ${tags.join(', ')}`] : []),
       ...(m.named.length ? m.named.map(n => `  - ${n.where}: ${n.projects.join(', ')}`) : ['  - named by no project']))
   }
   const pub = await readTextOrNull(join(dir, PUBLICATION_CONTRACT))
@@ -719,7 +1104,7 @@ export async function archiveBraindumps(ctx: CatalogContext, o: { id?: string; a
   let plan: ArchivePlan | undefined
   const result = (p: ArchivePlan, done: { commit: string } | null, problems: string[] = []) => {
     const lines = [
-      ...p.moves.map(m => `move    ${m.from}/ → ${m.to}/  (${BRAINDUMP_FILE}${m.review ? `, ${REVIEW_FILE}` : ''})`),
+      ...p.moves.map(m => `move    ${m.from}/ → ${m.to}/  (${BRAINDUMP_FILE}${m.review ? `, ${REVIEW_FILE}` : ''}${m.metadata ? `, ${METADATA_FILE}` : ''})`),
       ...p.because.map(b => `because ${b.file}: ${b.entry}: [${b.before.map(x => braindumpIdOf(x)).join(', ')}] → [${b.after.map(x => braindumpIdOf(x)).join(', ')}]`),
       `write   ${p.folder}/README.md`,
       `tag     ${p.tag} → ${p.parent.slice(0, 12)} (the catalog before)`,
@@ -738,6 +1123,7 @@ export async function archiveBraindumps(ctx: CatalogContext, o: { id?: string; a
       `Moved with ${o.all ? 'their reviews' : 'its review'}; taken out of ${plan!.because.length} because list${plan!.because.length === 1 ? '' : 's'}. The catalog before: tag ${plan!.tag}.`,
       ...(o.note?.trim() ? ['', o.note.trim()] : [])].join('\n'))
   const p = plan!
+  for (const mv of p.moves) await noteFollowUp(ctx.area, { drop: mv.id, index: true, by: o.author.trim() })
   // The tag on the commit before: on Gitea, and on the mirrors (the commit itself went there with the push).
   const problems: string[] = []
   await withLock(settingFile(ctx.area), async () => {
@@ -842,7 +1228,7 @@ export async function putIndex(ctx: CatalogContext, o: { text: string; author: s
 // its workflows `review` and `index` write through wfe catalog as their own
 // author. What a request for one of them says; the caller queues it.
 export const UPKEEP = { project: 'summoner', review: 'review', index: 'index' } as const
-export async function upkeepRequest(ctx: CatalogContext, o: { kind: 'review' | 'index'; id?: string }) {
+export async function upkeepRequest(ctx: CatalogContext, o: { kind: 'review' | 'index'; id?: string; followUp?: string }) {
   const snap = await catalogSnapshot(ctx, { maxAgeMs: 0 })
   if (o.kind === 'review' && o.id) { needId(o.id); if (!snap.braindumps.some(b => b.id === o.id)) throw new RequestError(404, `no braindump "${o.id}" to review`) }
   const reg = await loadRegistry(ctx.registryFile)
@@ -850,12 +1236,13 @@ export async function upkeepRequest(ctx: CatalogContext, o: { kind: 'review' | '
   if (!ws) throw new RequestError(409, `no ${UPKEEP.project} here to ${o.kind === 'review' ? 'write reviews' : 'write the index'}: run agdevctl bootstrap-projects first (it brings the summoner by the core's reference)`)
   const repo = `${snap.setting.repository.owner}/${snap.setting.repository.name}`
   const due = snap.braindumps.filter(b => !b.review || b.changedAfterReview).map(b => b.id)
-  const text = o.kind === 'index'
+  const by = o.followUp ? `(Asked by the catalog's follow-up after ${o.followUp} put in or changed a braindump.)` : ''
+  const text = (o.kind === 'index'
     ? `# Rewrite the catalog's index\n\nRewrite ${INDEX_PATH} of the catalog ${repo} (head ${snap.head}): everything that is not yet real, braindumps and challenges, each with its kind, a link and one or two lines on what is missing.\n\n(Requested with wfe catalog index request.)\n`
     : o.id
       ? `# Review braindump ${o.id}\n\nWrite or refresh the review of the braindump \`${o.id}\` (${braindumpPath(o.id)}) of the catalog ${repo} (head ${snap.head}).\n\n(Requested with wfe catalog review request ${o.id}.)\n`
-      : `# Review the braindumps that need it\n\nWrite or refresh the review of every braindump of the catalog ${repo} (head ${snap.head}) that has no review or changed after its review.${due.length ? ` At this head: ${due.join(', ')}.` : ' At this head there is none.'}\n\n(Requested with wfe catalog review request.)\n`
-  return { ok: true, kind: o.kind, ...(o.id ? { id: o.id } : {}), head: snap.head, workspace: ws.id, workflow: UPKEEP[o.kind], text, receipt: `catalog-${o.kind}-${(o.id ?? 'all').replace(/[^A-Za-z0-9._-]+/g, '.')}-${snap.head.slice(0, 12)}-${Date.now()}` }
+      : `# Review the braindumps that need it\n\nWrite or refresh the review of every braindump of the catalog ${repo} (head ${snap.head}) that has no review or changed after its review.${due.length ? ` At this head: ${due.join(', ')}.` : ' At this head there is none.'}\n\n(Requested with wfe catalog review request.)\n`).replace(/\(Requested with [^)]*\)/, m => by || m)
+  return { ok: true, kind: o.kind, ...(o.id ? { id: o.id } : {}), head: snap.head, workspace: ws.id, workflow: UPKEEP[o.kind], text, receipt: `catalog-${o.kind}-${(o.id ?? 'all').replace(/[^A-Za-z0-9._-]+/g, '.')}-${snap.head.slice(0, 12)}` }
 }
 
 // The published part: the public paths publication/github.toml selects,
@@ -880,10 +1267,20 @@ export async function publicationStatus(ctx: CatalogContext, o: { maxAgeMs?: num
     if (l) last = { publicCommit: l.public_commit!, sourceRev: l.source_rev ?? '', at: l.published_at ?? '' }
     else journalNote = `the journal in ${ws} records no publication`
   } catch (e) { journalNote = `the journal in ${ws} cannot be read: ${(e as Error).message}` }
-  return { contract: p.contract, destination: p.destination, head: snap.head, braindumps, reviews,
+  // user_catalog p7: what the adopted rules say about this selection.
+  const check = await (await import('./catalogRules.ts')).publicationCheck(ctx)
+  return { contract: p.contract, destination: p.destination, head: snap.head, braindumps, reviews, check,
     challenges: [...byChallenge.entries()].map(([id, files]) => ({ id, files })), rest: entries.filter(e => !grouped.has(e.from)),
     internal: { braindumps: snap.braindumps.filter(b => !b.published).map(b => b.id) },
     workspace: ws, last, note: journalNote }
+}
+// Records where drafts are kept (server/catalogDrafts.ts useDraftRoot checks the place first).
+export async function setDraftsSetting(ctx: CatalogContext, drafts: string | null) {
+  const s = await needSetting(ctx)
+  const { drafts: _old, ...rest } = s
+  const next: CatalogSetting = drafts ? { ...rest, drafts } : rest
+  await atomicWrite(settingFile(ctx.area), `${JSON.stringify(next, null, 2)}\n`)
+  return next
 }
 export async function setPublicationWorkspace(ctx: CatalogContext, folder: string) {
   const s = await needSetting(ctx)
@@ -1055,3 +1452,6 @@ export async function migrate(ctx: CatalogContext, o: { author: string; dryRun?:
     `Migrate to the catalog layout: ${CATALOG_FILE}, ${PROJECTS_PATH}, ${EPISODES_DIR}/<path>/${BRAINDUMP_FILE} (user_catalog p1)`)
   return { ok: true, dryRun: false, message: `Migrated ${s.repository.owner}/${s.repository.name} (${r.commit.slice(0, 7)}). README.md is yours and was not rewritten.`, lines, commit: r.commit as string | null }
 }
+
+// What the catalog's other modules (links, rules, asking: user_catalog p7) write and read through.
+export const internals = { commitChanges, sync, checkoutDir, settingFile, needSetting, needId, lastChange, showAt, braindumpIds, readPublished, localDate, isAfter }

@@ -100,4 +100,6 @@ server.listen(port, bind, () => {
   if (extraOrigins.length) console.log(`extra origins: ${extraOrigins.join(', ')}`)
   if (!process.env.WFE_NO_DIALOGUE) new DialogueWorker(dialogue).start()
   peerLoop?.start()
+  // user_catalog p6 ex2: the catalog's follow-up asks the summoner for reviews and the index by itself.
+  if (!process.env.WFE_NO_CATALOG_FOLLOWUP) void import('./catalogFollowUp.ts').then(f => new f.FollowUpLoop({ registryFile, area, gitea, giteaProblem }, exec).start())
 })

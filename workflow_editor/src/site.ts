@@ -22,9 +22,26 @@ export function hangoutHref(): string {
 // A discussion's meeting room in aghangout (p16).
 export const conversationHref = (id: string) => `${hangoutHref()}?conv=${encodeURIComponent(id)}`
 
+// user_catalog p8: what waits for the owner on the Catalog page, as a count on its link (read at most once a minute).
+let waiting: { count: number; at: number } | null = null
+let waitingRead: Promise<void> | null = null
+export function forgetWaiting() { waiting = null }
+function catalogLink(): HTMLElement {
+  const count = h('span.nav-count', { hidden: true })
+  const draw = () => { const n = waiting?.count ?? 0; count.textContent = String(n); count.hidden = !n; a.title = n ? `${n} thing${n === 1 ? '' : 's'} on the Catalog page wait for you` : 'Your catalog: braindumps, reviews, what is public' }
+  const a = h('a.button', { href: '#/catalog' }, 'Catalog', count)
+  draw()
+  if (!waitingRead && (!waiting || Date.now() - waiting.at > 60_000))
+    waitingRead = fetch('api/catalog/waiting').then(r => r.ok ? r.json() as Promise<{ count: number }> : { count: 0 }).then(x => { waiting = { count: x.count ?? 0, at: Date.now() } }, () => { waiting = { count: 0, at: Date.now() } }).finally(() => { waitingRead = null })
+  // Every link drawn while the count is read is drawn again when it arrives.
+  if (waitingRead) void waitingRead.then(draw)
+  return a
+}
+
 // The links every top-level screen offers beside its own actions.
-export function siteLinks(current?: 'usage'): HTMLElement[] {
+export function siteLinks(current?: 'usage' | 'catalog'): HTMLElement[] {
   return [
+    current === 'catalog' ? null : catalogLink(),
     current === 'usage' ? null : h('a.button', { href: '#/usage', title: 'Subscription windows and what executions used' }, 'Usage'),
     h('a.button', { href: hangoutHref(), title: 'Talk with the project agents (aghangout)' }, 'aghangout ↗'),
   ].filter((x): x is HTMLAnchorElement => !!x)

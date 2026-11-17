@@ -233,7 +233,7 @@ repository contents, and a commit hash does not include uncommitted files.
 ```json
 {
   "schema": "ag.workflow-run.v1",
-  "project": "rts-vs-bot",
+  "project": "example",
   "workflow": "build-game",
   "run": "run-001",
   "created": "2026-10-10T12:00:00.000Z",
@@ -396,7 +396,7 @@ and the run is `completed` only when `_final-report` is.
   this, a step's path was named only once it was ready, and a `manual` run
   got none; "this run's folder" in a request or a node description was
   resolved against the root about half the time (agops `recover`: 11 of 21
-  runs; protoprey `freework/run-003` replaced another run's root
+  runs; one project's `freework` run replaced another run's root
   `report.md`).
 
 - **Document evidence.** Before `complete` of a step (and `ask` from
@@ -729,7 +729,7 @@ action, and cannot judge whether a result needs a presentation.
 | `expectation-unstated` | completing a node | it has expectations with no statement (improve_wfnode p1, seen in trial: `scene-world/run-002` finished with all three unstated) |
 | `presentation-inside-work` | `wfe present register` | registered from a talk, work, confirmation or discussion-activity node |
 | `cleanup-unplanned` | `wfe present register` | no cleanup node is planned |
-| `document-missing` | completing a documentation step (`_plan`, `_report.<node>`, `_final-report`) | its document is not a nonempty file of the run folder, so the completion would record none (tidy p1: protoprey freework/run-006 completed `_final-report` "Report written" after the command that wrote it had failed) |
+| `document-missing` | completing a documentation step (`_plan`, `_report.<node>`, `_final-report`) | its document is not a nonempty file of the run folder, so the completion would record none (tidy p1: a `freework` run completed `_final-report` "Report written" after the command that wrote it had failed) |
 | `unrecorded-activity` | a question, a report, the run-completing completion | the run's catalog has templates and no work node is visible, but something suggests work was done: changed paths in the run's copy outside its records, artifacts outside the run folder or published outputs, or a talk that has run for more than 10 minutes |
 | `discussion-activity`, `discussion-open` | completion | a discussion activity completed with a plain completion; a conductor run ending with its discussion open (fix3) |
 | `conversation-unanswered` | the completion that puts a standing conductor to rest | the person's latest words in a room it conducts have no reply, result, question or announcement from it since; a progress note does not count (tidy p1: ponderer/conduct/run-048 said it would summarize, judged three results and rested silent) |
@@ -840,9 +840,9 @@ Documentation stays optional: nothing here makes a report mandatory. A
 documentation step that completes without its document still gets
 `document-missing`.
 
-Why: tidy p1. protoprey freework/run-006 completed `_final-report` "Report
-written" with no report. run-007 reported "7 tests pass" while its eighth
-test never ran. run-006 read `data/deliveries.json` without the status check
+Why: tidy p1. One `freework` run completed `_final-report` "Report
+written" with no report. The next reported "7 tests pass" while its eighth
+test never ran. The first read `data/deliveries.json` without the status check
 and missed an adoption that pointed at agsfx's run copy. lowerpoly
 freework/run-004 put one host's addresses into its new README.
 

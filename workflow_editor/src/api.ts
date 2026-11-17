@@ -112,8 +112,15 @@ export type SummonStyle = Awaited<ReturnType<typeof import('../server/summon.ts'
 export type CatalogView = import('../server/catalog.ts').CatalogView
 export type CatalogWhy = Awaited<ReturnType<typeof import('../server/catalog.ts').why>>
 export type CatalogBraindump = Awaited<ReturnType<typeof import('../server/catalog.ts').braindump>>
-export type CatalogUpkeep = { ok: boolean; kind: string; workspace: string; workflow: string; href: string }
+export type CatalogUpkeep = { ok: boolean; kind: string; workspace: string; workflow: string; href: string; run: string; duplicate: boolean }
 type CatalogChange = { ok: boolean; message: string; commit: string; changed: boolean }
+export type CatalogTagProposal = import('../server/catalog.ts').TagProposalView
+export type CatalogDraft = import('../server/catalogDrafts.ts').Draft
+export type CatalogDraftAdvice = import('../server/catalogDrafts.ts').Advice
+export type CatalogAskAction = import('../server/catalogDrafts.ts').AskAction
+export type CatalogDraftList = Awaited<ReturnType<typeof import('../server/catalogDrafts.ts').listDrafts>>
+export type CatalogDraftRead = Awaited<ReturnType<typeof import('../server/catalogDrafts.ts').readDraft>>
+export type CatalogDraftPreview = Awaited<ReturnType<typeof import('../server/catalogDrafts.ts').previewRegistration>>
 export type CatalogArchive = Awaited<ReturnType<typeof import('../server/catalog.ts').archiveBraindumps>>
 // A braindump's identity is a folder path: each segment is encoded, the slashes are kept.
 const bd = (id: string) => id.split('/').map(encodeURIComponent).join('/')
@@ -136,6 +143,35 @@ export const api = {
   catalogReviewRequest: (author: string, path?: string) => call<CatalogUpkeep>('POST', 'api/catalog/reviews/request', { author, path }),
   catalogIndexRequest: (author: string) => call<CatalogUpkeep>('POST', 'api/catalog/index/request', { author }),
   catalogReviewPut: (id: string, text: string, author: string, base?: string) => call<CatalogChange>('PUT', `api/catalog/reviews/${bd(id)}`, { text, author, base }),
+  // user_catalog p6 ex1: drafts outside Git (server/catalogDrafts.ts).
+  catalogDrafts: () => call<CatalogDraftList>('GET', 'api/catalog/drafts'),
+  catalogDraft: (id: string) => call<CatalogDraftRead>('GET', `api/catalog/drafts/${encodeURIComponent(id)}`),
+  catalogDraftCreate: (text: string, tags: string[], author: string, of?: { path: string; base?: string }) => call<{ message: string; draft: CatalogDraft }>('POST', 'api/catalog/drafts', { text, tags, author, ...(of ? { of: of.path, ofBase: of.base } : {}) }),
+  // user_catalog p6 ex2: the main button (save, then register as one commit) and renaming.
+  catalogDraftPut: (id: string, o: { text: string; base: number; author: string; path?: string; ofBase?: string; reuseArchived?: boolean }) => call<{ message: string; commit: string; path: string; draft: CatalogDraft; unchanged?: boolean }>('POST', `api/catalog/drafts/${encodeURIComponent(id)}/put`, o),
+  catalogMove: (from: string, to: string, author: string) => call<{ message: string; commit: string; from: string; to: string }>('POST', 'api/catalog/braindumps/move', { from, to, author }),
+  catalogDraftSave: (id: string, o: { text?: string; tags?: string[]; path?: string; ofBase?: string }, base: number, author: string) => call<{ message: string; draft: CatalogDraft; changed: boolean }>('PUT', `api/catalog/drafts/${encodeURIComponent(id)}`, { ...o, base, author }),
+  catalogDraftRemove: (id: string, author: string) => call<{ message: string }>('DELETE', `api/catalog/drafts/${encodeURIComponent(id)}`, { author }),
+  // user_catalog p7: asking the summoner from the field; the actions under its answer; links; rules.
+  catalogAsk: (o: { draft: string; base: number; author: string }) => call<{ message: string; href: string; advice: CatalogDraftAdvice; draft: string; duplicate: boolean }>('POST', 'api/catalog/ask', o),
+  catalogAskDo: (draft: string, ask: string, action: number, author: string) => call<{ ok: boolean; message: string; advice: CatalogDraftAdvice; commit?: string; href?: string }>('POST', `api/catalog/ask/${encodeURIComponent(draft)}/${encodeURIComponent(ask)}/do`, { action, author }),
+  catalogAskDecline: (draft: string, ask: string, action: number, author: string) => call<{ message: string; advice: CatalogDraftAdvice }>('POST', `api/catalog/ask/${encodeURIComponent(draft)}/${encodeURIComponent(ask)}/decline`, { action, author }),
+  catalogAskDismiss: (draft: string, ask: string, author: string) => call<{ message: string; removed: boolean }>('POST', `api/catalog/ask/${encodeURIComponent(draft)}/${encodeURIComponent(ask)}/dismiss`, { author }),
+  catalogAsked: () => call<{ asked: import('../server/catalogDrafts.ts').AskedLine[] }>('GET', 'api/catalog/ask'),
+  catalogLinksRequest: (author: string) => call<CatalogUpkeep>('POST', 'api/catalog/links/request', { author }),
+  catalogLinksAgree: (author: string, numbers: number[] | 'all') => call<{ message: string; commit: string | null }>('POST', 'api/catalog/links/agree', numbers === 'all' ? { all: true, author } : { numbers, author }),
+  catalogLinksDecline: (author: string, numbers: number[]) => call<{ message: string }>('POST', 'api/catalog/links/decline', { numbers, author }),
+  catalogRuleRetire: (id: string, author: string) => call<CatalogChange>('POST', 'api/catalog/rules/retire', { id, author }),
+  catalogPublicationAdd: (path: string, author: string) => call<CatalogChange>('POST', 'api/catalog/publication/add', { path, author }),
+  // user_catalog p8: OK / No on a statement on disclosure or the default licence; asking the publisher; what waits (the navigation's count).
+  catalogDisclosureAnswer: (n: number | 'licence', agree: boolean, author: string) => call<{ message: string }>('POST', 'api/catalog/links/disclosure', { n, agree, author }),
+  catalogPublicationRequest: (target: string | undefined, author: string) => call<CatalogUpkeep & { target: string }>('POST', 'api/catalog/publication/request', { target, author }),
+  catalogWaiting: () => call<{ count: number }>('GET', 'api/catalog/waiting'),
+  catalogDraftPreview: (id: string, path: string) => call<CatalogDraftPreview>('POST', `api/catalog/drafts/${encodeURIComponent(id)}/preview`, { path }),
+  catalogDraftRegister: (id: string, path: string, base: number, author: string, reuseArchived = false) => call<{ message: string; commit: string; path: string; draft: CatalogDraft }>('POST', `api/catalog/drafts/${encodeURIComponent(id)}/register`, { path, base, author, reuseArchived }),
+  // user_catalog p6 ex1: tags (metadata.yaml) and tag proposals.
+  catalogTags: (id: string, tags: string[], author: string, base?: string) => call<CatalogChange & { tags: string[] }>('PUT', `api/catalog/braindumps/${bd(id)}?tags=1`, { tags, author, base }),
+  catalogTagDecide: (proposal: string, author: string, accept: string[] | null) => call<CatalogChange>('POST', `api/catalog/tag-proposals/${encodeURIComponent(proposal)}`, accept ? { accept, author } : { dismiss: true, author }),
   workspaces: () => call<WorkspacesResponse>('GET', 'api/workspaces'),
   // What a shared:// reference is on this host (p12, server/boast.ts resolveShared).
   shareRef: (ref: string) => call<{ ref: string; state: string; detail: string; url: string | null; download: string | null; host: string; path: string | null; folder: boolean }>('GET', `api/share-ref?ref=${encodeURIComponent(ref)}`),

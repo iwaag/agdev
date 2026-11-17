@@ -1757,7 +1757,7 @@ export class ConversationService {
         if (record.control.attempt || ['completed', 'cancelled'].includes(situation(record))) continue
         let node = m.node ?? null
         if (!node) {
-          // A participant's turn (p3: rts-vs-bot/discuss/run-001, run-004
+          // A participant's turn (p3: participants of two discuss runs
           // spoke and left their only node running): its one authored node.
           if (!ANSWERING.includes(m.kind) || !discussWorkflows.includes(`${workspace}/${ref.workflow}`)) continue
           const authored = Object.keys(graph.nodes).filter(n => !graph.nodes[n].step)

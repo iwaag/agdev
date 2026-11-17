@@ -180,6 +180,7 @@ async function groundsSource(ctx: AccessContext, project: string, applies: Conte
     for (const p of e.because) {
       const b = snap.braindumps.find(x => x.path === p)
       lines.push('', `### ${p}${b?.updated ? ` (by ${b.updated.author}, ${b.updated.at.slice(0, 10)})` : ''}`, '', b ? (b.text ?? '').trim() : '(missing from the catalog)')
+      if (b?.tags.length) lines.push('', `Tags (the owner's optional labels; by themselves they ask for nothing): ${b.tags.join(', ')}`)
       const r = b?.review
       if (r) lines.push('', `#### Review of ${p}${r.updated ? ` (by ${r.updated.author}, ${r.updated.at.slice(0, 10)})` : ''}${b!.changedAfterReview ? '; the braindump changed after this review' : ''}`, '', (r.text ?? '').trim())
     }
