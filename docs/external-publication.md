@@ -55,6 +55,7 @@ destination = "https://github.com/<owner>/<repo>.git"
 branch = "main"
 visibility = "public"
 license = "CC0-1.0"
+because = "rule:project-example-publish"   # the project's own ground (improve_publish p2)
 local_secrets = ["forge.env"]              # optional
 forbidden = ["internal-host", "/Users/"]   # literal, case-insensitive
 
@@ -71,7 +72,8 @@ why = "the name of a pack made for it; nothing else of the project"
 [[tree]]                                   # a directory: every file under it, minus exclusions
 public = ""                                # where it goes in the public tree ("" = the root)
 from = "source:workflow_editor"            # source:<dir> | overlay:<dir>; "source:" = the whole repository
-exclude = ["devdocs/runs", "**/*.local.*"] # globs relative to `from`; a glob matching a directory drops it
+exclude = ["**/*.local.*"]                 # globs relative to `from`; a glob matching a directory drops it
+because = "project"                        # why it is public (every source: or workspace: selection)
 
 [[file]]                                   # one per public path; decides a path a [[tree]] also selects
 public = "docs/route.md"
@@ -87,7 +89,46 @@ contract = "publication/github.toml"       # the child's contract, inside the ch
 [[exclude]]                                # a submodule deliberately left out of the public tree
 path = "private/thing"
 why = "…"
+
+[[run]]                                    # a run record (improve_publish p2)
+id = "freework/run-018"
+files = ["request.md", "report.md"]        # the default; other text files of the run folder may be named
+because = "rule:runs-suggest-publish"
+
+[[local]]                                  # a source path kept local by a decision
+path = "devdocs/runs/freework/run-012"
+because = "answer:publisher/publish/run-031"
+
+[runs]
+judged = "<source commit>"                 # how far the publisher judged the runs
 ```
+
+**Grounds.** Every selection from the source names why it is public: `because` at the top (the
+project's own ground) and on each `[[tree]]` and `[[file]]` whose `from` is `source:` or
+`workspace:`, each `[[submodule]]`, `[[run]]` and `[[local]]`. A ground is `rule:<id>` (a rule of the
+installation's catalog), `answer:<project>/<workflow>/<run>` (the owner's or Omni's answer recorded
+in that run), `answer:before-improve_publish` (decided before grounds were recorded), `project`
+(part of what the project is public for: code, documents, the workflows a reader can request) or
+`owner:<name>` (the owner's own act, as the catalog's *Add to the public list*). Overlay entries
+need none. `plan` and `build` list a missing or malformed one as `not_grounded`; a `rule:<id>` that
+is no longer in the catalog is listed as `grounds_stale` and stops nothing (retiring a rule does
+not withdraw what is public).
+
+**Run records.** A run is public only by its own `[[run]]`: its `files` at
+`devdocs/runs/<id>/<file>`, by default `request.md` and `report.md` (the intent and the result). A
+`[[tree]]` never copies anything below `devdocs/runs/`; a `[[file]]` there is refused (code
+`contract`). `run.json`, `original-input.md`, `context/` and `definition/` are never public,
+whatever the contract says. A run's media is published as the project's own asset or example. A
+`[[run]]` needs an adopted `runs` rule `suggest-publish` that applies to the project, and a `runs`
+rule `never-publish` refuses it (code `rule`); a selection below `devdocs/episodes/` needs an
+`episodes` rule in the same way; a `workflows` rule `never-publish` refuses a selection below
+`devdocs/workflows/` (`workflow_editor/docs/mycatalog.md`, *Rules on run records*). A `[[local]]`
+path is left out of every `[[tree]]`, and a `[[file]]` or `[[run]]` at or below it is refused.
+`agdev-external-publish runs` (or `wfe catalog disclosure runs <project>`) lists the runs not yet
+judged: the criterion, the files each run changed outside its folder (the commits whose message
+names it), the sizes of its request and report and the private ids in them. A run folder unchanged
+since `[runs] judged`, with neither a `[[run]]` nor a `[[local]]`, is not listed again, until a
+`runs` rule is adopted after that commit.
 
 A `[[tree]]` selects a whole directory at the pinned revision. It never copies gitlinks (submodules are
 `[[submodule]]`s), `.gitmodules`, symbolic links, or the source's own `publication/` folder. Two trees
@@ -128,8 +169,9 @@ resolved against the parent's internal remote; its own contract is read at that 
 | Command | Effect |
 | --- | --- |
 | `plan [--rev R]` | the graph: identities, pins, destinations, checkouts, last pairs, problems |
-| `build [--rev R] --out DIR` | every candidate in `DIR/<name>/` with its tree id and search findings |
-| `stage [--rev R] --message M` | per repository, dependencies first: a first publication is a root commit; an update rebuilds the last published candidate, and applies the change from it to the new candidate onto the public head (fetched first). Refuses a checkout whose head is neither the remote nor the staged candidate |
+| `build [--rev R] --out DIR` | every candidate in `DIR/<name>/` with its tree id, search findings, grounds and its **scope change** |
+| `runs [--rev R]` | the project's run records not yet judged (above, *Run records*) |
+| `stage [--rev R] --message M [--scope-answer RUN#Q]` | refused (code `scope`) when the candidate widens what is public and no answer is named; then, per repository, dependencies first: a first publication is a root commit; an update rebuilds the last published candidate, and applies the change from it to the new candidate onto the public head (fetched first). Refuses a checkout whose head is neither the remote nor the staged candidate |
 | `resolve --repo ID --note …` / `abort --repo ID` | after a conflict: accept the resolved checkout (re-searched as the actual candidate) or drop it |
 | `push [--stop-before ID]` | dependencies first; each push only after every gitlink's child commit is on its public branch; the remote is read before (already there → recorded as published, nothing pushed) and after (decides the outcome) |
 | `status` | the journal |
@@ -148,9 +190,24 @@ replaced; staging over another owner's unfinished staging (staged, partial, conf
 checks that the remote is still the recorded public base and the checkout is the staged commit.
 Stagings without an owner (by hand) behave as before.
 
+**The scope and its one answer (improve_publish p2).** Each publication records in the journal its
+selections (`scope`: each `[[tree]]`, `[[file]]`, `[[submodule]]`, `[[run]]` with its ground) and
+the answer each was published under. A selection of a new candidate that no answered selection
+covers is a **scope change**: a new `[[file]]` outside every answered tree, a `[[tree]]` with an
+`exclude` removed, a new `[[run]]` or a file added to one, a new submodule. `build` prints it per
+repository, grouped as run records, workflows and the rest, each with its ground and the files it
+adds. `stage` refuses it (code `scope`) unless `--scope-answer <project>/<workflow>/<run>#<question>`
+names the answered question that covers exactly that list; the answer is recorded on each item.
+New files under an answered `[[tree]]` are not a scope change (read the delta, as always), and
+narrowing (an entry removed, a `[[local]]` added) never is. A first publication is a scope change as
+a whole; a contract whose `because` is an adopted `project … publish` rule has the repository
+answered by it, not its run records. A journal from before this records nothing: its last published
+contract counts as answered (`answer:before-improve_publish`). While contracts get their grounds, a
+missing `because` stops only a stage with a scope change.
+
 **Stop codes.** Every refusal prints `agdev-external-publish [<code>]: <reason>` and exits 1:
 `conflict`, `stale-public-head`, `unavailable-source`, `child-not-public`, `graph`, `contract`,
-`check-failed`, `checkout-state`, `owner`, `busy`, `infrastructure`, `usage`, `rule`. A workflow maps them to
+`check-failed`, `checkout-state`, `owner`, `busy`, `infrastructure`, `usage`, `rule`, `scope`. A workflow maps them to
 its next action; the code is a category, the reason says what to look at.
 
 ## Procedures
@@ -163,7 +220,8 @@ and overlay where the public text must follow; commit and push them to Gitea (a 
 the parent's pin). `plan`, then `build --out <scratch>` and read every candidate file — the
 searches assist, they do not prove a file may be public. `stage --message …`, check what the
 delta touches, `push`. A new repository, visibility, licence or a scope change needs the owner's
-decision on the concrete staged candidate; routine updates inside an approved scope do not.
+(or Omni's) answer on the concrete list `build` prints; routine updates inside an answered scope do
+not.
 
 **Partial graph publication.** Pushes are per repository, dependencies first, and each result
 is journaled. After any stop (`--stop-before`, a refused or failed push, a lost session) run

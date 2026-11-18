@@ -36,8 +36,10 @@ export interface SuggestedLink {
 }
 // p8: what a braindump states about a project's disclosure, and the owner's default licence, proposed with the links.
 // A proposed never-publish refuses a publication of the project until the owner answers No; a proposed publish does nothing until OK.
+// improve_publish p2: with `content` (runs, workflows, episodes) it is a statement on a kind of content, for one project
+// (`project`) or for all (`project` absent); follows suggest-publish or never-publish.
 export interface ProposedDisclosure {
-  n: number; project: string; follows: 'never-publish' | 'publish'; braindump: string; quote: string; why?: string
+  n: number; project: string; content?: string; follows: 'never-publish' | 'publish' | 'suggest-publish'; braindump: string; quote: string; why?: string
   state: 'suggested' | 'agreed' | 'declined' | 'gone'
   decided?: { by: string; at: string; commit?: string; reason?: string }
 }
@@ -124,12 +126,24 @@ export async function suggestLinks(ctx: CatalogContext, o: { suggestion: unknown
       const at = `disclosure[${i + 1}]`
       if (!isObj(x)) { problems.push(`${at}: not an object`); continue }
       const b = str(x.braindump).replace(/^\/+|\/+$/g, ''), p = str(x.project), quote = str(x.quote), follows = str(x.follows)
+      if (str(x.content)) {
+        const content = str(x.content)
+        if (!['runs', 'workflows', 'episodes'].includes(content)) { problems.push(`${at}: content is runs, workflows or episodes; "${content}" is none`); continue }
+        if (follows !== 'never-publish' && follows !== 'suggest-publish') { problems.push(`${at} (${content}): follows is suggest-publish (the sentence is the criterion for publishing) or never-publish`); continue }
+        const text = await textOf(b)
+        if (text === null) { problems.push(`${at}: no braindump "${b}" in the catalog at ${head.slice(0, 7)}`); continue }
+        if (p && !l.known(p)) { problems.push(`${at}: project "${p}" is neither in the plan ${snap.setting.plan || '(none)'} nor in ${PROJECTS_PATH}`); continue }
+        if (!quote || !holds(text, quote)) { problems.push(`${at} (${b}: ${content}${p ? ` of ${p}` : ''} ${follows}): the quote is not in the braindump's text at ${head.slice(0, 7)}; a statement needs the sentence, copied as it is written`); continue }
+        if (disclosure.some(y => y.content === content && y.project === p && y.follows === follows)) continue
+        disclosure.push({ n: disclosure.length + 1, project: p, content, follows: follows as ProposedDisclosure['follows'], braindump: b, quote: loose(quote).slice(0, 2000), ...(str(x.why) ? { why: str(x.why).slice(0, 1000) } : {}), state: 'suggested' })
+        continue
+      }
       if (follows !== 'never-publish' && follows !== 'publish') { problems.push(`${at} (${p}): follows is never-publish (stated private) or publish (stated public)`); continue }
       const text = await textOf(b)
       if (text === null) { problems.push(`${at}: no braindump "${b}" in the catalog at ${head.slice(0, 7)}`); continue }
       if (!l.known(p)) { problems.push(`${at}: project "${p}" is neither in the plan ${snap.setting.plan || '(none)'} nor in ${PROJECTS_PATH}`); continue }
       if (!quote || !holds(text, quote)) { problems.push(`${at} (${b}: ${p} ${follows}): the quote is not in the braindump's text at ${head.slice(0, 7)}; a statement needs the sentence, copied as it is written`); continue }
-      if (disclosure.some(y => y.project === p && y.follows === follows)) continue
+      if (disclosure.some(y => !y.content && y.project === p && y.follows === follows)) continue
       disclosure.push({ n: disclosure.length + 1, project: p, follows, braindump: b, quote: loose(quote).slice(0, 2000), ...(str(x.why) ? { why: str(x.why).slice(0, 1000) } : {}), state: 'suggested' })
     }
     if (isObj(raw.licence)) {
@@ -155,9 +169,10 @@ export async function suggestLinks(ctx: CatalogContext, o: { suggestion: unknown
     links: out, uncovered, ungrounded, ...(str(raw.note) ? { note: str(raw.note).slice(0, 2000) } : {}), existing, disclosure, licence }
   await withLock(file(ctx.area), () => write(ctx.area, s), { what: 'the link suggestion' })
   const adds = out.filter(x => x.kind === 'add').length
-  const priv = disclosure.filter(x => x.follows === 'never-publish').length
+  const priv = disclosure.filter(x => !x.content && x.follows === 'never-publish').length
+  const onContent = disclosure.filter(x => x.content).length
   const lic = licence as ProposedLicence | null
-  return { ok: true, message: `Kept the suggestion for catalog ${head.slice(0, 7)}: ${adds} link${adds === 1 ? '' : 's'} to add, ${out.length - adds} to drop, ${uncovered.length} braindump${uncovered.length === 1 ? '' : 's'} no project serves, ${ungrounded.length} project${ungrounded.length === 1 ? '' : 's'} without a ground${existing ? `; ${existing} named link${existing === 1 ? ' exists' : 's exist'} already` : ''}; ${disclosure.length} statement${disclosure.length === 1 ? '' : 's'} on disclosure (${priv} private, ${disclosure.length - priv} public)${lic ? `, the default licence ${lic.licence}` : ''}. Nothing is written to any because or rule until the owner agrees on the Catalog page${priv ? '; a project proposed private is refused by the publication tool from now on, until the owner answers No' : ''}.`, suggestion: s }
+  return { ok: true, message: `Kept the suggestion for catalog ${head.slice(0, 7)}: ${adds} link${adds === 1 ? '' : 's'} to add, ${out.length - adds} to drop, ${uncovered.length} braindump${uncovered.length === 1 ? '' : 's'} no project serves, ${ungrounded.length} project${ungrounded.length === 1 ? '' : 's'} without a ground${existing ? `; ${existing} named link${existing === 1 ? ' exists' : 's exist'} already` : ''}; ${disclosure.length - onContent} statement${disclosure.length - onContent === 1 ? '' : 's'} on disclosure (${priv} private, ${disclosure.length - onContent - priv} public)${onContent ? `, ${onContent} on run records, workflows or episodes` : ''}${lic ? `, the default licence ${lic.licence}` : ''}. Nothing is written to any because or rule until the owner agrees on the Catalog page${priv ? '; a project proposed private is refused by the publication tool from now on, until the owner answers No' : ''}.`, suggestion: s }
 }
 
 export async function linksView(ctx: CatalogContext, snap: CatalogSnapshot): Promise<LinksView> {
@@ -172,7 +187,7 @@ export async function linksView(ctx: CatalogContext, snap: CatalogSnapshot): Pro
   })
   // What is gone by now is shown as such, never written.
   const links = s.links.map(x => x.state === 'suggested' && (!ids.has(x.braindump) || !l.known(x.project)) ? { ...x, state: 'gone' as const } : x)
-  const disclosure = (s.disclosure ?? []).map(x => x.state === 'suggested' && (!ids.has(x.braindump) || !l.known(x.project)) ? { ...x, state: 'gone' as const } : x)
+  const disclosure = (s.disclosure ?? []).map(x => x.state === 'suggested' && (!ids.has(x.braindump) || ((!x.content || x.project) && !l.known(x.project))) ? { ...x, state: 'gone' as const } : x)
   return { suggestion: { ...s, links, disclosure, uncovered: s.uncovered.filter(u => ids.has(u.braindump)), open: links.filter(x => x.state === 'suggested').length, openDisclosure: disclosure.filter(x => x.state === 'suggested').length + (s.licence?.state === 'suggested' ? 1 : 0), behind: s.head !== snap.head }, pending }
 }
 export async function links(ctx: CatalogContext, o: { maxAgeMs?: number } = {}) { return linksView(ctx, await catalogSnapshot(ctx, o)) }
@@ -282,13 +297,15 @@ export async function answerDisclosure(ctx: CatalogContext, o: { n: number | 'li
     const at = new Date().toISOString()
     let message: string
     if (o.agree) {
-      const r = await adoptRule(ctx, 'project' in x ? { project: x.project, follows: x.follows, source: { braindump: x.braindump, commit: s.head, sentence: x.quote }, author: o.author, proposedBy: s.by }
+      const r = await adoptRule(ctx, 'content' in x && x.content ? { content: x.content, ...(x.project ? { project: x.project } : {}), follows: x.follows, source: { braindump: x.braindump, commit: s.head, sentence: x.quote }, author: o.author, proposedBy: s.by }
+        : 'project' in x ? { project: x.project, follows: x.follows, source: { braindump: x.braindump, commit: s.head, sentence: x.quote }, author: o.author, proposedBy: s.by }
         : { follows: 'default-licence', licence: x.licence, source: { braindump: x.braindump, commit: s.head, sentence: x.quote }, author: o.author, proposedBy: s.by })
       x.state = 'agreed'; x.decided = { by: o.author.trim(), at, commit: r.commit }
       message = r.message
     } else {
       x.state = 'declined'; x.decided = { by: o.author.trim(), at }
-      message = 'project' in x ? `Declined: nothing follows for ${x.project} from this sentence${x.follows === 'never-publish' ? '; the publication tool no longer refuses it on this proposal' : ''}.` : 'Declined: no default licence is adopted.'
+      message = 'content' in x && x.content ? `Declined: nothing follows for ${x.content}${x.project ? ` of ${x.project}` : ''} from this sentence${x.follows === 'never-publish' ? '; the publication tool no longer refuses them on this proposal' : ''}.`
+        : 'project' in x ? `Declined: nothing follows for ${x.project} from this sentence${x.follows === 'never-publish' ? '; the publication tool no longer refuses it on this proposal' : ''}.` : 'Declined: no default licence is adopted.'
     }
     await write(ctx.area, s)
     return { ok: true, message }

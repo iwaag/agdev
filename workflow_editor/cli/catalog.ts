@@ -44,7 +44,9 @@ wfe catalog rules list
 wfe catalog rules adopt --tag <tag> --follows never-publish|suggest-publish --braindump <path> --sentence <text> [--at <commit>] --author <who>
 wfe catalog rules adopt --project <id> --follows never-publish|publish --braindump <path> --sentence <text> [--at <commit>] --author <who>
 wfe catalog rules adopt --licence <spdx> --follows default-licence --braindump <path> --sentence <text> [--at <commit>] --author <who>
+wfe catalog rules adopt --content runs|workflows|episodes [--project <id>] --follows suggest-publish|never-publish --braindump <path> --sentence <text> [--at <commit>] --author <who>
 wfe catalog disclosure [<project>]
+wfe catalog disclosure runs <project> [--source <folder>]
 wfe catalog disclosure agree|decline (<n> | licence) --author <who>
 wfe catalog rules retire <id> --author <who>
 wfe catalog rules share <id> never|default --author <who>
@@ -246,6 +248,16 @@ disclosure what the owner's words make of each project (user_catalog p8): privat
            licence (rule default-licence; never shared as style). agree and
            decline answer a statement of the last link suggestion (its
            number) or its default licence: agree adopts the rule, one commit.
+           improve_publish p2: what a braindump states about a kind of
+           content (runs, workflows, episodes), for one project or all, is a
+           content rule: suggest-publish (the sentence is the criterion the
+           publisher reads; it selects nothing) or never-publish (the
+           publication tool refuses a contract that selects it). Without one,
+           run records and episodes stay local. disclosure runs <project>
+           lists the project's runs not yet judged, before any reading: the
+           criterion, the files each run changed outside its folder (the
+           commits naming it), the sizes of request.md and report.md and the
+           private ids in them; --source reads a draft clone.
 review     put writes review.md beside the braindump, one commit authored by
            --author (an agent signs by being the author); --base as for edit.
            No structure is required. show also says whether the braindump
@@ -533,7 +545,7 @@ export async function catalogCommand(c: CatalogCli): Promise<number> {
     }
     if (sub === 'rules' || sub === 'rule') {
       const r = await import('../server/catalogRules.ts')
-      if (a1 === 'adopt') { const x = await r.adoptRule(ctx, { tag: c.opt('tag'), project: c.opt('project'), licence: c.opt('licence'), follows: c.opt('follows'), source: { braindump: c.opt('braindump'), commit: c.opt('at'), sentence: c.opt('sentence') }, author: author() }); c.out(x.message, x); return 0 }
+      if (a1 === 'adopt') { const x = await r.adoptRule(ctx, { tag: c.opt('tag'), project: c.opt('project'), licence: c.opt('licence'), content: c.opt('content'), follows: c.opt('follows'), source: { braindump: c.opt('braindump'), commit: c.opt('at'), sentence: c.opt('sentence') }, author: author() }); c.out(x.message, x); return 0 }
       if (a1 === 'retire') { if (!a2) throw c.usage('wfe catalog rules retire <id> --author <who>'); const x = await r.retireRule(ctx, { id: a2, author: author() }); c.out(x.message, x); return 0 }
       if (a1 === 'share') { const v = c.positional[3]; if (!a2 || !v) throw c.usage('wfe catalog rules share <id> never|default --author <who>'); const x = await r.shareRule(ctx, { id: a2, share: v, author: author() }); c.out(x.message, x); return 0 }
       if (a1 !== 'list' && a1 !== undefined) throw c.usage('wfe catalog rules list | adopt | retire | share')
@@ -548,6 +560,11 @@ export async function catalogCommand(c: CatalogCli): Promise<number> {
         const l = await import('../server/catalogLinks.ts')
         const x = await l.answerDisclosure(ctx, { n: a2 === 'licence' ? 'licence' : Number(a2), agree: a1 === 'agree', author: author() })
         c.out(x.message, x); return 0
+      }
+      if (a1 === 'runs') {
+        if (!a2) throw c.usage('wfe catalog disclosure runs <project> [--source <folder>]')
+        const x = await r.disclosureRuns(ctx, { project: a2, source: c.opt('source') })
+        c.out(r.disclosureRunsLines(x).join('\n'), x); return 0
       }
       const d = await r.disclosure(ctx, { maxAgeMs: 0, project: a1 })
       c.out(r.disclosureLines(d).join('\n'), d); return 0

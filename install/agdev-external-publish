@@ -17,6 +17,8 @@ repositories stay the development authority; nothing is ever force-pushed, mirro
   abort   --repo ID                 drop a conflicted staging; the public checkout returns to its base
   push    [--stop-before ID]        push staged repositories, dependencies first, each only after its
                                     dependencies' public commits are verified on their public remotes
+  runs    [--rev R]                 the project's run records not yet judged: the criterion, the files each run changed
+                                    outside its folder, the sizes of request.md and report.md, private ids in them
   status                            the journal: source/public pairs, staged and pending work
   convert-journal                   convert a forge.publication.v1 journal to this schema (keeps a copy)
 
@@ -45,7 +47,24 @@ Contract (TOML, schema agdev.publication.v1; forge.publication.v1 is read for ol
   [[submodule]] path, contract                 a submodule published with this repository (its gitlink at
                                                the pinned revision selects the child's input commit)
   [[exclude]] path, why                        a submodule deliberately left out of the public tree
+  [[run]] id, [files], because                 a run record: devdocs/runs/<id>/<file> for each file (default
+                                               request.md, report.md); never run.json, original-input.md, context/,
+                                               definition/. A [[tree]] never copies devdocs/runs/; a [[file]] there is
+                                               refused. Needs an adopted `runs` rule suggest-publish for the project
+  [[local]] path, because                      a source path kept local by a decision: a [[tree]] leaves it out, a
+                                               [[file]] or [[run]] at or below it is refused
+  [runs] judged = "<commit>"                   how far the publisher judged the runs (read by `runs`)
+  because = "<ground>"                         top level (the project's own ground) and on every [[tree]]/[[file]]
+                                               from source:/workspace:, [[submodule]], [[run]], [[local]]:
+                                               rule:<id> | answer:<project>/<workflow>/<run> |
+                                               answer:before-improve_publish | project | owner:<name>
 A submodule of the source that is neither declared nor excluded stops the build.
+
+Scope (improve_publish p2): each publication records its selections and the answer each is published under. A
+selection no answered one covers (new, or wider: an exclude removed, a file outside every answered tree, a run's
+file added) is a scope change: `build` prints it, `stage` refuses it (code scope) without --scope-answer
+<project>/<workflow>/<run>#<question>. New files under an answered [[tree]] and narrowing are not scope changes.
+A missing `because` is listed as not grounded and stops a stage with a scope change.
 
 Ownership: `stage --owner O` records who a staging belongs to (a workflow run); `push`, `resolve` and `abort`
 then need the same `--owner`, `push --operation <stage id>` refuses when the assessed staging was replaced, and
@@ -53,7 +72,7 @@ staging over another owner's unfinished staging needs `--take-over <reason>` (re
 
 Standard library only; Python >= 3.11. Exit status 1 with `agdev-external-publish [<code>]: <reason>` on any
 refusal; codes: conflict, stale-public-head, unavailable-source, child-not-public, graph, contract, check-failed,
-checkout-state, owner, busy, infrastructure, usage, rule.
+checkout-state, owner, busy, infrastructure, usage, rule, scope.
 
 Rules (agdev docs/mycatalog.md, Rules): a catalog's rules.yaml refuses a candidate that holds a braindump kept
 private by a tag rule, or a public projects.yaml whose because names one; and on an installation with a catalog,
@@ -94,7 +113,7 @@ OVERLAY = "publication/overlay"
 
 class Refusal(SystemExit):
     """A stop with a category (`code`) a workflow can act on: conflict, stale-public-head, unavailable-source,
-    child-not-public, graph, contract, check-failed, checkout-state, owner, busy, infrastructure, usage."""
+    child-not-public, graph, contract, check-failed, checkout-state, owner, busy, infrastructure, usage, rule, scope."""
     code = "refused"
 
     @classmethod
@@ -359,10 +378,11 @@ def excluded_by(rel: str, patterns: list[str]) -> bool:
     return any(fnmatch(rel, p) or fnmatch(rel, p.rstrip("/") + "/*") for p in patterns)
 
 
-def tree_selection(repo: Path, rev: str, contract: dict) -> dict[str, tuple[bytes, str, str, str | None]]:
+def tree_selection(repo: Path, rev: str, contract: dict, locals_: list[str] | None = None) -> dict[str, tuple[bytes, str, str, str | None]]:
     """Every file a [[tree]] selects: public path -> (content, mode, origin, source path or None). A tree copies a directory of the
     source (or overlay) at the pinned revision, minus `exclude` globs (relative to `from`). Gitlinks and
-    .gitmodules are never copied (submodules come from [[submodule]]), nor the source's publication/ folder."""
+    .gitmodules are never copied (submodules come from [[submodule]]), nor the source's publication/ folder, nor
+    anything below devdocs/runs/ (a run record is selected by its own [[run]]) or at or below a [[local]] path."""
     selected: dict[str, tuple[bytes, str, str, str | None]] = {}
     for spec in contract.get("tree", []):
         kind, _, base = spec.get("from", "").partition(":")
@@ -385,6 +405,8 @@ def tree_selection(repo: Path, rev: str, contract: dict) -> dict[str, tuple[byte
                 continue
             if excluded_by(rel, excludes):
                 continue
+            if kind == "source" and (under(path, RUNS_DIR) or any(under(path, l) for l in locals_ or [])):
+                continue  # improve_publish p2: run records only by [[run]]; a [[local]] path is left out
             public = f"{public_root}/{rel}" if public_root else rel
             if public in selected:
                 raise Refusal.coded("contract", f"{public} is selected by two [[tree]] entries")
@@ -427,10 +449,30 @@ def installation_area() -> Path | None:
     return guess if guess.is_dir() else None
 
 
-def read_yaml_rules(raw: bytes, where: str) -> dict:
+def import_yaml():
+    """PyYAML, also from the user site of the account's own home when HOME points elsewhere (agent sessions do:
+    improve_publish p2 report 1). None when this interpreter has none."""
     try:
         import yaml
+        return yaml
     except ImportError:
+        pass
+    import pwd
+    home, ver = Path(pwd.getpwuid(os.getuid()).pw_dir), f"{sys.version_info.major}.{sys.version_info.minor}"
+    for site in (home / "Library" / "Python" / ver / "lib" / "python" / "site-packages",
+                 home / ".local" / "lib" / f"python{ver}" / "site-packages"):
+        if site.is_dir() and str(site) not in sys.path:
+            sys.path.append(str(site))
+    try:
+        import yaml
+        return yaml
+    except ImportError:
+        return None
+
+
+def read_yaml_rules(raw: bytes, where: str) -> dict:
+    yaml = import_yaml()
+    if yaml is None:
         raise Refusal.coded("rule", f"{where} holds adopted rules and PyYAML is not installed to read them: "
                                     "nothing is built (python3 -m pip install pyyaml)")
     class Loader(yaml.SafeLoader):  # times stay as written (a public form copies them as they are)
@@ -443,39 +485,148 @@ def read_yaml_rules(raw: bytes, where: str) -> dict:
         raise Refusal.coded("rule", f"{where} cannot be read ({error}): nothing is built")
 
 
+_CATALOG: tuple[list[dict], dict] | None = None
+
+
+def catalog_state() -> tuple[list[dict], dict]:
+    """The rules of this installation's catalog (rules.yaml at HEAD of the service's clone) and its open link
+    suggestion (<area>/.local/catalog-links.json, with the summoner's proposals). ([], {}) without a catalog."""
+    global _CATALOG
+    if _CATALOG is not None:
+        return _CATALOG
+    rules: list[dict] = []
+    links: dict = {}
+    area = installation_area()
+    if area and (area / "catalog.json").is_file():
+        clone = area / ".local" / "catalog"
+        raw = git(clone, "cat-file", "blob", f"HEAD:{RULES_FILE}", check=False) if clone.is_dir() else b""
+        if raw and any(schema in raw.decode("utf-8", errors="replace") for schema in RULES_SCHEMAS):
+            rules = [r for r in read_yaml_rules(raw, f"the catalog's {RULES_FILE}").get("rules") or [] if isinstance(r, dict)]
+        try:
+            links = json.loads((area / ".local" / "catalog-links.json").read_text(encoding="utf-8")) or {}
+        except Exception:
+            links = {}
+    _CATALOG = (rules, links)
+    return _CATALOG
+
+
+def has_catalog() -> bool:
+    area = installation_area()
+    return bool(area and (area / "catalog.json").is_file())
+
+
 _PRIVATE: dict | None = None
 
 
 def private_projects() -> dict[str, list[str]]:
     """The projects this installation's catalog keeps private, each with why (the same reading as
     `wfe catalog disclosure`: an adopted project rule never-publish at HEAD of the service's clone, or such a
-    proposal not declined). {} on an installation without a catalog."""
+    proposal not declined). {} on an installation without a catalog. A content rule for one project
+    (improve_publish p2) is not a project rule."""
     global _PRIVATE
     if _PRIVATE is not None:
         return _PRIVATE
     found: dict[str, list[str]] = {}
-    area = installation_area()
-    if area and (area / "catalog.json").is_file():
-        clone = area / ".local" / "catalog"
-        raw = git(clone, "cat-file", "blob", f"HEAD:{RULES_FILE}", check=False) if clone.is_dir() else b""
-        if raw and any(schema in raw.decode("utf-8", errors="replace") for schema in RULES_SCHEMAS):
-            for r in read_yaml_rules(raw, f"the catalog's {RULES_FILE}").get("rules") or []:
-                if r.get("project") and r.get("follows") == "never-publish":
-                    src = r.get("source") or {}
-                    found.setdefault(str(r["project"]), []).append(
-                        f"rule {r.get('id')}, adopted by {(r.get('adopted') or {}).get('by')} from "
-                        f"{src.get('braindump')}@{str(src.get('commit'))[:7]}: \"{src.get('sentence')}\"")
-        try:
-            links = json.loads((area / ".local" / "catalog-links.json").read_text(encoding="utf-8"))
-            for d in links.get("disclosure") or []:
-                if d.get("project") and d.get("follows") == "never-publish" and d.get("state") == "suggested":
-                    found.setdefault(str(d["project"]), []).append(
-                        f"proposed by {links.get('by')} ({links.get('id')}, {d.get('n')}) from {d.get('braindump')}: "
-                        f"\"{d.get('quote')}\" (not answered yet; No on the Catalog page lifts it)")
-        except Exception:
-            pass
+    rules, links = catalog_state()
+    for r in rules:
+        if r.get("project") and not r.get("content") and r.get("follows") == "never-publish":
+            src = r.get("source") or {}
+            found.setdefault(str(r["project"]), []).append(
+                f"rule {r.get('id')}, adopted by {(r.get('adopted') or {}).get('by')} from "
+                f"{src.get('braindump')}@{str(src.get('commit'))[:7]}: \"{src.get('sentence')}\"")
+    for d in links.get("disclosure") or []:
+        if d.get("project") and not d.get("content") and d.get("follows") == "never-publish" and d.get("state") == "suggested":
+            found.setdefault(str(d["project"]), []).append(
+                f"proposed by {links.get('by')} ({links.get('id')}, {d.get('n')}) from {d.get('braindump')}: "
+                f"\"{d.get('quote')}\" (not answered yet; No on the Catalog page lifts it)")
     _PRIVATE = found
     return found
+
+
+# ---------------------------------------------------------------- content rules (improve_publish p2)
+
+RUNS_DIR, EPISODES_SRC, WORKFLOWS_DIR = "devdocs/runs", "devdocs/episodes", "devdocs/workflows"
+CONTENTS = ("runs", "workflows", "episodes")
+RUN_FILES = ["request.md", "report.md"]
+RUN_NEVER = ("run.json", "original-input.md")
+RUN_NEVER_DIRS = ("context", "definition")
+# improve_publish p2 decision 12: a missing `because` stops only a widening stage until every contract has its
+# grounds (step 6); then it is a contract refusal everywhere.
+GROUNDS_REQUIRED = False
+
+
+def under(path: str, base: str) -> bool:
+    base = base.strip("/")
+    return path == base or path.startswith(base + "/")
+
+
+def content_statements(content: str) -> list[dict]:
+    """Every statement on a kind of content: adopted rules, and the summoner's proposals not answered."""
+    rules, links = catalog_state()
+    out = []
+    for r in rules:
+        if r.get("content") == content:
+            src = r.get("source") or {}
+            out.append({"rule": r.get("id"), "project": r.get("project") or None, "follows": r.get("follows"),
+                        "adopted": True, "at": str((r.get("adopted") or {}).get("at") or ""),
+                        "braindump": src.get("braindump"), "sentence": src.get("sentence")})
+    for d in links.get("disclosure") or []:
+        if d.get("content") == content and d.get("state") == "suggested":
+            out.append({"proposal": f"{links.get('id')} #{d.get('n')}", "project": d.get("project") or None,
+                        "follows": d.get("follows"), "adopted": False, "by": links.get("by"),
+                        "braindump": d.get("braindump"), "sentence": d.get("quote")})
+    return out
+
+
+def criterion(content: str, project: str | None) -> dict | None:
+    """The statement that decides a kind of content of a project: of the statements in force (adopted, or a
+    proposed never-publish), those for this project, else the general ones; never-publish wins between them. A
+    proposed suggest-publish decides nothing until the owner's OK."""
+    force = [x for x in content_statements(content) if x["adopted"] or x["follows"] == "never-publish"]
+    own = [x for x in force if project and x["project"] == project]
+    pool = own or [x for x in force if not x["project"]]
+    return next((x for x in pool if x["follows"] == "never-publish"), None) or next(
+        (x for x in pool if x["follows"] == "suggest-publish"), None)
+
+
+def statement_words(x: dict) -> str:
+    who = f"rule {x['rule']}" if x.get("rule") else f"proposed by {x.get('by')} ({x.get('proposal')}, not answered yet)"
+    return f"{who}, from {x.get('braindump')}: \"{x.get('sentence')}\""
+
+
+def content_refusal(content: str, project: str | None, what: str) -> None:
+    """A selection of run records, episodes or workflows against the owner's words: never-publish refuses; run
+    records and episodes without a suggest-publish stay local (p1 principle 2)."""
+    c = criterion(content, project)
+    if c and c["follows"] == "never-publish":
+        raise Refusal.coded("rule", f"{what}: {content} of {project or 'any project'} are never published ({statement_words(c)})")
+    if content in ("runs", "episodes") and not c:
+        raise Refusal.coded("rule", f"{what}: no rule of the owner states that {content} of {project or 'this project'} "
+                                    f"are published, so they stay local (agdev docs/external-publication.md, What stays local)")
+
+
+def project_of(ctx: "Ctx") -> str | None:
+    """The project a workspace belongs to (the registry, else pj-<id>); None for the catalog's own workspace."""
+    area = installation_area()
+    if area and (area / "catalog.json").is_file():
+        try:
+            setting = json.loads((area / "catalog.json").read_text(encoding="utf-8"))
+            if setting.get("publicationWorkspace") and Path(setting["publicationWorkspace"]).resolve() == ctx.workspace:
+                return None
+        except Exception:
+            pass
+    project = None
+    if area:
+        try:
+            registry = json.loads((area / "registry.json").read_text(encoding="utf-8"))
+            for w in registry.get("workspaces", []):
+                if Path(w.get("path", "")).resolve() == ctx.workspace:
+                    project = w.get("project") or w.get("id")
+        except Exception:
+            pass
+    if not project and ctx.workspace.name.startswith("pj-"):
+        project = ctx.workspace.name[3:]
+    return project
 
 
 def private_name_re(project: str):
@@ -488,27 +639,11 @@ def disclosure_refusal(ctx: "Ctx") -> None:
     `project: <id>, follows: never-publish` in the catalog's rules.yaml, or such a statement the summoner proposed
     and the owner has not declined (<area>/.local/catalog-links.json). Its workspace is refused for build, stage and
     push. An installation without a catalog, or a catalog without such a rule, is not affected."""
-    area = installation_area()
-    if not area or not (area / "catalog.json").is_file():
+    if not has_catalog():
         return
-    try:
-        setting = json.loads((area / "catalog.json").read_text(encoding="utf-8"))
-    except Exception:
-        return
-    if setting.get("publicationWorkspace") and Path(setting["publicationWorkspace"]).resolve() == ctx.workspace:
-        return  # the catalog itself: its tag rules are read from the candidate (rule_refusals)
-    project = None
-    try:
-        registry = json.loads((area / "registry.json").read_text(encoding="utf-8"))
-        for w in registry.get("workspaces", []):
-            if Path(w.get("path", "")).resolve() == ctx.workspace:
-                project = w.get("project") or w.get("id")
-    except Exception:
-        pass
-    if not project and ctx.workspace.name.startswith("pj-"):
-        project = ctx.workspace.name[3:]
+    project = project_of(ctx)
     if not project:
-        return
+        return  # the catalog itself (its tag rules are read from the candidate), or no project known
     found = private_projects().get(project, [])
     if found:
         raise Refusal.coded("rule", f"project {project} is kept private by the owner's words: {'; '.join(found)}. "
@@ -540,7 +675,7 @@ def public_rules(repo: Path, rev: str, contract: dict, raw: bytes) -> bytes:
     braindump this candidate selects, that are not never-publish on a project (it names what is private) and not
     share: never; without source.commit (an internal commit no reader can resolve); adopted.by the account of the
     destination (only the owner adopts a rule). Everything else is left out without a trace."""
-    import yaml
+    yaml = import_yaml()
     doc = read_yaml_rules(raw, f"{RULES_FILE} at {rev[:12]}")
     _, selected = selected_sources(repo, rev, contract)
     account = identity(contract.get("destination", "")).split("/")[0] or None
@@ -551,11 +686,13 @@ def public_rules(repo: Path, rev: str, contract: dict, raw: bytes) -> bytes:
         source = r.get("source") or {}
         if f"{EPISODES}{source.get('braindump')}/braindump.md" not in selected:
             continue
-        if r.get("project") and r.get("follows") == "never-publish":
+        if r.get("project") and not r.get("content") and r.get("follows") == "never-publish":
             continue
+        if r.get("content") and r.get("project") and str(r["project"]) in private_projects():
+            continue  # a content rule naming a project kept private names what is private
         if r.get("share") == "never" or r.get("follows") == "default-licence":
             continue
-        rule = {k: r[k] for k in ("id", "tag", "project", "follows") if k in r}
+        rule = {k: r[k] for k in ("id", "content", "tag", "project", "follows") if k in r}
         rule["source"] = {k: source[k] for k in ("braindump", "sentence") if k in source}
         adopted = dict(r.get("adopted") or {})
         if account and "by" in adopted:
@@ -581,8 +718,8 @@ def rule_refusals(repo: Path, rev: str, contract: dict) -> None:
     raw = git(repo, "cat-file", "blob", f"{rev}:{RULES_FILE}", check=False)
     if not raw or not any(schema in raw.decode("utf-8", errors="replace") for schema in RULES_SCHEMAS):
         return
-    import yaml
     doc = read_yaml_rules(raw, f"{RULES_FILE} at {rev[:12]}")
+    yaml = import_yaml()
     rules = [r for r in doc.get("rules") or [] if isinstance(r, dict) and r.get("follows") == "never-publish" and r.get("tag")]
     if doc.get("schema") not in RULES_SCHEMAS or not rules:
         return
@@ -615,19 +752,280 @@ def rule_refusals(repo: Path, rev: str, contract: dict) -> None:
                                     "out of the shared project, or keep projects.yaml out of the contract")
 
 
+def local_paths(contract: dict) -> list[str]:
+    """Source paths kept local by a decision ([[local]] path, because)."""
+    out = []
+    for e in contract.get("local", []):
+        path = str(e.get("path", "")).strip("/")
+        if not path or path.startswith(".") or ".." in path.split("/"):
+            raise Refusal.coded("contract", f"[[local]] path {e.get('path')!r}: a source path")
+        out.append(path)
+    return out
+
+
+def content_of(path: str) -> str | None:
+    return "runs" if under(path, RUNS_DIR) else "episodes" if under(path, EPISODES_SRC) else \
+        "workflows" if under(path, WORKFLOWS_DIR) else None
+
+
+_CHECKED: dict[tuple, None] = {}
+
+
+def content_check(path: str, project: str | None, what: str) -> None:
+    content = content_of(path)
+    if content in ("episodes", "workflows") and (content, project) not in _CHECKED:
+        content_refusal(content, project, what)
+        _CHECKED[(content, project)] = None
+
+
+def run_files(entry: dict) -> tuple[str, list[str]]:
+    run_id = str(entry.get("id", "")).strip("/")
+    parts = run_id.split("/")
+    if len(parts) != 2 or not all(parts) or any(x.startswith(".") for x in parts):
+        raise Refusal.coded("contract", f"[[run]] id {entry.get('id')!r}: <workflow>/<run>, e.g. freework/run-018")
+    names = entry.get("files", RUN_FILES)
+    if not isinstance(names, list) or not names or not all(isinstance(n, str) and n for n in names):
+        raise Refusal.coded("contract", f"[[run]] {run_id}: files is a list of the run folder's text files")
+    for n in names:
+        segs = n.strip("/").split("/")
+        if n.startswith("/") or ".." in segs or segs[0] in RUN_NEVER_DIRS or n.strip("/") in RUN_NEVER:
+            raise Refusal.coded("contract", f"[[run]] {run_id}: {n} is never public (run.json, original-input.md, "
+                                "context/ and definition/ are kept local whatever the contract says)")
+    return run_id, [n.strip("/") for n in names]
+
+
+def run_selection(repo: Path, rev: str, contract: dict, project: str | None, locals_: list[str]) -> list[tuple]:
+    """The files of every [[run]]: (public path, content, mode, run id). A run needs an adopted runs rule
+    suggest-publish that applies to the project; never-publish (adopted or proposed) refuses."""
+    out = []
+    for entry in contract.get("run", []):
+        run_id, names = run_files(entry)
+        folder = f"{RUNS_DIR}/{run_id}"
+        for l in locals_:
+            if under(folder, l) or under(l, folder):
+                raise Refusal.coded("contract", f"[[run]] {run_id}: {folder} is kept local ([[local]] {l})")
+        content_refusal("runs", project, f"[[run]] {run_id}")
+        for n in names:
+            content, mode = blob(repo, rev, f"{folder}/{n}")
+            try:
+                content.decode("utf-8")
+            except UnicodeDecodeError:
+                raise Refusal.coded("contract", f"[[run]] {run_id}: {n} is not a text file; a run's media is published "
+                                    "as the project's own asset, selected like any project file")
+            out.append((f"{folder}/{n}", content, mode, run_id))
+    return out
+
+
+# ---------------------------------------------------------------- grounds and scope (improve_publish p2)
+
+GROUND_RE = None
+
+
+def ground_ok(value) -> bool:
+    import re
+    global GROUND_RE
+    GROUND_RE = GROUND_RE or re.compile(r"^(rule:[A-Za-z0-9][A-Za-z0-9_.-]*|answer:[a-z0-9][a-z0-9_.-]*/[a-z0-9][a-z0-9_.-]*/"
+                                        r"run-[0-9]+|answer:before-improve_publish|project|owner:\S.*)$")
+    return isinstance(value, str) and bool(GROUND_RE.match(value))
+
+
+def needs_ground(kind: str, entry: dict) -> bool:
+    if kind in ("submodule", "run", "local"):
+        return True
+    return str(entry.get("from", "")).split(":", 1)[0] in ("source", "workspace")
+
+
+def label_of(kind: str, e: dict) -> str:
+    return f"[[{kind}]] " + str(e.get("id") or e.get("path") or e.get("public") or e.get("from") or "")
+
+
+def grounds(contract: dict) -> dict:
+    """What names no ground (or a malformed one), and the rule grounds no longer in the catalog."""
+    missing, stale = [], []
+    rules_known = {r.get("id") for r in catalog_state()[0]}
+    pairs = [("contract", contract)] + [(k, e) for k in ("tree", "file", "submodule", "run", "local") for e in contract.get(k, [])]
+    for kind, e in pairs:
+        if kind != "contract" and not needs_ground(kind, e):
+            continue
+        where = "the contract (top-level because: the project's own ground)" if kind == "contract" else label_of(kind, e)
+        value = e.get("because")
+        if not ground_ok(value):
+            missing.append(where + (f": because {value!r} is none of rule:<id>, answer:<project>/<workflow>/<run>, "
+                                    "answer:before-improve_publish, project, owner:<name>" if value else ""))
+        elif value.startswith("rule:") and has_catalog() and value[5:] not in rules_known:
+            stale.append(f"{where}: {value} is not a rule of the catalog any more (reported; nothing is withdrawn)")
+    return {"not_grounded": missing, "grounds_stale": stale}
+
+
+def scope_items(repo: Path, rev: str, contract: dict) -> list[dict]:
+    """The selections a scope is made of: source and workspace [[tree]]/[[file]], [[submodule]], [[run]]."""
+    items = []
+    for t in contract.get("tree", []):
+        if str(t.get("from", "")).startswith("source:"):
+            items.append({"kind": "tree", "public": t.get("public", ""), "from": t["from"],
+                          "exclude": list(t.get("exclude", [])), "because": t.get("because")})
+    for f in contract.get("file", []):
+        if str(f.get("from", "")).split(":", 1)[0] in ("source", "workspace"):
+            items.append({"kind": "file", "public": f["public"], "from": f["from"], "because": f.get("because")})
+    for m in contract.get("submodule", []):
+        items.append({"kind": "submodule", "path": m["path"], "because": m.get("because")})
+    for r in contract.get("run", []):
+        run_id, names = run_files(r)
+        items.append({"kind": "run", "id": run_id, "files": names, "because": r.get("because")})
+    return items
+
+
+def item_paths(item: dict, listing: list[str], locals_: list[str]) -> list[str]:
+    if item["kind"] == "file":
+        kind, _, rel = item["from"].partition(":")
+        return [rel.strip("/") if kind == "source" else f"workspace:{rel}"]
+    if item["kind"] == "submodule":
+        return [item["path"]]
+    if item["kind"] == "run":
+        return [f"{RUNS_DIR}/{item['id']}/{n}" for n in item["files"]]
+    base = item["from"].partition(":")[2].strip("/")
+    out = []
+    for path in listing:
+        if base and not path.startswith(base + "/"):
+            continue
+        if path == ".gitmodules" or under(path, "publication") or under(path, RUNS_DIR) or any(under(path, l) for l in locals_):
+            continue
+        if not excluded_by(path[len(base) + 1:] if base else path, item["exclude"]):
+            out.append(path)
+    return out
+
+
+def key_of(item: dict) -> tuple:
+    return (item["kind"], item.get("id") or item.get("path") or (item.get("public"), item.get("from")))
+
+
+def scope_compare(repo: Path, rev: str, contract: dict, answered: list[dict]) -> tuple[list[dict], list[dict]]:
+    """The current selections, each with the answer that covers it, and the scope change: the items no answered
+    selection covers (new, or wider), each with the paths it adds. A path is covered when an answered [[file]]
+    names it or an answered [[tree]] selects it as a pattern (new files under an answered tree are covered)."""
+    listing = [r.split("\t", 1)[1] for r in filter(None, git(repo, "ls-tree", "-r", "-z", "--full-tree", rev).decode().split("\0"))]
+    locals_ = local_paths(contract)
+    files = {}
+    trees = []
+    for a in answered:
+        if a["kind"] == "file":
+            k, _, rel = a["from"].partition(":")
+            files[rel.strip("/") if k == "source" else f"workspace:{rel}"] = a.get("answer")
+        elif a["kind"] == "tree":
+            trees.append(a)
+    by_key = {key_of(a): a for a in answered}
+
+    def covering(path: str) -> str | None:
+        if path in files:
+            return files[path] or "answered"
+        for t in trees:
+            base = t["from"].partition(":")[2].strip("/")
+            if (not base or path.startswith(base + "/")) and not excluded_by(path[len(base) + 1:] if base else path, t.get("exclude", [])):
+                return t.get("answer") or "answered"
+        return None
+
+    items, change = [], []
+    for item in scope_items(repo, rev, contract):
+        same = by_key.get(key_of(item))
+        if item["kind"] == "run":
+            adds = [n for n in item["files"] if not same or n not in same.get("files", [])]
+            adds = [f"{RUNS_DIR}/{item['id']}/{n}" for n in adds]
+            answer = same.get("answer") if same and not adds else None
+        elif item["kind"] == "submodule":
+            adds = [] if same else [item["path"]]
+            answer = same.get("answer") if same else None
+        else:
+            paths = item_paths(item, listing, locals_)
+            adds = [x for x in paths if covering(x) is None]
+            answer = (same.get("answer") if same else None) or (covering(paths[0]) if paths and not adds else None)
+        if adds:
+            group = "run records" if item["kind"] == "run" else "workflows" if all(under(x, WORKFLOWS_DIR) for x in adds) else "the rest"
+            change.append({**item, "group": group, "adds": adds})
+        items.append({**item, "answer": answer if not adds else None})
+    return items, change
+
+
+def answered_scope(node_repo: Path, journal_state: dict | None, contract_path: str) -> tuple[list[dict], str]:
+    """The last answered scope of a repository: the journal's, or (a journal from before improve_publish p2) the
+    selections of the contract at the last published source revision, answered before this phase."""
+    published = entries(journal_state, "published") if journal_state else []
+    if not published:
+        return [], "none (a first publication)"
+    last = published[-1]
+    if last.get("scope") is not None:
+        return last["scope"], f"the journal (publication from {last['source_rev'][:12]})"
+    try:
+        old = load_contract(node_repo, last["source_rev"], contract_path)
+        items = scope_items(node_repo, last["source_rev"], old)
+    except Refusal:
+        return [], "none (the last published contract cannot be read)"
+    return [{**i, "answer": "answer:before-improve_publish"} for i in items], \
+        f"the contract at {last['source_rev'][:12]}, published before improve_publish p2 (answer:before-improve_publish)"
+
+
+def first_publication_rule(contract: dict, project: str | None) -> str | None:
+    """A first publication whose contract names an adopted `project <id> publish` rule as its ground: that rule
+    answers the repository itself (user_catalog p8), not its run records."""
+    because = contract.get("because")
+    if not (isinstance(because, str) and because.startswith("rule:")):
+        return None
+    for r in catalog_state()[0]:
+        if r.get("id") == because[5:] and not r.get("content") and r.get("project") == project and r.get("follows") == "publish":
+            return because
+    return None
+
+
+def scope_of(ctx: "Ctx", node: "Node", journal: dict) -> dict:
+    """Everything stage and build say about one repository's scope and grounds."""
+    state = journal["repositories"].get(node.id)
+    answered, basis = answered_scope(node.repo, state, node.contract_path)
+    items, change = scope_compare(node.repo, node.rev, node.contract, answered)
+    rule = first_publication_rule(node.contract, project_of(ctx)) if not answered else None
+    if rule:
+        kept = []
+        for c in change:
+            if c["kind"] == "run":
+                kept.append(c)
+            else:
+                for i in items:
+                    if key_of(i) == key_of(c):
+                        i["answer"] = rule
+        change = kept
+        basis += f"; the repository is answered by {rule}"
+    return {"answered_by": basis, "items": items, "change": change, **grounds(node.contract),
+            "local": [{"path": e.get("path"), "because": e.get("because")} for e in node.contract.get("local", [])]}
+
+
+def change_lines(scope: dict) -> list[str]:
+    out = []
+    for group in ("run records", "workflows", "the rest"):
+        items = [c for c in scope["change"] if c["group"] == group]
+        if items:
+            out.append(f"{group}:")
+            for c in items:
+                out.append(f"  {label_of(c['kind'], c)} (because {c.get('because') or 'none'}): adds {', '.join(c['adds'][:20])}"
+                           + (f" and {len(c['adds']) - 20} more" if len(c["adds"]) > 20 else ""))
+    return out
+
+
 def build(ctx: Ctx, repo: Path, rev: str, contract: dict, out: Path, links: dict[str, tuple[str, str]],
           declared: list[str]) -> dict:
     """Write the candidate of one repository; links: submodule path -> (public commit, public URL)."""
     if out.exists() and any(out.iterdir()):
         raise Refusal.coded("usage", f"{out} is not empty")
     rule_refusals(repo, rev, contract)
+    project = project_of(ctx)
+    locals_ = local_paths(contract)
+    runs = run_selection(repo, rev, contract, project, locals_)
     out.mkdir(parents=True, exist_ok=True)
     files, inputs = [], []
     named = {f["public"] for f in contract.get("file", [])}
     catalog = is_catalog(repo, rev)
-    for public, (content, mode, origin, source_path) in sorted(tree_selection(repo, rev, contract).items()):
+    for public, (content, mode, origin, source_path) in sorted(tree_selection(repo, rev, contract, locals_).items()):
         if public in named:
             continue  # a [[file]] for the same path decides (with its edits)
+        if source_path:
+            content_check(source_path, project, f"[[tree]] {origin.split(' ')[0]}: {source_path}")
         if catalog and source_path == RULES_FILE:
             content = public_rules(repo, rev, contract, content)
         target = out / public
@@ -639,6 +1037,14 @@ def build(ctx: Ctx, repo: Path, rev: str, contract: dict, out: Path, links: dict
         kind, _, rel = entry["from"].partition(":")
         mode = "100644"
         if kind == "source":
+            path = rel.strip("/")
+            if under(path, RUNS_DIR):
+                raise Refusal.coded("contract", f"[[file]] {entry['public']}: {path} is a run record; a run is selected by its "
+                                    "own [[run]] (id, files), never by [[file]] or [[tree]]")
+            for l in locals_:
+                if under(path, l):
+                    raise Refusal.coded("contract", f"[[file]] {entry['public']}: {path} is kept local ([[local]] {l})")
+            content_check(path, project, f"[[file]] {entry['public']}")
             content, mode = blob(repo, rev, rel)
             if rel.strip("/") == RULES_FILE and is_catalog(repo, rev):
                 if entry.get("edit"):
@@ -665,6 +1071,14 @@ def build(ctx: Ctx, repo: Path, rev: str, contract: dict, out: Path, links: dict
         target.chmod(0o755 if mode == "100755" else 0o644)
         files.append({"path": entry["public"], "from": entry["from"], "sha256": hashlib.sha256(content).hexdigest(),
                       "edits": len(entry.get("edit", []))})
+    for public, content, mode, run_id in runs:
+        if public in named or (out / public).exists():
+            raise Refusal.coded("contract", f"[[run]] {run_id}: {public} is selected twice")
+        target = out / public
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(content)
+        target.chmod(0o644)
+        files.append({"path": public, "from": f"run:{run_id}", "sha256": hashlib.sha256(content).hexdigest(), "edits": 0})
     gitlinks = []
     if declared:
         text = ""
@@ -818,8 +1232,14 @@ def public_url(destination: str, parent: str) -> str:
     return destination
 
 
+def recorded_scope(scope: dict, scope_answer: str | None) -> list[dict]:
+    """The scope a publication records: every selection with the answer it is published under."""
+    answer = f"answer:{scope_answer.split('#', 1)[0]}" if scope_answer else None
+    return [{k: v for k, v in {**i, "answer": i.get("answer") or answer}.items() if v is not None} for i in scope["items"]]
+
+
 def stage_repo(ctx: Ctx, root: Node, node: Node, journal: dict, results: dict, message: str, op: dict,
-               extra_secrets: list[str]) -> dict:
+               extra_secrets: list[str], scope: dict | None = None, scope_answer: str | None = None) -> dict:
     checkout = checkout_of(ctx, root, node, journal)
     state = repo_state(journal, node, checkout, ctx)
     branch = state["branch"]
@@ -836,11 +1256,13 @@ def stage_repo(ctx: Ctx, root: Node, node: Node, journal: dict, results: dict, m
             return {"public_commit": entry["public_commit"], "action": "already published"}
     info, tree = candidate_tree(ctx, node.repo, node.rev, node.contract_path, checkout, links, True, extra_secrets)
     previous = published[-1] if published else None
+    record = recorded_scope(scope, scope_answer) if scope else None
     staged = entries(state, "staged")
     if previous and previous["candidate_tree"] == tree:
         pair = {"source_rev": node.rev, "candidate_tree": tree, "public_commit": previous["public_commit"],
                 "gitlinks": gl_record, "status": "published", "reused_from": previous["source_rev"],
-                "published_at": now(), "notes": "internal-only change: the candidate equals the last published one"}
+                "published_at": now(), "notes": "internal-only change: the candidate equals the last published one",
+                **({"scope": record} if record is not None else {})}
         state["publications"] = [p for p in state["publications"] if p.get("status") != "staged"] + [pair]
         return {"public_commit": previous["public_commit"], "action": "unchanged candidate; pair recorded"}
     if staged and staged[-1]["candidate_tree"] == tree and staged[-1].get("gitlinks", []) == gl_record and \
@@ -855,7 +1277,7 @@ def stage_repo(ctx: Ctx, root: Node, node: Node, journal: dict, results: dict, m
     entry = {"source_rev": node.rev, "candidate_tree": tree, "destination": state["destination"], "branch": branch,
              "inputs": info["inputs"], "files": len(info["files"]), "gitlinks": gl_record,
              "checks": {"forbidden_and_secret_values": "passed", "private_names": info.get("private_names")},
-             "operation": op["id"], "staged_at": now()}
+             "operation": op["id"], "staged_at": now(), **({"scope": record} if record is not None else {})}
     if previous is None:
         if head and not (staged and staged[-1]["public_commit"] == head):
             raise Refusal.coded("checkout-state", f"{checkout} has commits but the journal records no publication: inspect it first")
@@ -916,8 +1338,11 @@ def stage_repo(ctx: Ctx, root: Node, node: Node, journal: dict, results: dict, m
     return {"public_commit": commit, "action": "staged"}
 
 
+SCOPE_ANSWER_RE = None
+
+
 def cmd_stage(ctx: Ctx, rev: str, message: str, extra_secrets: list[str], owner: str | None = None,
-              take_over: str | None = None) -> dict:
+              take_over: str | None = None, scope_answer: str | None = None) -> dict:
     disclosure_refusal(ctx)
     with ctx.lock():
         journal = ctx.read_journal()
@@ -932,10 +1357,30 @@ def cmd_stage(ctx: Ctx, rev: str, message: str, extra_secrets: list[str], owner:
         problems = validate(ctx, root, journal)
         if problems:
             raise Refusal.coded("graph", "graph problems: " + "; ".join(problems))
+        if scope_answer:
+            import re
+            if not re.match(r"^[a-z0-9][a-z0-9_.-]*/[a-z0-9][a-z0-9_.-]*/run-[0-9]+#[A-Za-z0-9_.-]+$", scope_answer):
+                raise Refusal.coded("usage", f"--scope-answer {scope_answer!r}: <project>/<workflow>/<run>#<question>, the run "
+                                    "and its question the owner or Omni answered (e.g. publisher/publish/run-031#q1)")
+        # improve_publish p2: the scope change of every repository of the graph, before anything is written.
+        scopes = {node.id: scope_of(ctx, node, journal) for node in order}
+        ungrounded = [f"{nid}: {m}" for nid, sc in scopes.items() for m in sc["not_grounded"]]
+        changed = {nid: sc for nid, sc in scopes.items() if sc["change"]}
+        if ungrounded and (GROUNDS_REQUIRED or changed):
+            raise Refusal.coded("contract", "not grounded (every selection names why it is public: because = rule:<id> | "
+                                "answer:<project>/<workflow>/<run> | project): " + "; ".join(ungrounded))
+        if changed and not scope_answer:
+            raise Refusal.coded("scope", "this candidate widens what is public; it needs one answer on exactly this list "
+                                "(ask once, then stage --scope-answer <run>#<question>):\n" + "\n".join(
+                                    f"{nid}:\n" + "\n".join("  " + l for l in change_lines(sc)) for nid, sc in changed.items()))
         op = {"id": now(), "command": "stage", "root": root.id, "root_rev": root.rev,
               "order": [n.id for n in order], "status": "staging", "notes": [], "repositories": {}}
         if owner:
             op["owner"] = owner
+        if changed:
+            op["scope_answer"] = scope_answer
+            op["scope_change"] = {nid: [{k: c[k] for k in ("kind", "group", "adds", "because") if k in c} |
+                                        {"selection": label_of(c["kind"], c)} for c in sc["change"]] for nid, sc in changed.items()}
         if previous and previous["status"] in UNFINISHED and held != owner:
             op["took_over"] = {"operation": previous["id"], "owner": held, "status": previous["status"],
                                "reason": take_over or "no owner recorded on it"}
@@ -944,7 +1389,8 @@ def cmd_stage(ctx: Ctx, rev: str, message: str, extra_secrets: list[str], owner:
         journal.setdefault("operations", []).append(op)
         results: dict[str, dict] = {}
         for node in order:
-            results[node.id] = stage_repo(ctx, root, node, journal, results, message, op, extra_secrets)
+            results[node.id] = stage_repo(ctx, root, node, journal, results, message, op, extra_secrets,
+                                          scopes[node.id], scope_answer)
             op["repositories"][node.id] = {"source_rev": node.rev, **results[node.id]}
             ctx.write_journal(journal)
         op["status"] = "staged" if any(r["action"] == "staged" for r in results.values()) else "nothing to push"
@@ -1117,7 +1563,9 @@ def describe(ctx: Ctx, rev: str) -> dict:
             "license": node.contract.get("license"), "checkout": checkout_of(ctx, root, node, journal).as_posix(),
             "submodules": [{"path": c.path, "repository": c.id, "source_rev": c.rev} for c in node.children],
             "excluded": node.excluded,
-            "last_published": {"source_rev": last["source_rev"], "public_commit": last["public_commit"]} if last else None})
+            "last_published": {"source_rev": last["source_rev"], "public_commit": last["public_commit"]} if last else None,
+            **grounds(node.contract), "local": [e.get("path") for e in node.contract.get("local", [])],
+            "runs": [e.get("id") for e in node.contract.get("run", [])]})
     return out
 
 
@@ -1141,11 +1589,119 @@ def cmd_build(ctx: Ctx, rev: str, out: Path, extra_secrets: list[str]) -> dict:
             git(Path(tmp), "init", "-q")
             tree = tree_of(Path(tmp), out / node.name, [g for g in info["gitlinks"] if g[1]])
         info["gitlinks"] = [(path, commit or "not yet staged") for path, commit in info["gitlinks"]]
+        scope = scope_of(ctx, node, journal)
         report["repositories"].append({"id": node.id, "source_rev": node.rev, "out": (out / node.name).as_posix(),
                                        "candidate_tree": tree, "files": len(info["files"]), "inputs": info["inputs"],
                                        "gitlinks": info["gitlinks"], "findings": findings,
-                                       "private_names": {"searched": sorted(private_projects()), "allowed": kept}})
+                                       "private_names": {"searched": sorted(private_projects()), "allowed": kept},
+                                       "scope_change": scope["change"], "scope_change_lines": change_lines(scope),
+                                       "answered_by": scope["answered_by"], "not_grounded": scope["not_grounded"],
+                                       "grounds_stale": scope["grounds_stale"], "local": scope["local"]})
+        if GROUNDS_REQUIRED and scope["not_grounded"]:
+            raise Refusal.coded("contract", f"{node.id} is not grounded: " + "; ".join(scope["not_grounded"]))
     return report
+
+
+def run_changes(repo: Path, rev: str) -> dict[str, set[str]]:
+    """Per run (<workflow>/<run>) the files outside devdocs/runs/ changed by the commits whose message names it."""
+    import re
+    names = re.compile(r"(?<![A-Za-z0-9_.-])([a-z0-9][a-z0-9_.-]*/run-[0-9]+)(?![0-9A-Za-z])")
+    out: dict[str, set[str]] = {}
+    log = git(repo, "log", "--no-merges", "--name-only", "--format=%x01%B%x02", rev).decode("utf-8", errors="replace")
+    for record in log.split("\x01")[1:]:
+        message, _, files = record.partition("\x02")
+        changed = {f for f in files.split("\n") if f.strip() and not under(f.strip(), RUNS_DIR)}
+        if not changed:
+            continue
+        for run in set(names.findall(message)):
+            out.setdefault(run, set()).update(changed)
+    return out
+
+
+MEDIA = (".png", ".jpg", ".jpeg", ".gif", ".webp", ".svg", ".mp4", ".webm", ".ogv", ".mov", ".wav", ".flac", ".mp3",
+         ".ogg", ".npy", ".npz", ".exr", ".glb", ".gltf", ".fbx", ".blend", ".ctex", ".md5", ".import", ".log", ".zip")
+CODE = (".py", ".ts", ".js", ".mjs", ".sh", ".gd", ".gdshader", ".tscn", ".tres", ".toml", ".yaml", ".yml", ".json", ".css",
+        ".html", ".rs", ".go", ".c", ".h", ".cpp", ".cfg")
+
+
+def change_kind(path: str) -> str:
+    """What a changed file is, for the publisher's first look: workflow, code, text, media or other."""
+    low = path.lower()
+    if under(path, WORKFLOWS_DIR):
+        return "workflow"
+    if "/.godot/" in f"/{low}" or low.endswith(MEDIA):
+        return "media"
+    if low.endswith(CODE) or "/" in path and Path(path).suffix == "" and not low.endswith(".gitkeep"):
+        return "code"
+    if low.endswith((".md", ".txt", ".rst")):
+        return "text"
+    return "other"
+
+
+def cmd_runs(ctx: Ctx, rev: str) -> dict:
+    """improve_publish p2 decision 17: the runs of the project not yet judged, before any reading."""
+    project = project_of(ctx)
+    rev = git(ctx.source, "rev-parse", "--verify", f"{rev}^{{commit}}").decode().strip()
+    contract = load_contract(ctx.source, rev, ctx.contract)
+    crit = criterion("runs", project)
+    listing = [r.split("\t", 1)[1] for r in filter(None, git(ctx.source, "ls-tree", "-r", "-z", "--full-tree", rev).decode().split("\0"))]
+    folders: dict[str, list[str]] = {}
+    for path in listing:
+        parts = path.split("/")
+        if len(parts) >= 5 and under(path, RUNS_DIR):
+            folders.setdefault(f"{parts[2]}/{parts[3]}", []).append("/".join(parts[4:]))
+    selected = {str(e.get("id", "")).strip("/"): e for e in contract.get("run", [])}
+    locals_ = local_paths(contract)
+    judged = (contract.get("runs") or {}).get("judged")
+    judged_note, judged_ok = "no [runs] judged in the contract", False
+    if judged:
+        if not git_ok(ctx.source, "cat-file", "-e", f"{judged}^{{commit}}") or not git_ok(ctx.source, "merge-base", "--is-ancestor", judged, rev):
+            judged_note = f"[runs] judged = {judged} is not an ancestor of {rev[:12]}: every run is listed"
+        else:
+            at = git(ctx.source, "show", "-s", "--format=%cI", judged).decode().strip()
+            def utc(t: str) -> datetime:
+                return datetime.fromisoformat(t.replace("Z", "+00:00")).astimezone(timezone.utc)
+            if crit and crit.get("adopted") and crit.get("at") and utc(crit["at"]) > utc(at):
+                judged_note = f"{crit['rule']} was adopted after {judged[:12]} ({at}): a new criterion, every run is listed"
+            else:
+                judged_ok, judged_note = True, f"judged up to {judged[:12]} ({at})"
+    changes = run_changes(ctx.source, rev)
+    private = [(p, private_name_re(p)) for p in sorted(private_projects())]
+    forbidden = [w for w in contract.get("forbidden", [])]
+    out = {"project": project, "source_rev": rev, "criterion": crit, "judged": judged_note, "selected": [], "local": [],
+           "unchanged_since_judged": 0, "runs": []}
+
+    def number(run: str):
+        w, r = run.split("/")
+        return (w, int(r.rsplit("-", 1)[-1]) if r.rsplit("-", 1)[-1].isdigit() else 0, r)
+
+    for run in sorted(folders, key=number):
+        folder = f"{RUNS_DIR}/{run}"
+        if run in selected:
+            out["selected"].append({"id": run, "files": selected[run].get("files", RUN_FILES), "because": selected[run].get("because")})
+            continue
+        if any(under(folder, l) for l in locals_):
+            out["local"].append(run)
+            continue
+        if judged_ok and git_ok(ctx.source, "diff", "--quiet", judged, rev, "--", folder):
+            out["unchanged_since_judged"] += 1
+            continue
+        outside = sorted(changes.get(run, set()))
+        kinds: dict[str, int] = {}
+        for f in outside:
+            k = change_kind(f)
+            kinds[k] = kinds.get(k, 0) + 1
+        line = {"id": run, "kinds": kinds, "development": [f for f in outside if change_kind(f) in ("workflow", "code", "text")][:40],
+                "outside": outside, "texts": sorted(f for f in folders[run] if f.endswith((".md", ".txt")) and "/" not in f)}
+        for name in ("request.md", "report.md"):
+            if name in folders[run]:
+                text = git(ctx.source, "cat-file", "blob", f"{rev}:{folder}/{name}").decode("utf-8", errors="replace")
+                line[name] = {"bytes": len(text.encode()), "private": [p for p, rx in private if rx.search(text)],
+                              "forbidden": [w for w in forbidden if w.lower() in text.lower()]}
+            else:
+                line[name] = None
+        out["runs"].append(line)
+    return out
 
 
 def cmd_convert(ctx: Ctx) -> dict:
@@ -1190,6 +1746,10 @@ def main() -> None:
             sub.add_argument("--message", required=True)
             sub.add_argument("--owner", help="the run (or person) this staging belongs to, e.g. publisher/publish/run-003")
             sub.add_argument("--take-over", metavar="REASON", help="replace another owner's unfinished staging (why)")
+            sub.add_argument("--scope-answer", metavar="RUN#QUESTION",
+                             help="the answered question that covers this candidate's scope change, e.g. publisher/publish/run-031#q1")
+    rr = commands.add_parser("runs")
+    rr.add_argument("--rev", default="HEAD")
     r = commands.add_parser("resolve")
     r.add_argument("--repo", required=True)
     r.add_argument("--note", required=True)
@@ -1210,9 +1770,11 @@ def main() -> None:
         if args.command == "plan":
             result = describe(ctx, args.rev)
         elif args.command == "build":
-            result = cmd_build(ctx, args.rev, args.out, args.secrets)
+            result = cmd_build(ctx, args.rev, args.out.resolve(), args.secrets)
         elif args.command == "stage":
-            result = cmd_stage(ctx, args.rev, args.message, args.secrets, args.owner, args.take_over)
+            result = cmd_stage(ctx, args.rev, args.message, args.secrets, args.owner, args.take_over, args.scope_answer)
+        elif args.command == "runs":
+            result = cmd_runs(ctx, args.rev)
         elif args.command == "resolve":
             result = cmd_resolve(ctx, args.repo, args.note, args.secrets, args.owner, args.take_over)
         elif args.command == "abort":

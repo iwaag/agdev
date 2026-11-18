@@ -391,6 +391,39 @@ still read) and holds two more kinds.
   sets or removes it (one commit); the default licence is always `never`. Nothing forces a rule
   public.
 
+#### Rules on run records, workflows and episodes (improve_publish p2)
+
+What a braindump states about a **kind of content** of a project is a fourth kind of rule, from a
+sentence of any braindump:
+
+```yaml
+  - id: runs-suggest-publish              # <content>[-<project>]-<follows>
+    content: runs                         # runs | workflows | episodes
+    project: gimmickimg                   # optional: this project only
+    follows: suggest-publish              # or never-publish
+    source: {braindump: agdev_philosophy/p4, commit: <40 hex>, sentence: "…"}
+    adopted: {by: <who>, at: <time>}
+```
+
+- **`suggest-publish`**: the sentence is the criterion the publisher reads when it judges a
+  project's runs (`wfe catalog disclosure runs <project>`). It selects nothing: each run the
+  publisher proposes is published only after the owner's or Omni's answer on the list.
+- **`never-publish`**: the publication tool refuses a contract that selects that content (code
+  `rule`).
+- A rule for one project decides over a general one; between equals `never-publish` wins.
+- **Without a rule, run records and episodes stay local**: the publisher proposes none and the tool
+  refuses to select them. Workflows follow their project (the publisher's guide); a `workflows`
+  rule exists only when the owner states something about workflows.
+- The `ground` run proposes them with the links, each with its sentence; a statement about one
+  project's runs is a rule for that project. A proposed `never-publish` already refuses; a proposed
+  `suggest-publish` does nothing until **OK**. `wfe catalog rules adopt --content runs [--project
+  <id>] --follows suggest-publish|never-publish …` adopts one directly.
+- Public form, as for every rule: public when its braindump is in the public list and it is not
+  `share: never`; a rule naming a project kept private never is.
+
+`wfe catalog disclosure` prints, after the projects, the statements on content in force and those
+waiting for **OK**.
+
 **One `rules.yaml`, published as its public part.** The file on Gitea holds every rule, private
 and public, and is the only one the installation enforces. When it is in the public list, the
 publication tool publishes it in a derived form: the rules whose braindump the list selects, that

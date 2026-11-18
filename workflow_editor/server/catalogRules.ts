@@ -25,14 +25,24 @@
 // with the link suggestion (server/catalogLinks.ts): a proposed never-publish
 // already refuses, a proposed publish does nothing.
 //
+//   content rule  (improve_publish p2) what a braindump states about a kind of
+//                 content (runs, workflows, episodes), optionally of one project:
+//                 suggest-publish, the sentence is the criterion the publisher
+//                 reads (it selects nothing); never-publish, the publication tool
+//                 refuses a contract that selects that content. One project's rule
+//                 decides over a general one; never-publish wins between equals.
+//                 Without a rule, run records and episodes stay local.
+//
 // improve_publish p1: `share: never` on any rule keeps it in this installation
 // (neither published nor offered by a style import); the public rules.yaml is
 // derived by the publication tool (publicRules here is the same reading, for
 // `wfe catalog publication status`); and a selected file that names a project
 // kept private is refused by the tool unless the contract's [[allow]] with
 // found = "private:<id>" records why.
-import { readFile } from 'node:fs/promises'
-import { join } from 'node:path'
+import { execFile } from 'node:child_process'
+import { access, readFile } from 'node:fs/promises'
+import { join, resolve } from 'node:path'
+import { fileURLToPath } from 'node:url'
 import { Document } from 'yaml'
 import {
   BRAINDUMP_FILE, braindumpPath, braindumpTitle, EPISODES_DIR, globMatch, metadataPath, normalizeTag, PROJECTS_PATH, PUBLICATION_CONTRACT, publishedPaths,
@@ -52,38 +62,43 @@ export const RULES_SCHEMAS = ['ag.catalog-rules.v1', RULES_SCHEMA]
 export const FOLLOWS = ['never-publish', 'suggest-publish'] as const // of a tag
 export const PROJECT_FOLLOWS = ['never-publish', 'publish'] as const
 export const LICENCE_FOLLOWS = 'default-licence'
+export const CONTENTS = ['runs', 'workflows', 'episodes'] as const
+export const CONTENT_FOLLOWS = ['suggest-publish', 'never-publish'] as const
+export type Content = typeof CONTENTS[number]
 export type Follows = typeof FOLLOWS[number]
 export type ProjectFollows = typeof PROJECT_FOLLOWS[number]
 export interface RuleSource { braindump: string; commit: string; sentence: string }
 export interface Rule { id: string; tag: string; follows: Follows; share?: 'never'; source: RuleSource; adopted: { by: string; at: string } }
 export interface ProjectRule { id: string; project: string; follows: ProjectFollows; share?: 'never'; source: RuleSource; adopted: { by: string; at: string } }
+export interface ContentRule { id: string; content: Content; project?: string; follows: typeof CONTENT_FOLLOWS[number]; share?: 'never'; source: RuleSource; adopted: { by: string; at: string } }
 export interface LicenceRule { id: 'default-licence'; follows: typeof LICENCE_FOLLOWS; licence: string; share: 'never'; source: RuleSource; adopted: { by: string; at: string } }
-export type AnyRule = Rule | ProjectRule | LicenceRule
+export type AnyRule = Rule | ProjectRule | LicenceRule | ContentRule
 type Body<T> = Omit<T, 'id' | 'adopted'>
-export type RuleBody = Body<Rule> | Body<ProjectRule> | Body<LicenceRule>
+export type RuleBody = Body<Rule> | Body<ProjectRule> | Body<LicenceRule> | Body<ContentRule>
 // What the page and the CLI read: one flat shape for every kind.
-export interface RuleView { id: string; kind: 'tag' | 'project' | 'licence'; follows: string; tag?: string; project?: string; licence?: string; share?: string; source: RuleSource; adopted: { by: string; at: string }; sourceChanged: boolean; sourceNote?: string }
+export interface RuleView { id: string; kind: 'tag' | 'project' | 'licence' | 'content'; follows: string; tag?: string; project?: string; licence?: string; content?: string; share?: string; source: RuleSource; adopted: { by: string; at: string }; sourceChanged: boolean; sourceNote?: string }
 
 const isObj = (v: unknown): v is Record<string, unknown> => typeof v === 'object' && v !== null && !Array.isArray(v)
 const str = (v: unknown) => typeof v === 'string' ? v : ''
-export const kindOf = (r: AnyRule): RuleView['kind'] => 'tag' in r ? 'tag' : 'project' in r ? 'project' : 'licence'
+export const kindOf = (r: AnyRule): RuleView['kind'] => 'content' in r ? 'content' : 'tag' in r ? 'tag' : 'project' in r ? 'project' : 'licence'
 export const ruleId = (tag: string, follows: string) => `${tag.toLowerCase()}-${follows}`
 export const projectRuleId = (project: string, follows: string) => `project-${project}-${follows}`
+export const contentRuleId = (content: string, project: string | undefined, follows: string) => `${content}${project ? `-${project}` : ''}-${follows}`
 // White space is compared loosely: a sentence may be wrapped differently than it is quoted.
 export const loose = (t: string) => t.replace(/\s+/g, ' ').trim()
 export const holds = (text: string, sentence: string) => loose(sentence).length >= 4 && loose(text).includes(loose(sentence))
 export const PROJECT_ID = /^[a-z0-9][a-z0-9_.-]{0,63}$/
 export const LICENCE_ID = /^[A-Za-z0-9][A-Za-z0-9.+-]{1,63}$/
 
-export interface RulesFile { all: AnyRule[]; rules: Rule[]; projects: ProjectRule[]; licence: LicenceRule | null; problem?: string }
+export interface RulesFile { all: AnyRule[]; rules: Rule[]; projects: ProjectRule[]; contents: ContentRule[]; licence: LicenceRule | null; problem?: string }
 export function readRules(text: string | null): RulesFile {
-  const none: RulesFile = { all: [], rules: [], projects: [], licence: null }
+  const none: RulesFile = { all: [], rules: [], projects: [], contents: [], licence: null }
   if (text === null || !text.trim()) return none
   const r = parseSubset(text)
   if (!r.ok) return { ...none, problem: r.problem.message }
   const raw = r.doc.toJS() as unknown
   if (!isObj(raw) || !RULES_SCHEMAS.includes(str(raw.schema))) return { ...none, problem: `not ${RULES_SCHEMA}` }
-  const out: RulesFile = { all: [], rules: [], projects: [], licence: null }
+  const out: RulesFile = { all: [], rules: [], projects: [], contents: [], licence: null }
   for (const x of Array.isArray(raw.rules) ? raw.rules : []) {
     if (!isObj(x) || !isObj(x.source)) return { ...none, problem: 'a rule needs its source' }
     const a = isObj(x.adopted) ? x.adopted : {}
@@ -92,6 +107,12 @@ export function readRules(text: string | null): RulesFile {
       if (!LICENCE_ID.test(str(x.licence))) return { ...none, problem: 'a default-licence rule needs its licence (an SPDX id)' }
       const l: LicenceRule = { id: 'default-licence', follows: LICENCE_FOLLOWS, licence: str(x.licence), share: 'never', ...common }
       out.licence = l; out.all.push(l)
+    } else if (str(x.content)) {
+      // improve_publish p2: before project, a content rule for one project is not a project rule.
+      if (!(CONTENTS as readonly string[]).includes(str(x.content))) return { ...none, problem: `a content rule is about ${CONTENTS.join(', ')}; "${str(x.content)}" is none` }
+      if (!(CONTENT_FOLLOWS as readonly string[]).includes(str(x.follows))) return { ...none, problem: `a rule on ${str(x.content)} follows suggest-publish or never-publish` }
+      const c: ContentRule = { id: str(x.id) || contentRuleId(str(x.content), str(x.project) || undefined, str(x.follows)), content: x.content as Content, ...(str(x.project) ? { project: str(x.project) } : {}), follows: x.follows as ContentRule['follows'], ...(str(x.share) === 'never' ? { share: 'never' as const } : {}), ...common }
+      out.contents.push(c); out.all.push(c)
     } else if (str(x.project)) {
       if (!(PROJECT_FOLLOWS as readonly string[]).includes(str(x.follows))) return { ...none, problem: `a rule on project ${str(x.project)} follows never-publish or publish` }
       const p: ProjectRule = { id: str(x.id) || projectRuleId(str(x.project), str(x.follows)), project: str(x.project), follows: x.follows as ProjectFollows, ...(str(x.share) === 'never' ? { share: 'never' as const } : {}), ...common }
@@ -149,7 +170,7 @@ export async function knownProjects(ctx: CatalogContext): Promise<string[]> {
   ])].sort()
 }
 
-export type RuleInput = { tag?: unknown; project?: unknown; follows?: unknown; licence?: unknown; source?: unknown }
+export type RuleInput = { tag?: unknown; project?: unknown; follows?: unknown; licence?: unknown; content?: unknown; source?: unknown }
 // A proposed rule, checked: what it is about, what follows, and its source. Nothing is written.
 export async function checkRuleSource(ctx: CatalogContext, o: RuleInput): Promise<RuleBody> {
   const follows = str(o.follows)
@@ -157,6 +178,16 @@ export async function checkRuleSource(ctx: CatalogContext, o: RuleInput): Promis
     const licence = str(o.licence).trim()
     if (!LICENCE_ID.test(licence)) throw new RequestError(400, `a default-licence rule names its licence as an SPDX id (for example CC0-1.0); "${licence}" is not one`)
     return { follows: LICENCE_FOLLOWS, licence, share: 'never', source: await sourceAt(ctx, o.source, { conventions: false }) }
+  }
+  if (str(o.content)) {
+    const content = str(o.content).trim(), project = str(o.project).trim()
+    if (!(CONTENTS as readonly string[]).includes(content)) throw new RequestError(400, `a content rule is about ${CONTENTS.join(', ')}; "${content}" is none`)
+    if (!(CONTENT_FOLLOWS as readonly string[]).includes(follows)) throw new RequestError(400, `what follows for ${content} is one of ${CONTENT_FOLLOWS.join(', ')}; "${follows}" is neither`)
+    if (project) {
+      if (!PROJECT_ID.test(project)) throw new RequestError(400, `"${project}" is not a project id`)
+      if (!(await knownProjects(ctx)).includes(project)) throw new RequestError(404, `no project "${project}" in this installation's plan, ${PROJECTS_PATH} or the registry`)
+    }
+    return { content: content as Content, ...(project ? { project } : {}), follows: follows as ContentRule['follows'], source: await sourceAt(ctx, o.source, { conventions: false }) }
   }
   if (str(o.project)) {
     const project = str(o.project).trim()
@@ -171,7 +202,7 @@ export async function checkRuleSource(ctx: CatalogContext, o: RuleInput): Promis
   if (!(FOLLOWS as readonly string[]).includes(follows)) throw new RequestError(400, `what follows from #${n.tag} is one of ${FOLLOWS.join(', ')}; "${follows}" is neither. Other consequences do not exist: say it in words instead`)
   return { tag: n.tag, follows: follows as Follows, source: await sourceAt(ctx, o.source, { conventions: true }) }
 }
-const idOf = (x: RuleBody) => 'tag' in x ? ruleId(x.tag, x.follows) : 'project' in x ? projectRuleId(x.project, x.follows) : 'default-licence'
+const idOf = (x: RuleBody) => 'content' in x ? contentRuleId(x.content, x.project, x.follows) : 'tag' in x ? ruleId(x.tag, x.follows) : 'project' in x ? projectRuleId(x.project, x.follows) : 'default-licence'
 
 export async function adoptRule(ctx: CatalogContext, o: RuleInput & { author: string; proposedBy?: string }) {
   if (!o.author.trim()) throw new RequestError(400, 'adopting a rule needs your name: the owner adopts it')
@@ -216,11 +247,12 @@ export async function shareRule(ctx: CatalogContext, o: { id: string; share: str
 // What of rules.yaml the publication tool publishes (improve_publish p1 decision 4; the tool's public_rules is the
 // authority): a rule whose source braindump the list selects, not never-publish on a project, not share: never.
 export interface PublicRule { id: string; public: boolean; why: string }
-export function publicRules(rd: RulesFile, selected: Map<string, string>): PublicRule[] {
+export function publicRules(rd: RulesFile, selected: Map<string, string>, privateIds: string[] = []): PublicRule[] {
   if (!selected.has(RULES_PATH)) return rd.all.map(r => ({ id: r.id, public: false, why: `${RULES_PATH} is not in the public list` }))
   return rd.all.map(r => {
     if (kindOf(r) === 'licence' || ('share' in r && r.share === 'never')) return { id: r.id, public: false, why: 'share: never' }
     if (kindOf(r) === 'project' && r.follows === 'never-publish') return { id: r.id, public: false, why: 'it names a project kept private' }
+    if (kindOf(r) === 'content' && 'project' in r && r.project && privateIds.includes(r.project)) return { id: r.id, public: false, why: `it names ${r.project}, kept private` }
     if (!selected.has(braindumpPath(r.source.braindump))) return { id: r.id, public: false, why: `its braindump ${r.source.braindump} is not in the public list` }
     return { id: r.id, public: true, why: `its braindump ${r.source.braindump} is public` }
   })
@@ -239,14 +271,16 @@ export async function retireRule(ctx: CatalogContext, o: { id: string; author: s
   const g = gone!
   return { ok: true, message: `Retired rule ${o.id} (${r.commit.slice(0, 7)}): nothing follows from ${subjectOf(g)} any more${g.follows === 'never-publish' ? '; what was public of it before is not unpublished by this, and nothing becomes public by it' : g.follows === 'publish' ? '; what is public of it stays public' : ''}.`, commit: r.commit, changed: r.changed }
 }
-const subjectOf = (r: { tag?: string; project?: string; licence?: string }) => r.tag ? `#${r.tag}` : r.project ? `project ${r.project}` : `the default licence ${r.licence}`
-export const followsWords = (r: { tag?: string; project?: string; licence?: string; follows: string }) =>
-  r.follows === LICENCE_FOLLOWS ? `a project published for the first time is licensed ${r.licence}, unless it holds another's material or states another licence (your own preference: never shared as style)`
+const subjectOf = (r: { tag?: string; project?: string; licence?: string; content?: string }) => r.content ? `${r.content}${r.project ? ` of ${r.project}` : ''}` : r.tag ? `#${r.tag}` : r.project ? `project ${r.project}` : `the default licence ${r.licence}`
+export const contentNames: Record<string, string> = { runs: 'run records', workflows: 'workflows', episodes: 'episodes' }
+export const followsWords = (r: { tag?: string; project?: string; licence?: string; content?: string; follows: string }) =>
+  r.content ? (r.follows === 'never-publish' ? `${contentNames[r.content] ?? r.content} of ${r.project ?? 'any project'} are never published` : `${contentNames[r.content] ?? r.content} of ${r.project ?? 'a public project'} are proposed for publication by this sentence (the publisher reads it; it selects nothing)`)
+  : r.follows === LICENCE_FOLLOWS ? `a project published for the first time is licensed ${r.licence}, unless it holds another's material or states another licence (your own preference: never shared as style)`
   : r.project ? (r.follows === 'never-publish' ? `project ${r.project} is never published` : `project ${r.project} is to be published (the publisher may make it public when you ask)`)
   : r.follows === 'never-publish' ? `a braindump tagged #${r.tag} is never published` : `a braindump tagged #${r.tag} is suggested for the public list`
 
 const viewOf = (r: AnyRule, sourceChanged: boolean, sourceNote?: string): RuleView => ({
-  id: r.id, kind: kindOf(r), follows: r.follows, ...('tag' in r ? { tag: r.tag } : {}), ...('project' in r ? { project: r.project } : {}),
+  id: r.id, kind: kindOf(r), follows: r.follows, ...('content' in r ? { content: r.content } : {}), ...('tag' in r ? { tag: r.tag } : {}), ...('project' in r && r.project ? { project: r.project } : {}),
   ...('licence' in r ? { licence: r.licence, share: r.share } : 'share' in r && r.share ? { share: r.share } : {}), source: r.source, adopted: r.adopted, sourceChanged, ...(sourceNote ? { sourceNote } : {}),
 })
 // The adopted rules, each with whether its source changed since (derived from Git).
@@ -279,8 +313,11 @@ export interface DisclosureLine {
   public: { destination: string; commit: string; at: string }[] // from the journal of its workspace
   workspace?: string; note?: string
 }
+// improve_publish p2: what the owner's words say about a kind of content, in force (an adopted rule, a proposed
+// never-publish) or waiting for OK (a proposed suggest-publish).
+export interface ContentLine { content: string; project?: string; follows: string; braindump: string; sentence: string; rule?: string; proposal?: { suggestion: string; n: number; by: string }; inForce: boolean }
 export interface Disclosure {
-  head: string; projects: DisclosureLine[]
+  head: string; projects: DisclosureLine[]; contents: ContentLine[]
   licence: { rule?: RuleView; proposal?: { licence: string; braindump: string; sentence: string; suggestion: string; by: string } } | null
   // Where a first publication goes: the owner of the catalog's own destination (github.com/<owner>/mycatalog).
   publicOwner: string | null
@@ -313,7 +350,7 @@ export async function disclosure(ctx: CatalogContext, o: { maxAgeMs?: number; pr
     const pub = ws ? await journalOf(ws.path) : []
     const stated: Statement[] = [
       ...cur.projects.filter(r => r.project === p).map(r => ({ follows: r.follows, braindump: r.source.braindump, sentence: r.source.sentence, commit: r.source.commit, rule: r.id })),
-      ...proposals.filter(x => x.project === p).map(x => ({ follows: x.follows, braindump: x.braindump, sentence: x.quote, proposal: { suggestion: s!.id, n: x.n, by: s!.by } })),
+      ...proposals.filter(x => x.project === p && !x.content).map(x => ({ follows: x.follows as ProjectFollows, braindump: x.braindump, sentence: x.quote, proposal: { suggestion: s!.id, n: x.n, by: s!.by } })),
     ]
     // An adopted rule before a proposal; never-publish before publish.
     const never = stated.find(x => x.follows === 'never-publish' && x.rule) ?? stated.find(x => x.follows === 'never-publish')
@@ -327,15 +364,61 @@ export async function disclosure(ctx: CatalogContext, o: { maxAgeMs?: number; pr
   }
   const lv = ruleViews.find(r => r.kind === 'licence')
   const lp = s?.licence && s.licence.state === 'suggested' ? { licence: s.licence.licence, braindump: s.licence.braindump, sentence: s.licence.quote, suggestion: s.id, by: s.by } : undefined
-  return { head: snap.head, projects: lines, licence: lv || lp ? { ...(lv ? { rule: lv } : {}), ...(lp ? { proposal: lp } : {}) } : null, publicOwner }
+  const contents: ContentLine[] = [
+    ...cur.contents.map(r => ({ content: r.content, ...(r.project ? { project: r.project } : {}), follows: r.follows, braindump: r.source.braindump, sentence: r.source.sentence, rule: r.id, inForce: true })),
+    ...proposals.filter(x => x.content).map(x => ({ content: x.content!, ...(x.project ? { project: x.project } : {}), follows: x.follows, braindump: x.braindump, sentence: x.quote, proposal: { suggestion: s!.id, n: x.n, by: s!.by }, inForce: x.follows === 'never-publish' })),
+  ].filter(x => !o.project || !x.project || x.project === o.project)
+  return { head: snap.head, projects: lines, contents, licence: lv || lp ? { ...(lv ? { rule: lv } : {}), ...(lp ? { proposal: lp } : {}) } : null, publicOwner }
 }
 export function disclosureLines(d: Disclosure): string[] {
   const st = (x: Statement) => `${x.rule ? `rule ${x.rule}` : `proposed by ${x.proposal?.by} (suggestion ${x.proposal?.suggestion}, ${x.proposal?.n})`}, from ${x.braindump}: “${x.sentence}”`
   return [
     ...d.projects.map(l => [`${l.project.padEnd(16)} ${l.state}${l.public.length ? `  (${l.public.map(p => p.destination.replace(/^https:\/\//, '').replace(/\.git$/, '')).join(', ')})` : ''}`,
       ...(l.decides ? [`  ${st(l.decides)}`] : []), ...l.also.map(x => `  also: ${x.follows}, ${st(x)}`), ...(l.note ? [`  ${l.note}`] : [])].join('\n')),
+    ...(d.contents.length ? ['', ...d.contents.map(x => `${(contentNames[x.content] ?? x.content).padEnd(16)} ${x.project ? `of ${x.project}` : 'of every project'}: ${x.follows}${x.inForce ? '' : ' (proposed: nothing follows until you answer OK)'}\n  ${st({ follows: x.follows as ProjectFollows, braindump: x.braindump, sentence: x.sentence, ...(x.rule ? { rule: x.rule } : {}), ...(x.proposal ? { proposal: x.proposal } : {}) })}`)]
+      : ['', 'run records and episodes: no rule states a criterion, so they stay local (the publisher proposes none)']),
     '', d.licence?.rule ? `default licence ${d.licence.rule.licence} (rule default-licence, from ${d.licence.rule.source.braindump}: “${d.licence.rule.source.sentence}”; never shared as style)`
       : d.licence?.proposal ? `default licence: ${d.licence.proposal.licence} proposed by ${d.licence.proposal.by}, from ${d.licence.proposal.braindump}: “${d.licence.proposal.sentence}” (not in force until you answer OK)` : 'default licence: none adopted (the publisher asks for the licence of a first publication)',
+  ]
+}
+
+// ---- run records: the publisher's first look (improve_publish p2 decision 17) --------------
+
+export interface RunLine { id: string; kinds: Record<string, number>; development: string[]; outside: string[]; texts: string[]; 'request.md': { bytes: number; private: string[]; forbidden: string[] } | null; 'report.md': RunLine['request.md'] }
+export interface RunsListing { project: string; source_rev: string; criterion: { rule?: string; proposal?: string; follows: string; braindump: string; sentence: string; project?: string | null } | null; judged: string; selected: { id: string; files: string[]; because?: string }[]; local: string[]; unchanged_since_judged: number; runs: RunLine[] }
+// The installed publication tool (<root>/config/install, beside the area), else the copy in this release.
+async function publishTool(area: string): Promise<string> {
+  for (const p of [resolve(area, '..', '..', 'config', 'install', 'agdev-external-publish'), fileURLToPath(new URL('../../install/agdev-external-publish', import.meta.url))]) {
+    try { await access(p); return p } catch { /* next */ }
+  }
+  throw new RequestError(500, 'agdev-external-publish is not installed beside this area or in this release')
+}
+// The tool's `runs` reading of a project's workspace (its source, or a draft clone): the contract, the rules and the
+// open proposals are read in one place, the tool.
+export async function disclosureRuns(ctx: CatalogContext, o: { project: string; source?: string }): Promise<RunsListing> {
+  const reg = await loadRegistry(ctx.registryFile)
+  const ws = reg.workspaces.find(w => w.project === o.project) ?? reg.workspaces.find(w => w.id === o.project)
+  if (!ws) throw new RequestError(404, `no workspace of project "${o.project}" here`)
+  const tool = await publishTool(ctx.area)
+  const args = [tool, '--workspace', ws.path, ...(o.source ? ['--source', resolve(o.source)] : []), 'runs']
+  return new Promise((ok, fail) => execFile('python3', args, { env: { ...process.env, WFE_AREA: ctx.area }, maxBuffer: 64 * 1024 * 1024 }, (e, stdout, stderr) => {
+    if (e) return fail(new RequestError(409, (stderr || e.message).trim()))
+    try { ok(JSON.parse(stdout) as RunsListing) } catch (x) { fail(new RequestError(500, `the tool's listing cannot be read: ${(x as Error).message}`)) }
+  }))
+}
+const kb = (n: number) => n < 1000 ? `${n} B` : `${(n / 1000).toFixed(1)} kB`
+export function disclosureRunsLines(x: RunsListing): string[] {
+  const c = x.criterion
+  const text = (t: RunLine['request.md'], name: string) => t ? `${name} ${kb(t.bytes)}${t.private.length ? ` (names ${t.private.join(', ')}, kept private)` : ''}${t.forbidden.length ? ` (forbidden: ${t.forbidden.join(', ')})` : ''}` : `no ${name}`
+  return [
+    `run records of ${x.project} at ${x.source_rev.slice(0, 12)}`,
+    c ? `criterion: ${c.follows} — ${c.rule ? `rule ${c.rule}` : `proposed (${c.proposal})`}, from ${c.braindump}: “${c.sentence}”` : 'criterion: none — no rule states one, so run records stay local and the publisher proposes none',
+    `judged: ${x.judged}`,
+    ...(x.selected.length ? [`public by [[run]]: ${x.selected.map(r => `${r.id} (${r.files.join(', ')}; ${r.because ?? 'no because'})`).join(', ')}`] : []),
+    ...(x.local.length ? [`kept local by [[local]]: ${x.local.join(', ')}`] : []),
+    ...(x.unchanged_since_judged ? [`${x.unchanged_since_judged} run${x.unchanged_since_judged === 1 ? '' : 's'} judged before and unchanged: not listed`] : []),
+    `not yet judged: ${x.runs.length}`,
+    ...x.runs.map(r => `  ${r.id.padEnd(26)} ${Object.keys(r.kinds).length ? `changed outside its folder: ${Object.entries(r.kinds).map(([k, n]) => `${n} ${k}`).join(', ')}` : 'changed nothing outside its folder'}; ${text(r['request.md'], 'request.md')}, ${text(r['report.md'], 'report.md')}${r.development.length ? `\n  ${''.padEnd(26)} ${r.development.slice(0, 6).join(', ')}${r.development.length > 6 ? `, … (${r.development.length})` : ''}` : ''}`),
   ]
 }
 
@@ -373,7 +456,7 @@ export async function checkFolder(dir: string, files: string[], o: { privateProj
   const contract = ct === null ? null : readPublicationContract(ct)
   const selected = contract === null ? new Map<string, string>() : publishedPaths(contract, files)
   if (selected.has(RULES_PATH)) out.rulesFile = 'selected'
-  if (selected.has(RULES_PATH)) out.publicRules = publicRules(rd, selected)
+  if (selected.has(RULES_PATH)) out.publicRules = publicRules(rd, selected, (o.privateProjects ?? []).map(p => p.project))
   const ids = files.filter(f => f.startsWith(`${EPISODES_DIR}/`) && f.endsWith(`/${BRAINDUMP_FILE}`)).map(f => f.slice(EPISODES_DIR.length + 1, -BRAINDUMP_FILE.length - 1))
   const never: { id: string; rule: Rule; title: string }[] = []
   for (const id of ids) {
@@ -443,7 +526,7 @@ export function checkLines(c: PublicationCheck): string[] {
   ]
 }
 
-const rulesFileEntry = (by: string) => `\n\n[[file]]                            # the adopted rules: added by ${by} (with the conventions tagged ${RECOMMENDED_TAG})\npublic = "${RULES_PATH}"\nfrom = "source:${RULES_PATH}"\n`
+const rulesFileEntry = (by: string) => `\n\n[[file]]                            # the adopted rules: added by ${by} (with the conventions tagged ${RECOMMENDED_TAG})\npublic = "${RULES_PATH}"\nfrom = "source:${RULES_PATH}"\nbecause = "project"\n`
 // *Add to the public list*: the braindump's own files as one [[tree]] of the contract, in one commit (with rules.yaml, the first time a
 // braindump tagged mybraindump is added). `rules.yaml` as the id adds that file alone. Nothing is pushed.
 export async function publicationAdd(ctx: CatalogContext, o: { id: string; author: string }) {
@@ -471,7 +554,7 @@ export async function publicationAdd(ctx: CatalogContext, o: { id: string; autho
     const tags = readBraindumpMetadata(await readTextOrNull(join(dir, metadataPath(o.id)))).tags
     withRules = files.includes(RULES_PATH) && !selected.has(RULES_PATH) && tags.some(t => sameTag(t, RECOMMENDED_TAG))
     const folder = `${EPISODES_DIR}/${o.id}`
-    return [{ path: PUBLICATION_CONTRACT, text: `${ct.trimEnd()}\n\n[[tree]]                            # braindump ${o.id}: added by ${o.author.trim()}${rule ? ` (rule ${rule})` : ''}\nfrom = "source:${folder}"\npublic = "${folder}"\nexclude = ["*/*"]                   # its own files only, not the braindumps below it\n${withRules ? rulesFileEntry(o.author.trim()).replace(/^\n/, '') : ''}` }]
+    return [{ path: PUBLICATION_CONTRACT, text: `${ct.trimEnd()}\n\n[[tree]]                            # braindump ${o.id}: added by ${o.author.trim()}${rule ? ` (rule ${rule})` : ''}\nfrom = "source:${folder}"\npublic = "${folder}"\nexclude = ["*/*"]                   # its own files only, not the braindumps below it\nbecause = "${rule ? `rule:${rule}` : `owner:${o.author.trim().replace(/"/g, '')}`}"\n${withRules ? rulesFileEntry(o.author.trim()).replace(/^\n/, '') : ''}` }]
   }, o.author, () => isRules ? [`Add ${RULES_PATH} to the public list`, '', `${PUBLICATION_CONTRACT}: the adopted rules as a [[file]]. Nothing is published by this commit.`].join('\n')
     : [`Add braindump ${o.id} to the public list`, '', `${PUBLICATION_CONTRACT}: its folder as a [[tree]]${rule ? ` (suggested by rule ${rule})` : ''}${withRules ? `, and ${RULES_PATH}` : ''}. Nothing is published by this commit.`].join('\n'))
   return { ok: true, message: `${isRules ? RULES_PATH : `Braindump ${o.id}${withRules ? ` (with ${RULES_PATH})` : ''}`} is in the public list (${r.commit.slice(0, 7)}). Nothing was published: ask the publisher for that.`, commit: r.commit, changed: r.changed }
