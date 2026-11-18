@@ -20,6 +20,12 @@ repositories stay the development authority; nothing is ever force-pushed, mirro
   runs    [--rev R]                 the project's run records not yet judged: the criterion, the files each run changed
                                     outside its folder, the sizes of request.md and report.md, private ids in them
   status                            the journal: source/public pairs, staged and pending work
+  facts   [--rev R] [--runs]        read only: per repository what is public (journal), selected, widening, local (with
+                                    a known public commit that held it), staged; holds; a catalog's rules' public form
+  hold    add --path P --request R [--repo ID] --by A [--note N] | withdraw --request R | list
+                                    the owner's request to keep P local from now on (improve_publish p3): until a
+                                    revision whose contract no longer selects P is published, stage, resolve and push
+                                    refuse a candidate that selects it (code hold); kept in .agdev/publication/holds.json
   convert-journal                   convert a forge.publication.v1 journal to this schema (keeps a copy)
 
 Layout (workspace = the folder holding the project's `source/` checkout):
@@ -64,7 +70,7 @@ Scope (improve_publish p2): each publication records its selections and the answ
 selection no answered one covers (new, or wider: an exclude removed, a file outside every answered tree, a run's
 file added) is a scope change: `build` prints it, `stage` refuses it (code scope) without --scope-answer
 <project>/<workflow>/<run>#<question>. New files under an answered [[tree]] and narrowing are not scope changes.
-A missing `because` is listed as not grounded and stops a stage with a scope change.
+A missing or malformed `because` refuses build and stage (code contract).
 
 Ownership: `stage --owner O` records who a staging belongs to (a workflow run); `push`, `resolve` and `abort`
 then need the same `--owner`, `push --operation <stage id>` refuses when the assessed staging was replaced, and
@@ -72,7 +78,7 @@ staging over another owner's unfinished staging needs `--take-over <reason>` (re
 
 Standard library only; Python >= 3.11. Exit status 1 with `agdev-external-publish [<code>]: <reason>` on any
 refusal; codes: conflict, stale-public-head, unavailable-source, child-not-public, graph, contract, check-failed,
-checkout-state, owner, busy, infrastructure, usage, rule, scope.
+checkout-state, owner, busy, infrastructure, usage, rule, scope, hold.
 
 Rules (agdev docs/mycatalog.md, Rules): a catalog's rules.yaml refuses a candidate that holds a braindump kept
 private by a tag rule, or a public projects.yaml whose because names one; and on an installation with a catalog,
@@ -107,13 +113,14 @@ from urllib.parse import urlsplit
 
 SCHEMAS = {"agdev.publication.v1", "forge.publication.v1"}
 JOURNAL_SCHEMA = "agdev.publication.v1.journal"
+HOLDS_SCHEMA = "agdev.publication.v1.holds"
 DEFAULT_CONTRACT = "publication/github.toml"
 OVERLAY = "publication/overlay"
 
 
 class Refusal(SystemExit):
     """A stop with a category (`code`) a workflow can act on: conflict, stale-public-head, unavailable-source,
-    child-not-public, graph, contract, check-failed, checkout-state, owner, busy, infrastructure, usage, rule, scope."""
+    child-not-public, graph, contract, check-failed, checkout-state, owner, busy, infrastructure, usage, rule, scope, hold."""
     code = "refused"
 
     @classmethod
@@ -216,14 +223,37 @@ class Ctx:
         tmp.replace(self.journal_path)
 
     @contextmanager
-    def lock(self):
+    def lock(self, wait: float = 0):
+        """The workspace's publication lock; `wait` seconds to wait for a running operation (a hold waits: a push is short)."""
+        import time
         self.state.mkdir(parents=True, exist_ok=True)
         with open(self.state / ".lock", "w") as handle:
-            try:
-                fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            except BlockingIOError:
-                raise Refusal.coded("busy", f"another publication operation holds {self.state / '.lock'}")
+            until = time.monotonic() + wait
+            while True:
+                try:
+                    fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    break
+                except BlockingIOError:
+                    if time.monotonic() >= until:
+                        raise Refusal.coded("busy", f"another publication operation holds {self.state / '.lock'}")
+                    time.sleep(0.5)
             yield
+
+    @property
+    def holds_path(self) -> Path:
+        return self.state / "holds.json"
+
+    def read_holds(self) -> list[dict]:
+        if not self.holds_path.is_file():
+            return []
+        data = json.loads(self.holds_path.read_text(encoding="utf-8"))
+        return list(data.get("holds", []))
+
+    def write_holds(self, holds: list[dict]) -> None:
+        self.state.mkdir(parents=True, exist_ok=True)
+        tmp = self.holds_path.with_name(self.holds_path.name + ".tmp")
+        tmp.write_text(json.dumps({"schema": HOLDS_SCHEMA, "holds": holds}, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+        tmp.replace(self.holds_path)
 
 
 # ---------------------------------------------------------------- graph
@@ -550,9 +580,9 @@ CONTENTS = ("runs", "workflows", "episodes")
 RUN_FILES = ["request.md", "report.md"]
 RUN_NEVER = ("run.json", "original-input.md")
 RUN_NEVER_DIRS = ("context", "definition")
-# improve_publish p2 decision 12: a missing `because` stops only a widening stage until every contract has its
-# grounds (step 6); then it is a contract refusal everywhere.
-GROUNDS_REQUIRED = False
+# improve_publish p2 decision 12: since every contract has its grounds (step 6), a missing `because` is a contract
+# refusal for build and stage.
+GROUNDS_REQUIRED = True
 
 
 def under(path: str, base: str) -> bool:
@@ -1307,6 +1337,13 @@ def stage_repo(ctx: Ctx, root: Node, node: Node, journal: dict, results: dict, m
                       for g in previous.get("gitlinks", [])}
         _, old_tree = candidate_tree(ctx, node.repo, previous["source_rev"], node.contract_path, checkout, prev_links,
                                      False, extra_secrets)
+        if old_tree == tree:  # the previous candidate, rebuilt by this tool, is this one: no change to apply
+            pair = {"source_rev": node.rev, "candidate_tree": tree, "public_commit": previous["public_commit"],
+                    "gitlinks": gl_record, "status": "published", "reused_from": previous["source_rev"],
+                    "published_at": now(), "notes": "the previous candidate rebuilt today equals this one: nothing to publish",
+                    **({"scope": record} if record is not None else {})}
+            state["publications"] = [p for p in state["publications"] if p.get("status") != "staged"] + [pair]
+            return {"public_commit": previous["public_commit"], "action": "unchanged candidate; pair recorded"}
         old = git(checkout, "commit-tree", old_tree, "-m", "previous candidate", env=identity_env).decode().strip()
         new = git(checkout, "commit-tree", tree, "-p", old, "-m", body, env=identity_env).decode().strip()
         entry.update(public_base=remote, public_changes_since_base=changes or None,
@@ -1373,6 +1410,10 @@ def cmd_stage(ctx: Ctx, rev: str, message: str, extra_secrets: list[str], owner:
             raise Refusal.coded("scope", "this candidate widens what is public; it needs one answer on exactly this list "
                                 "(ask once, then stage --scope-answer <run>#<question>):\n" + "\n".join(
                                     f"{nid}:\n" + "\n".join("  " + l for l in change_lines(sc)) for nid, sc in changed.items()))
+        holds = ctx.read_holds()
+        for node in order:  # improve_publish p3: what the owner asked to keep local is not staged while its change is pending
+            hold_refusal(held_selection(holds, node.id, selected_source_paths(node.repo, node.rev, node.contract)),
+                         node.id, node.rev, "this candidate")
         op = {"id": now(), "command": "stage", "root": root.id, "root_rev": root.rev,
               "order": [n.id for n in order], "status": "staging", "notes": [], "repositories": {}}
         if owner:
@@ -1395,6 +1436,11 @@ def cmd_stage(ctx: Ctx, rev: str, message: str, extra_secrets: list[str], owner:
             ctx.write_journal(journal)
         op["status"] = "staged" if any(r["action"] == "staged" for r in results.values()) else "nothing to push"
         ctx.write_journal(journal)
+        settled = False
+        for node in order:
+            settled |= settle_holds(ctx, holds, node.id, node.rev, released=results[node.id]["action"] != "staged")
+        if settled:
+            ctx.write_holds(holds)
         return op
 
 
@@ -1423,8 +1469,10 @@ def cmd_resolve(ctx: Ctx, repo_id: str, note: str, extra_secrets: list[str], own
         base = entry["conflict"]["base"]
         if not git_ok(checkout, "merge-base", "--is-ancestor", base, head):
             raise Refusal.coded("conflict", f"{checkout} HEAD {head[:12]} does not descend from the public base {base[:12]}")
-        contract = load_contract(source_repo_for(ctx, journal, repo_id), entry["source_rev"],
-                                 state.get("contract", DEFAULT_CONTRACT))
+        source_repo = source_repo_for(ctx, journal, repo_id)
+        contract = load_contract(source_repo, entry["source_rev"], state.get("contract", DEFAULT_CONTRACT))
+        hold_refusal(held_selection(ctx.read_holds(), repo_id, selected_source_paths(source_repo, entry["source_rev"], contract)),
+                     repo_id, entry["source_rev"], "the conflicted candidate")
         with tempfile.TemporaryDirectory() as tmp:
             out = Path(tmp) / "resolved"
             out.mkdir()
@@ -1529,6 +1577,7 @@ def cmd_push(ctx: Ctx, stop_before: str | None, owner: str | None = None, operat
         check_owner(journal, owner, "push", take_over)
         if op["status"] in ("conflict", "aborted"):
             raise Refusal.coded("conflict", f"the last staging is {op['status']}: resolve, or stage again")
+        holds = ctx.read_holds()
         done = {}
         for repo_id in op["order"]:
             state = journal["repositories"][repo_id]
@@ -1541,11 +1590,299 @@ def cmd_push(ctx: Ctx, stop_before: str | None, owner: str | None = None, operat
                 op["pushed"] = done
                 ctx.write_journal(journal)
                 return op
+            staged = entries(state, "staged")[-1]
+            repo = source_repo_for(ctx, journal, repo_id)
+            contract = load_contract(repo, staged["source_rev"], state.get("contract", DEFAULT_CONTRACT))
+            hold_refusal(held_selection(holds, repo_id, selected_source_paths(repo, staged["source_rev"], contract)),
+                         repo_id, staged["source_rev"], f"the staged candidate ({op['id']})")
             done[repo_id] = push_repo(ctx, journal, repo_id)
             ctx.write_journal(journal)
+            if settle_holds(ctx, holds, repo_id, staged["source_rev"], released=True):
+                ctx.write_holds(holds)
         op.update(status="published", pushed=done, completed_at=now())
         ctx.write_journal(journal)
         return op
+
+
+# ---------------------------------------------------------------- holds (improve_publish p3)
+#
+# A hold is coordination, not policy: the owner asked (from the Catalog page) to keep a source path local from now on,
+# and the owning agent's contract change (a [[local]]) is not integrated yet. While a hold is `held` or `integrated`,
+# no candidate that still selects the path is staged, resolved or pushed (code hold). It becomes `integrated` when a
+# stage reads a revision that no longer selects it, and `released` when a publication from such a revision is
+# complete (pushed, or nothing to push). Only the hold is released; the [[local]] stays in the contract.
+
+ACTIVE_HOLDS = ("held", "integrated")
+
+
+def selected_source_paths(repo: Path, rev: str, contract: dict) -> list[str]:
+    """Every source path the contract selects at rev (trees minus excludes and [[local]], files, runs, submodules)."""
+    listing = [r.split("\t", 1)[1] for r in filter(None, git(repo, "ls-tree", "-r", "-z", "--full-tree", rev).decode().split("\0"))]
+    locals_ = local_paths(contract)
+    out: list[str] = []
+    for item in scope_items(repo, rev, contract):
+        out += [x for x in item_paths(item, listing, locals_) if not x.startswith("workspace:")]
+    return out
+
+
+def held_selection(holds: list[dict], repo_id: str, paths: list[str]) -> list[tuple[dict, list[str]]]:
+    found = []
+    for h in holds:
+        if h.get("state") in ACTIVE_HOLDS and h.get("repository") == repo_id:
+            hit = [p for p in paths if under(p, h["path"]) or under(h["path"], p)]
+            if hit:
+                found.append((h, hit))
+    return found
+
+
+def hold_refusal(found: list[tuple[dict, list[str]]], repo_id: str, rev: str, what: str) -> None:
+    if found:
+        raise Refusal.coded("hold", f"{repo_id}@{rev[:12]}: {what} selects what the owner asked to keep local and whose "
+                            "contract change is not integrated: " + "; ".join(
+                                f"{h['path']} (request {h['request']} by {h.get('by')}, {h.get('at')}; selects "
+                                f"{', '.join(paths[:5])}{' …' if len(paths) > 5 else ''})" for h, paths in found)
+                            + ". Stage again from a revision whose contract keeps it local ([[local]])")
+
+
+def public_holds(repo: Path, journal_state: dict | None, contract_path: str, path: str) -> dict | None:
+    """The newest journaled publication of a repository whose selection held a source path, with whether it is the
+    public head's (the last publication). None when no journaled publication held it."""
+    published = entries(journal_state, "published") if journal_state else []
+    for i, entry in enumerate(reversed(published)):
+        scope = entry.get("scope")
+        try:
+            if scope is None:
+                old = load_contract(repo, entry["source_rev"], contract_path)
+                scope = scope_items(repo, entry["source_rev"], old)
+            listing = [r.split("\t", 1)[1] for r in filter(None, git(repo, "ls-tree", "-r", "-z", "--full-tree", entry["source_rev"]).decode().split("\0"))]
+        except (Refusal, subprocess.CalledProcessError):
+            continue
+        locals_ = []
+        hit = False
+        for item in scope:
+            if item["kind"] == "run":
+                hit = any(under(f"{RUNS_DIR}/{item['id']}/{n}", path) for n in item.get("files", RUN_FILES))
+            elif item["kind"] == "submodule":
+                hit = under(item["path"], path) or under(path, item["path"])
+            else:
+                hit = any(under(x, path) for x in item_paths(item, listing, locals_))
+            if hit:
+                break
+        if hit:
+            return {"public_commit": entry["public_commit"], "source_rev": entry["source_rev"],
+                    "published_at": entry.get("published_at"), "head": i == 0}
+    return None
+
+
+def cmd_hold(ctx: Ctx, action: str, repo_id: str | None, path: str | None, request: str | None, by: str | None,
+             note: str | None) -> dict:
+    """hold add | withdraw | list. add: the owner's request to keep `path` local from now on, recorded under the lock
+    (waiting up to 60 s for a running operation), with what it now blocks and whether the public head holds it."""
+    if action == "list":
+        return {"holds": ctx.read_holds()}
+    if not request:
+        raise Refusal.coded("usage", "hold needs --request <id> (the page's request)")
+    with ctx.lock(wait=60):
+        holds = ctx.read_holds()
+        journal = ctx.read_journal()
+        if action == "withdraw":
+            mine = [h for h in holds if h.get("request") == request and h.get("state") in ACTIVE_HOLDS]
+            if not mine:
+                raise Refusal.coded("usage", f"no active hold of request {request}")
+            for h in mine:
+                h.update(state="withdrawn", withdrawn={"by": by, "at": now(), "why": note or ""})
+            ctx.write_holds(holds)
+            return {"holds": mine}
+        if action != "add" or not path:
+            raise Refusal.coded("usage", "hold add --repo ID --path P --request R --by A [--note N]")
+        path = path.strip("/")
+        if not path or path.startswith(".") or ".." in path.split("/"):
+            raise Refusal.coded("usage", f"--path {path!r}: a source path of the repository")
+        root = discover(ctx, "HEAD")
+        nodes = {n.id: n for n in postorder(root)}
+        repo_id = repo_id or root.id
+        if repo_id not in nodes:
+            raise Refusal.coded("usage", f"{repo_id} is not a repository of this graph ({', '.join(nodes)})")
+        node = nodes[repo_id]
+        same = next((h for h in holds if h.get("repository") == repo_id and h.get("path") == path and h.get("state") in ACTIVE_HOLDS), None)
+        if same:
+            hold, duplicate = same, True
+        else:
+            hold = {"request": request, "repository": repo_id, "path": path, "by": by, "at": now(), "note": note or "",
+                    "state": "held"}
+            holds.append(hold)
+            duplicate = False
+        selected_now = [p for p in selected_source_paths(node.repo, node.rev, node.contract) if under(p, path) or under(path, p)]
+        if not selected_now and not same:
+            hold["state"], hold["integrated"] = "integrated", {"rev": node.rev, "at": now(), "note": "not selected when asked"}
+        ctx.write_holds(holds)
+        state = journal["repositories"].get(repo_id)
+        staged = entries(state, "staged")[-1] if state and entries(state, "staged") else None
+        blocked = None
+        if staged:
+            try:
+                old = load_contract(node.repo, staged["source_rev"], node.contract_path)
+                hit = [p for p in selected_source_paths(node.repo, staged["source_rev"], old) if under(p, path)]
+                if hit:
+                    blocked = {"operation": staged.get("operation"), "public_commit": staged["public_commit"], "paths": hit[:20]}
+            except Refusal:
+                pass
+        return {"hold": hold, "duplicate": duplicate, "selected_now": selected_now[:50], "selected_count": len(selected_now),
+                "staged_blocked": blocked, "public": public_holds(node.repo, state, node.contract_path, path)}
+
+
+def settle_holds(ctx: Ctx, holds: list[dict], node_id: str, rev: str, released: bool) -> bool:
+    """After a stage or push of a repository at rev (which passed the hold check): held -> integrated; integrated ->
+    released when the publication is complete. Returns whether anything changed."""
+    changed = False
+    for h in holds:
+        if h.get("repository") != node_id:
+            continue
+        if h.get("state") == "held":
+            h.update(state="integrated", integrated={"rev": rev, "at": now()})
+            changed = True
+        if released and h.get("state") == "integrated":
+            h.update(state="released", released={"rev": rev, "at": now()})
+            changed = True
+    return changed
+
+
+GROUP_CODE = (".py", ".ts", ".js", ".mjs", ".sh", ".gd", ".gdshader", ".rs", ".go", ".c", ".h", ".cpp", ".css", ".html")
+
+
+def group_of(item: dict, paths: list[str]) -> str:
+    """Display only: run records, workflows, code, other files."""
+    if item["kind"] == "run":
+        return "run records"
+    if paths and all(under(p, WORKFLOWS_DIR) for p in paths):
+        return "workflows"
+    if item["kind"] == "submodule" or item["kind"] == "tree":
+        return "code"
+    return "code" if paths and paths[0].lower().endswith(GROUP_CODE) else "other files"
+
+
+def rule_publicity(repo: Path, rev: str, contract: dict) -> list[dict]:
+    """Per rule of a catalog's rules.yaml: whether its public form exists in this candidate and why (public_rules)."""
+    raw = git(repo, "cat-file", "blob", f"{rev}:{RULES_FILE}", check=False)
+    if not raw:
+        return []
+    doc = read_yaml_rules(raw, f"{RULES_FILE} at {rev[:12]}")
+    _, selected = selected_sources(repo, rev, contract)
+    rules_selected = RULES_FILE in selected or any(f.get("from") == f"source:{RULES_FILE}" for f in contract.get("file", []))
+    out = []
+    for r in doc.get("rules") or []:
+        if not isinstance(r, dict):
+            continue
+        source = r.get("source") or {}
+        why, public = "", False
+        if not rules_selected:
+            why = f"{RULES_FILE} is not selected"
+        elif r.get("follows") == "default-licence" or r.get("share") == "never":
+            why = "share: never (kept in this installation)"
+        elif r.get("project") and not r.get("content") and r.get("follows") == "never-publish":
+            why = "it names a project kept private"
+        elif r.get("content") and r.get("project") and str(r["project"]) in private_projects():
+            why = f"it names {r['project']}, kept private"
+        elif f"{EPISODES}{source.get('braindump')}/braindump.md" not in selected:
+            why = f"its braindump {source.get('braindump')} is not selected"
+        else:
+            public, why = True, f"its braindump {source.get('braindump')} is selected"
+        out.append({"id": r.get("id"), "share": r.get("share") or "default", "public": public, "why": why})
+    return out
+
+
+def cmd_facts(ctx: Ctx, rev: str, with_runs: bool) -> dict:
+    """improve_publish p3: what is public, what is selected, what is local and what is pending, per repository of the
+    graph at rev, for the Catalog page. Reads only: no stage, no fetch, no write."""
+    journal = ctx.read_journal()
+    holds = ctx.read_holds()
+    root = discover(ctx, rev)
+    out = {"root": root.id, "source_rev": root.rev, "project": project_of(ctx), "problems": validate(ctx, root, journal),
+           "repositories": [], "holds": holds, "operation": None}
+    op = last_stage(journal)
+    if op:
+        out["operation"] = {k: op.get(k) for k in ("id", "status", "owner", "scope_answer", "scope_change", "root_rev", "completed_at")}
+    for node in postorder(root):
+        state = journal["repositories"].get(node.id)
+        published = entries(state, "published") if state else []
+        last = published[-1] if published else None
+        staged = (entries(state, "staged") or [None])[-1] if state else None
+        conflict = (entries(state, "conflict") or [None])[-1] if state else None
+        answered, basis = answered_scope(node.repo, state, node.contract_path)
+        try:
+            items, change = scope_compare(node.repo, node.rev, node.contract, answered)
+        except Refusal as refusal:
+            items, change = [], []
+            out["problems"].append(f"{node.id}: {refusal}")
+        listing = [r.split("\t", 1)[1] for r in filter(None, git(node.repo, "ls-tree", "-r", "-z", "--full-tree", node.rev).decode().split("\0"))]
+        locals_ = local_paths(node.contract)
+        widen = {key_of(c): c for c in change}
+        last_keys = {key_of(a) for a in (last.get("scope") or []) if isinstance(a, dict)} if last and last.get("scope") is not None else None
+        selections = []
+        for item in items:
+            paths = [f"{RUNS_DIR}/{item['id']}/{n}" for n in item["files"]] if item["kind"] == "run" else \
+                [item["path"]] if item["kind"] == "submodule" else item_paths(item, listing, locals_)
+            k = key_of(item)
+            if k in widen:
+                status = "widening"
+            elif last is None:
+                status = "selected, not published yet"
+            elif last_keys is not None and k not in last_keys and item["kind"] != "tree":
+                status = "selected, not published yet"
+            elif last["source_rev"] == node.rev:
+                status = "public"
+            else:
+                status = "public; source changed since"
+            edits = 0
+            if item["kind"] == "file":
+                edits = next((len(f.get("edit", [])) for f in node.contract.get("file", []) if f.get("public") == item.get("public")), 0)
+            selections.append({**{k2: v for k2, v in item.items() if k2 != "answer"}, "key": label_of(item["kind"], item),
+                               "group": group_of(item, paths), "status": status, "answer": item.get("answer"),
+                               "paths": paths[:50], "count": len(paths), "edits": edits,
+                               **({"adds": widen[k]["adds"][:50]} if k in widen else {})})
+        local = []
+        for e in node.contract.get("local", []):
+            p = str(e.get("path", "")).strip("/")
+            local.append({"path": p, "because": e.get("because"), "public": public_holds(node.repo, state, node.contract_path, p)})
+        # Selections of the last publication no longer selected (narrowed without a [[local]]).
+        dropped = []
+        if last and last.get("scope"):
+            now_keys = {key_of(i) for i in items}
+            for a in last["scope"]:
+                if key_of(a) not in now_keys:
+                    dropped.append({"key": label_of(a["kind"], a), "kind": a["kind"], "answer": a.get("answer"),
+                                    "public_commit": last["public_commit"]})
+        repo = {"id": node.id, "name": node.name, "path": node.path, "source_rev": node.rev,
+                "destination": node.contract.get("destination"), "visibility": node.contract.get("visibility"),
+                "license": node.contract.get("license"), "because": node.contract.get("because"),
+                "checkout": checkout_of(ctx, root, node, journal).relative_to(ctx.workspace).as_posix(),
+                "public": {"public_commit": last["public_commit"], "source_rev": last["source_rev"],
+                           "published_at": last.get("published_at"), "scope": last.get("scope"),
+                           "scope_recorded": last.get("scope") is not None} if last else None,
+                "publications": len(published), "answered_by": basis, "selections": selections, "local": local,
+                "dropped": dropped, "staged": {k: staged.get(k) for k in ("operation", "public_commit", "source_rev", "staged_at")} if staged else None,
+                "conflict": {"files": conflict["conflict"]["files"], "at": conflict["conflict"]["at"]} if conflict else None,
+                "excluded": node.excluded, **grounds(node.contract),
+                "holds": [h for h in holds if h.get("repository") == node.id]}
+        if is_catalog(node.repo, node.rev):
+            repo["rules"] = rule_publicity(node.repo, node.rev, node.contract)
+        out["repositories"].append(repo)
+    if with_runs:
+        try:
+            out["runs"] = cmd_runs(ctx, rev)
+        except Refusal as refusal:
+            out["runs"] = {"problem": str(refusal)}
+    return out
+
+
+def scope_proposal(report_repos: list[dict]) -> dict:
+    """The build's scope change as one proposal with stable item keys and a version (a digest of the candidate trees
+    and the items): what the page offers for one answer with item-level exclusions."""
+    items = [{"key": f"{r['id']} {label_of(c['kind'], c)}", "repository": r["id"], "selection": label_of(c["kind"], c),
+              "group": c["group"], "adds": c["adds"], "because": c.get("because")} for r in report_repos for c in r["scope_change"]]
+    repos = [{"id": r["id"], "candidate_tree": r["candidate_tree"], "source_rev": r["source_rev"]} for r in report_repos]
+    version = hashlib.sha256(json.dumps({"repositories": repos, "items": items}, sort_keys=True).encode()).hexdigest()[:16]
+    return {"schema": "agdev.publication.v1.scope-proposal", "version": version, "repositories": repos, "items": items}
 
 
 # ---------------------------------------------------------------- plan / build / status / convert
@@ -1599,6 +1936,9 @@ def cmd_build(ctx: Ctx, rev: str, out: Path, extra_secrets: list[str]) -> dict:
                                        "grounds_stale": scope["grounds_stale"], "local": scope["local"]})
         if GROUNDS_REQUIRED and scope["not_grounded"]:
             raise Refusal.coded("contract", f"{node.id} is not grounded: " + "; ".join(scope["not_grounded"]))
+        held = held_selection(ctx.read_holds(), node.id, selected_source_paths(node.repo, node.rev, node.contract))
+        report["repositories"][-1]["holds"] = [{"path": h["path"], "request": h["request"], "selects": p[:10]} for h, p in held]
+    report["scope_proposal"] = scope_proposal(report["repositories"])
     return report
 
 
@@ -1750,6 +2090,16 @@ def main() -> None:
                              help="the answered question that covers this candidate's scope change, e.g. publisher/publish/run-031#q1")
     rr = commands.add_parser("runs")
     rr.add_argument("--rev", default="HEAD")
+    ff = commands.add_parser("facts")
+    ff.add_argument("--rev", default="HEAD")
+    ff.add_argument("--runs", action="store_true", help="include the runs listing (slower on projects with many runs)")
+    hh = commands.add_parser("hold")
+    hh.add_argument("action", choices=["add", "withdraw", "list"])
+    hh.add_argument("--repo")
+    hh.add_argument("--path")
+    hh.add_argument("--request")
+    hh.add_argument("--by")
+    hh.add_argument("--note")
     r = commands.add_parser("resolve")
     r.add_argument("--repo", required=True)
     r.add_argument("--note", required=True)
@@ -1775,6 +2125,10 @@ def main() -> None:
             result = cmd_stage(ctx, args.rev, args.message, args.secrets, args.owner, args.take_over, args.scope_answer)
         elif args.command == "runs":
             result = cmd_runs(ctx, args.rev)
+        elif args.command == "facts":
+            result = cmd_facts(ctx, args.rev, args.runs)
+        elif args.command == "hold":
+            result = cmd_hold(ctx, args.action, args.repo, args.path, args.request, args.by, args.note)
         elif args.command == "resolve":
             result = cmd_resolve(ctx, args.repo, args.note, args.secrets, args.owner, args.take_over)
         elif args.command == "abort":

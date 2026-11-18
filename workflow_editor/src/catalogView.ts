@@ -24,6 +24,7 @@ import { api, type CatalogBraindump, type CatalogTagProposal, type CatalogView }
 import { EXAMPLE_TAGS, normalizeTag, RECOMMENDED_TAG, sameTag } from '../shared/catalog.ts'
 import { composePanel } from './catalogCompose.ts'
 import { draftsPanel } from './catalogDrafts.ts'
+import { publicationPanel } from './catalogPublication.ts'
 import { displayToggle, isSimple, onDisplay, showDetail } from './displayMode.ts'
 import { h, when } from './dom.ts'
 import { icon } from './icons.ts'
@@ -329,6 +330,8 @@ export function renderCatalogView(root: HTMLElement): ViewHandle {
 
   // user_catalog p6 ex1: drafts, written without a path and saved outside Git; the card keeps its own DOM.
   const drafts = draftsPanel({ author: () => author.value.trim(), haveAuthor, authorSlot, registered: () => load(true) })
+  // improve_publish p3: what is public and why, per project, and the owner's requests; the elements keep their own DOM.
+  const pub = publicationPanel({ author: () => author.value.trim(), haveAuthor, authorSlot, changed: () => load(true) })
   // user_catalog p6 ex2: the writing field, always there; the card keeps its own DOM.
   const compose = composePanel({ author: () => author.value.trim(), haveAuthor, authorSlot, changed: () => load(true), tagChoices: () => data?.configured ? tagChoicesOf(data) : [] })
   const editInField = async (b: Bd) => { const fb = await need(b.id); if (!fb) { render(); return } await compose.edit({ id: b.id, title: b.title === b.id ? lastSegment(b.id) : b.title, text: fb.text ?? '', base: b.updated?.commit }) }
@@ -365,6 +368,7 @@ export function renderCatalogView(root: HTMLElement): ViewHandle {
     // What is open is read again; the rest is read when opened.
     if (refresh) { const ids = [...full.keys()]; full.clear(); await Promise.all(ids.map(id => api.catalogBraindump(id).then(b => { full.set(id, b) }, () => { open.delete(id) }))) }
     if (data?.configured) await Promise.all([drafts.load(), compose.load()])
+    if (data?.configured) pub.setQuestions(data.waiting.items.flatMap(i => i.question ? [i.question] : []))
     if (!disposed) render()
   }
   async function need(id: string): Promise<CatalogBraindump | null> {
@@ -494,7 +498,10 @@ export function renderCatalogView(root: HTMLElement): ViewHandle {
           h('button.small.primary', { title: 'Adopt it as your rule: one commit of rules.yaml in your name', onclick: () => void change('waiting', () => api.catalogDisclosureAnswer(i.n!, true, author.value.trim())) }, 'OK'),
           h('button.small', { title: 'Nothing follows from this sentence', onclick: () => void change('waiting', () => api.catalogDisclosureAnswer(i.n!, false, author.value.trim())) }, 'No')]
         : i.kind === 'publication' ? [publisherButton(undefined, 'waiting')]
+        : i.kind === 'publisher' && i.question ? []
         : i.href ? [h('a.button.small', { href: i.href }, 'Open the run')] : []
+      // improve_publish p3: the publisher's question, answered here in one batch (the same question as on its run).
+      if (i.kind === 'publisher' && i.question) return h('div.catalog-waiting-line.publisher.pub-asks', words, pub.answer(i.question))
       return h(`div.catalog-tag-line.catalog-waiting-line.${i.kind}`, words, ...buttons)
     }
     return h('section.card.catalog-waiting', { dataset: { section: 'waiting' } },
@@ -530,6 +537,11 @@ export function renderCatalogView(root: HTMLElement): ViewHandle {
       c?.undecided.length ? [h('h3.small', 'Not decided'), h('p.small', 'No rule covers these braindumps: they stay internal until you tag them. ', c.undecided.map(title).join(', '))] : null,
       c?.projectMentions.some(m => m.allowed === undefined) ? h('p.small', `Files of the public list that name a private project; the publication tool refuses them until the text is generalized or the contract records why the name is needed: ${[...new Set(c.projectMentions.filter(m => m.allowed === undefined).map(m => `${m.path} (${m.project})`))].join(', ')}.`) : null,
       c?.projectMentions.some(m => m.allowed !== undefined) ? h('p.small.muted.d-only', `A private project's name kept where the public text needs it: ${[...new Set(c.projectMentions.filter(m => m.allowed !== undefined).map(m => `${m.path} (${m.project}: ${m.allowed})`))].join(', ')}.`) : null,
+      // improve_publish p3: per project, what is public, why, what is kept local and what waits; requests from a line.
+      h('h3.small', 'Per project: what is public, and why'),
+      h('div.pub-projects', v.publication?.destination ? pub.project('mycatalog', 'The catalog (mycatalog)') : null,
+        [...pubP, ...toPublish].filter(l => l.workspace).map(l => pub.project(l.project))),
+      h('p.small.muted.d-only', 'Read from each project\'s publication contract, journal and holds by the publication tool (wfe catalog publication facts <project>). Changing it is a request: Keep local takes effect at once and the project\'s agent records it; Propose asks the publisher, which asks you once on the exact change. History already public is never rewritten.'),
       d?.licence?.rule ? h('p.small.muted', `Default licence of a first publication: ${d.licence.rule.licence}, from “${d.licence.rule.source.braindump}”: “${d.licence.rule.source.sentence}”. Your own preference: never shared as style.`) : null,
       authorSlot('public'), askedAt('public'))
   }
@@ -973,7 +985,7 @@ export function renderCatalogView(root: HTMLElement): ViewHandle {
 
   render()
   void load()
-  return { dispose: () => { disposed = true; offDisplay(); drafts.dispose(); compose.dispose(); if (pendingPoll) clearInterval(pendingPoll); if (fuPoll) clearInterval(fuPoll) }, isDirty: () => editing !== null || (requesting !== null && !!reqText.value.trim()) || drafts.isDirty() || compose.isDirty() }
+  return { dispose: () => { disposed = true; offDisplay(); drafts.dispose(); compose.dispose(); if (pendingPoll) clearInterval(pendingPoll); if (fuPoll) clearInterval(fuPoll) }, isDirty: () => editing !== null || (requesting !== null && !!reqText.value.trim()) || drafts.isDirty() || compose.isDirty() || pub.isDirty() }
 }
 
 // The project page's section (#/ws/<workspace>): why this project exists.

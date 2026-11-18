@@ -387,7 +387,7 @@ export function disclosureLines(d: Disclosure): string[] {
 export interface RunLine { id: string; kinds: Record<string, number>; development: string[]; outside: string[]; texts: string[]; 'request.md': { bytes: number; private: string[]; forbidden: string[] } | null; 'report.md': RunLine['request.md'] }
 export interface RunsListing { project: string; source_rev: string; criterion: { rule?: string; proposal?: string; follows: string; braindump: string; sentence: string; project?: string | null } | null; judged: string; selected: { id: string; files: string[]; because?: string }[]; local: string[]; unchanged_since_judged: number; runs: RunLine[] }
 // The installed publication tool (<root>/config/install, beside the area), else the copy in this release.
-async function publishTool(area: string): Promise<string> {
+export async function publishTool(area: string): Promise<string> {
   for (const p of [resolve(area, '..', '..', 'config', 'install', 'agdev-external-publish'), fileURLToPath(new URL('../../install/agdev-external-publish', import.meta.url))]) {
     try { await access(p); return p } catch { /* next */ }
   }

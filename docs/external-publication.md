@@ -110,7 +110,8 @@ installation's catalog), `answer:<project>/<workflow>/<run>` (the owner's or Omn
 in that run), `answer:before-improve_publish` (decided before grounds were recorded), `project`
 (part of what the project is public for: code, documents, the workflows a reader can request) or
 `owner:<name>` (the owner's own act, as the catalog's *Add to the public list*). Overlay entries
-need none. `plan` and `build` list a missing or malformed one as `not_grounded`; a `rule:<id>` that
+need none. A missing or malformed one refuses `build` and `stage` (code `contract`; `plan` lists it
+as `not_grounded`); a `rule:<id>` that
 is no longer in the catalog is listed as `grounds_stale` and stops nothing (retiring a rule does
 not withdraw what is public).
 
@@ -174,6 +175,8 @@ resolved against the parent's internal remote; its own contract is read at that 
 | `stage [--rev R] --message M [--scope-answer RUN#Q]` | refused (code `scope`) when the candidate widens what is public and no answer is named; then, per repository, dependencies first: a first publication is a root commit; an update rebuilds the last published candidate, and applies the change from it to the new candidate onto the public head (fetched first). Refuses a checkout whose head is neither the remote nor the staged candidate |
 | `resolve --repo ID --note …` / `abort --repo ID` | after a conflict: accept the resolved checkout (re-searched as the actual candidate) or drop it |
 | `push [--stop-before ID]` | dependencies first; each push only after every gitlink's child commit is on its public branch; the remote is read before (already there → recorded as published, nothing pushed) and after (decides the outcome) |
+| `facts [--rev R] [--runs]` | read only: per repository what is public (the journal's last publication and its scope), every selection with its state (public, selected and not published yet, widening), each `[[local]]` with a known public commit that held it, the staged and conflicted work, the holds, and for a catalog each rule's public form; `--runs` adds `runs` |
+| `hold add --path P --request R [--repo ID] --by A [--note N]` / `withdraw --request R` / `list` | the owner's request to keep `P` local from now on (below, *Seeing and changing it from the Catalog page*) |
 | `status` | the journal |
 | `convert-journal` | P2 forge journal → this schema, keeping `github.forge-v1.json` |
 
@@ -202,12 +205,11 @@ New files under an answered `[[tree]]` are not a scope change (read the delta, a
 narrowing (an entry removed, a `[[local]]` added) never is. A first publication is a scope change as
 a whole; a contract whose `because` is an adopted `project … publish` rule has the repository
 answered by it, not its run records. A journal from before this records nothing: its last published
-contract counts as answered (`answer:before-improve_publish`). While contracts get their grounds, a
-missing `because` stops only a stage with a scope change.
+contract counts as answered (`answer:before-improve_publish`).
 
 **Stop codes.** Every refusal prints `agdev-external-publish [<code>]: <reason>` and exits 1:
 `conflict`, `stale-public-head`, `unavailable-source`, `child-not-public`, `graph`, `contract`,
-`check-failed`, `checkout-state`, `owner`, `busy`, `infrastructure`, `usage`, `rule`, `scope`. A workflow maps them to
+`check-failed`, `checkout-state`, `owner`, `busy`, `infrastructure`, `usage`, `rule`, `scope`, `hold`. A workflow maps them to
 its next action; the code is a category, the reason says what to look at.
 
 ## Procedures
@@ -305,6 +307,85 @@ public and why the others are not.
 from the folder `wfe catalog publication status` names; its owning agent is the summoner (workflow
 `catalog-publication-edit`), which writes the catalog through `wfe catalog`. Omni or a person no
 longer publishes the catalog by hand.
+
+## Seeing and changing it from the Catalog page (improve_publish p3)
+
+The Catalog page's **Public** section has one row per published (or to be published) project and the
+catalog itself. Opening a row reads the project with `facts` once (the service caches it until the source,
+the journal, the holds or the catalog change; *Fetch and read again* in Detail fetches the source first). It
+reads the source's integrated `main` as last fetched, not the workspace checkout. CLI: `wfe catalog publication
+facts <project> [--runs]`; API: `GET api/catalog/publication/facts/<project>[?runs=1]`.
+
+**What it shows, kept apart.** Per repository and grouped as run records, workflows, code and other files
+(a grouping for reading, not a rule):
+
+- **Public**: selected by the last journaled publication, under the answer named. Only the journal makes
+  something public; a selection alone is never shown as public.
+- **Selected, not published yet**, and **Selected, needs your answer** (a scope change: the publisher asks once).
+- **Kept local**: a `[[local]]`, with whose decision. **Previously public; remains in history** (or *still in the
+  public head*, until the next publication) names a journaled public commit that held it. The search covers the
+  journal only: a path published before the journal existed is not found, and the commit shown is a known one,
+  not claimed to be the last.
+- Run records **not yet judged**, and those **judged before and unchanged**: the latter have no individual reason,
+  only the publisher's judgment in its run, and the page says so.
+- In Detail: the revision read, staged and conflicted work, `not_grounded`, the holds, and for the catalog each
+  rule's public form and its `share` (*Rules and their public form*).
+
+An unreadable state (a tool refusal, a missing workspace) is shown as *unavailable* with the reason and the
+revision tried; reading never stages, fetches without being asked, edits or publishes.
+
+**One chain of grounds, shown in place.** *Why* beside an item walks principle 3 backwards. For gimmickimg's
+run record `partial-animation/run-001`:
+
+1. the owner's sentence, in one of the owner's internal braindumps (quoted on the page, which is internal; it
+   is not published by this: the braindump is not in the catalog's public list);
+2. the rule adopted from it, `runs-suggest-publish`, by the owner (`rules.yaml`);
+3. the contract's selection, `[[run]] id = "partial-animation/run-001"` with `because = "rule:runs-suggest-publish"`
+   (`publication/github.toml` of `pj-gimmickimg`);
+4. the answer it was published under, `publisher/publish/run-041#q1` (the journal's `scope` and the operation's
+   `scope_answer`);
+5. the public commit `ddd1d69` of `github.com/iwaag/pj-gimmickimg`.
+
+A `project` ground shows the project's own (here the adopted `project-gimmickimg-publish`); a selection decided
+before grounds were recorded is labelled *legacy* rather than given a reason it never had.
+
+**Keep local from now on (narrowing).** Beside a selected item, or any path: the page shows what it covers and,
+for a public item, that history keeps it. Sending it:
+
+1. The tool records a **hold** under its lock (`.agdev/publication/holds.json`): from then on `stage` refuses a
+   revision that still selects the path, and `push` and `resolve` refuse a candidate staged from such a revision —
+   an older candidate cannot slip through (code `hold`). Only then is the request reported accepted. A hold is
+   coordination, not a fourth policy store: it names the request and ends.
+2. The owning agent's `publication-edit` (the summoner's `catalog-publication-edit` for the catalog) is asked to
+   write `[[local]] path = "…"`, `because = "owner:<name> (Catalog page request <id>)"`, and to remove a `[[run]]`
+   or `[[file]]` at or under it. The page writes no contract.
+3. The row shows the request's state: *blocked; contract update pending* → *exclusion integrated* → *removal from
+   public head pending* (the next publication carries the removal) → *removal published*, or *kept local* for a path
+   never public. A stage from a revision that no longer selects the path makes the hold `integrated`; the publication
+   from it (or *nothing to push*) `released`. Only the hold is released; the `[[local]]` stays.
+4. If the contract change fails, the state is *failed; protection retained*: the hold keeps refusing. Ask again
+   (the same request and run while it is open), or **Withdraw** it in Detail with the reason; withdrawing ends the
+   hold, a `[[local]]` already written stays.
+
+A push that had already started when the request arrived is not undone: the answer says that the path was public
+at that commit, and the next publication removes it from the head. The public history is never rewritten.
+
+**Propose publication (widening).** Beside a kept-local item, on ticked unjudged run records, or in words
+(*Propose something else*): the page asks the publisher (`publish`, with the items and the words). Proposing
+approves nothing: the publisher judges the items against the owner's rules, prepares and assesses the candidate,
+and, if it widens the scope, attaches the build's `scope_proposal` (`scope-proposal.json`: the items with stable
+keys and a version over the candidate trees) and asks once.
+
+**Answering, with exceptions.** The question appears under **Waiting for you** (and the project's row points to
+it) as one proposal: every item ticked; untick what should stay local; **Approve all** or **Approve N, keep M
+local**; optional words. The answer is one `question.answer` on the publisher's run in your name, with a block
+`agdev-scope-answer` (`version`, `approve`, `decline`); the publisher writes each declined item as a `[[local]]`
+(`because = "answer:<run>"`) and stages with `--scope-answer <run>#<question>`. A proposal that changed since the
+page read it is refused (*stale*), nothing is answered, and the ticks and words stay; the same answer sent twice
+is recorded once. A question without a proposal is answered in words.
+
+**Resuming.** Requests are listed with their runs under the project (*Your requests*) after a reload or on another
+device; a failed send keeps what was typed on the page.
 
 ## What is public, and where
 

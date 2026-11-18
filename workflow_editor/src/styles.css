@@ -1646,3 +1646,32 @@ ul.catalog-tag-meanings { list-style: none; margin: 4px 0 0; padding: 0; display
 span.catalog-tag-meanings { display: block; margin-top: 2px; overflow-wrap: anywhere; }
 .catalog-compose-offer { margin: 4px 0; }
 .catalog-compose-offer .chip, .catalog-tag-examples .chip { margin: 2px 2px; }
+
+/* improve_publish p3: what is public and why, per project (src/catalogPublication.ts) */
+.pub-projects { display: grid; gap: 8px; margin: 6px 0; }
+.pub-project { border: 1px solid var(--line); border-radius: 8px; padding: 8px 10px; min-width: 0; }
+.pub-head { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; justify-content: space-between; }
+.pub-body:empty { display: none; }
+.pub-body { margin-top: 6px; min-width: 0; }
+.pub-repo { margin: 6px 0 10px; min-width: 0; }
+.pub-repo > p, .pub-body p { overflow-wrap: anywhere; }
+.pub-repo h4 { margin: 8px 0 2px; font-size: 13px; }
+.pub-group { margin: 6px 0; min-width: 0; }
+.pub-group > summary { cursor: pointer; overflow-wrap: anywhere; }
+ul.pub-items { list-style: none; margin: 4px 0; padding: 0 0 0 4px; display: grid; gap: 4px; }
+.pub-item { border-top: 1px solid var(--line); padding-top: 4px; min-width: 0; }
+.pub-line { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; min-width: 0; }
+.pub-name { flex: 1 1 14em; min-width: 0; overflow-wrap: anywhere; }
+.pub-name code, .pub-paths code, .pub-why code { overflow-wrap: anywhere; white-space: normal; }
+ol.pub-why { margin: 4px 0 4px 18px; padding: 0; font-size: 13px; display: grid; gap: 2px; }
+ol.pub-why li { overflow-wrap: anywhere; }
+ul.pub-paths { margin: 4px 0; padding-left: 18px; max-height: 14em; overflow-y: auto; }
+.pub-form { margin: 6px 0; }
+.pub-form textarea, .pub-answer textarea { width: 100%; box-sizing: border-box; }
+.pub-requests ul { margin: 4px 0; padding-left: 18px; }
+.pub-request { overflow-wrap: anywhere; }
+.pub-asks { display: block; background: #fff; border: 1px solid #ecd2b0; border-radius: 8px; padding: 8px 10px; }
+.pub-answer { margin-top: 6px; min-width: 0; }
+.pub-question p { white-space: pre-wrap; overflow-wrap: anywhere; }
+button.linkish { background: none; border: 0; color: var(--accent); padding: 2px 4px; cursor: pointer; text-decoration: underline; }
+@media (max-width: 640px) { .pub-project { padding: 6px 8px; } ul.pub-items { padding-left: 0; } }

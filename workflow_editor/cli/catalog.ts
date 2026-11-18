@@ -48,6 +48,7 @@ wfe catalog rules adopt --content runs|workflows|episodes [--project <id>] --fol
 wfe catalog disclosure [<project>]
 wfe catalog disclosure runs <project> [--source <folder>]
 wfe catalog disclosure agree|decline (<n> | licence) --author <who>
+wfe catalog publication facts <project | mycatalog> [--runs] [--refresh]
 wfe catalog rules retire <id> --author <who>
 wfe catalog rules share <id> never|default --author <who>
 wfe catalog review show <path>
@@ -630,8 +631,20 @@ export async function catalogCommand(c: CatalogCli): Promise<number> {
         const q = await c.request({ workspace: r.workspace, workflow: r.workflow, text: r.text, author: by, receipt: r.receipt })
         c.out(q.message, { ...r, request: q.data }); return 0
       }
+      // improve_publish p3: what is public, selected, local and pending per repository, with grounds (the Catalog page's reading).
+      if (a1 === 'facts') {
+        if (!a2) throw c.usage('wfe catalog publication facts <project | mycatalog> [--runs] [--refresh]')
+        const x = await (await import('../server/publicationFacts.ts')).publicationFacts(ctx, a2, { runs: c.flag('runs'), refresh: c.flag('refresh') })
+        const lines = x.unavailable ? [`${a2}: unavailable — ${x.unavailable}`] : [`${a2} at ${x.revisionRead} ${short(x.sourceRev ?? '')}${x.fetchProblem ? ` (${x.fetchProblem})` : ''}`,
+          ...x.repositories.flatMap(r => [`${r.id} → ${r.destination}: ${r.public ? `public ${short(r.public.public_commit)} from ${short(r.public.source_rev)}${r.public.scope_recorded ? '' : ' (scope not recorded)'}` : 'never published'}; ground: ${r.ground.words}`,
+            ...r.selections.map(s => `  ${s.group.padEnd(12)} ${s.key} — ${s.status}; ${s.ground.words}${s.scopeGround ? `; published under ${s.scopeGround.words}` : ''}`),
+            ...r.local.map(l => `  local        ${l.path} — ${l.ground.words}${l.public ? `; previously public, remains in history (${short(l.public.public_commit)}${l.public.head ? ', still in the public head' : ''})` : ''}`),
+            ...r.holds.map(h => `  hold         ${h.path} — ${h.state} (request ${h.request} by ${h.by})`)]),
+          ...x.requests.map(q => `request ${q.id} ${q.kind} ${q.path ?? (q.items ?? []).join(', ')}: ${q.state}${q.detail ? ` — ${q.detail}` : ''}`)]
+        c.out(lines.join('\n'), x); return 0
+      }
       if (a1 === 'add') { if (!a2) throw c.usage('wfe catalog publication add <path> --author <who>'); const x = await rr.publicationAdd(ctx, { id: a2, author: author() }); c.out(x.message, x); return 0 }
-      if (a1 !== 'status' && a1 !== undefined) throw c.usage('wfe catalog publication status | check [--source <folder>] | add <path> | put <path> | request [<project>] | use <folder>')
+      if (a1 !== 'status' && a1 !== undefined) throw c.usage('wfe catalog publication status | check [--source <folder>] | facts <project> | add <path> | put <path> | request [<project>] | use <folder>')
       const r = await m.publicationStatus(ctx, { maxAgeMs: 0 })
       if (!r.contract) { c.out('The catalog has no publication/github.toml: nothing is published.', r); return 0 }
       const list = (name: string, xs: string[]) => [`${name} (${xs.length})`, ...xs.map(x => `  ${x}`)]

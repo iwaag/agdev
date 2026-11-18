@@ -110,6 +110,9 @@ export type CatalogViewResponse = Awaited<ReturnType<typeof import('../server/ca
 export type SummonStatusResponse = Awaited<ReturnType<typeof import('../server/summon.ts').status>>
 export type SummonStyle = Awaited<ReturnType<typeof import('../server/summon.ts').styleRequest>>
 export type CatalogView = import('../server/catalog.ts').CatalogView
+export type PublicationFacts = import('../server/publicationFacts.ts').PublicationFacts
+export type PublicationRequest = import('../server/publicationFacts.ts').PublicationRequest
+export type PublisherQuestion = import('../server/publicationFacts.ts').PublisherQuestion
 export type CatalogWhy = Awaited<ReturnType<typeof import('../server/catalog.ts').why>>
 export type CatalogBraindump = Awaited<ReturnType<typeof import('../server/catalog.ts').braindump>>
 export type CatalogUpkeep = { ok: boolean; kind: string; workspace: string; workflow: string; href: string; run: string; duplicate: boolean }
@@ -163,6 +166,13 @@ export const api = {
   catalogLinksDecline: (author: string, numbers: number[]) => call<{ message: string }>('POST', 'api/catalog/links/decline', { numbers, author }),
   catalogRuleRetire: (id: string, author: string) => call<CatalogChange>('POST', 'api/catalog/rules/retire', { id, author }),
   catalogPublicationAdd: (path: string, author: string) => call<CatalogChange>('POST', 'api/catalog/publication/add', { path, author }),
+  // improve_publish p3: what is public and why, per project; the two requests; one batch answer; a rule's share.
+  publicationFacts: (project: string, o: { runs?: boolean; refresh?: boolean } = {}) => call<PublicationFacts>('GET', `api/catalog/publication/facts/${encodeURIComponent(project)}?${o.runs ? 'runs=1&' : ''}${o.refresh ? 'refresh=1' : ''}`),
+  publicationKeepLocal: (o: { project: string; repository?: string; path: string; revision?: string; note?: string; author: string }) => call<{ ok: boolean; duplicate: boolean; message: string; request: PublicationRequest }>('POST', 'api/catalog/publication/keep-local', o),
+  publicationWithdraw: (o: { project: string; id: string; reason: string; author: string }) => call<{ ok: boolean; message: string }>('POST', 'api/catalog/publication/withdraw', o),
+  publicationPropose: (o: { project: string; items: string[]; note?: string; revision?: string; author: string }) => call<{ ok: boolean; duplicate: boolean; message: string; request: PublicationRequest }>('POST', 'api/catalog/publication/propose', o),
+  publicationAnswer: (o: { workspace: string; workflow: string; run: string; question: string; version?: string; decline: string[]; text?: string; author: string }) => call<{ ok: boolean; duplicate: boolean; message: string }>('POST', 'api/catalog/publication/answer', o),
+  catalogRuleShare: (id: string, share: 'never' | 'default', author: string) => call<CatalogChange>('POST', 'api/catalog/rules/share', { id, share, author }),
   // user_catalog p8: OK / No on a statement on disclosure or the default licence; asking the publisher; what waits (the navigation's count).
   catalogDisclosureAnswer: (n: number | 'licence', agree: boolean, author: string) => call<{ message: string }>('POST', 'api/catalog/links/disclosure', { n, agree, author }),
   catalogPublicationRequest: (target: string | undefined, author: string) => call<CatalogUpkeep & { target: string }>('POST', 'api/catalog/publication/request', { target, author }),

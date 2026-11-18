@@ -870,6 +870,8 @@ export function createHandler(config: ServiceConfig) {
           const input = await body(req) as Record<string, unknown>
           if (!id && method === 'POST') return send(res, 200, await r.adoptRule(ctx, { tag: input.tag, project: input.project, licence: input.licence, follows: input.follows, source: input.source, author: str(input.author, 'author') }))
           if (id === 'retire' && method === 'POST') return send(res, 200, await r.retireRule(ctx, { id: str(input.id, 'id'), author: str(input.author, 'author') }))
+          // improve_publish p3: share never | default from the Catalog page (the same as wfe catalog rules share).
+          if (id === 'share' && method === 'POST') return send(res, 200, await r.shareRule(ctx, { id: str(input.id, 'id'), share: str(input.share, 'share'), author: str(input.author, 'author') }))
         }
         // user_catalog p8: what the owner's words make of each project; asking the publisher.
         if (wsId === 'waiting' && method === 'GET') return send(res, 200, await m.waitingCount(ctx))
@@ -882,6 +884,28 @@ export function createHandler(config: ServiceConfig) {
           return send(res, q.duplicate ? 200 : 201, { ...r, kind: 'publish', request: q, duplicate: q.duplicate, run: q.ref.run, href: `#/ws/${encodeURIComponent(r.workspace)}/run/${encodeURIComponent(q.ref.workflow)}/${encodeURIComponent(q.ref.run)}` })
         }
         if (wsId === 'publication' && id === 'check' && method === 'GET') return send(res, 200, await (await import('./catalogRules.ts')).publicationCheck(ctx, { maxAgeMs: fresh }))
+        // improve_publish p3: per project what is public and why (server/publicationFacts.ts); the two requests; one batch answer.
+        if (wsId === 'publication' && id.startsWith('facts/') && method === 'GET') return send(res, 200, await (await import('./publicationFacts.ts')).publicationFacts(ctx, id.slice(6), { refresh: fresh === 0, runs: url.searchParams.get('runs') === '1' }))
+        if (wsId === 'publication' && (id === 'keep-local' || id === 'propose' || id === 'withdraw' || id === 'answer') && method === 'POST') {
+          const pf = await import('./publicationFacts.ts')
+          const input = await body(req) as Record<string, unknown>
+          const author = str(input.author, 'author')
+          const request = (o: { workspace: string; workflow: string; text: string; author: string; receipt: string }) => needExec().requestOnce({ ...o, via: 'browser' })
+          if (id === 'keep-local') return send(res, 200, await pf.keepLocal(ctx, { project: str(input.project, 'project'), repository: text(input.repository), path: str(input.path, 'path'), revision: text(input.revision), note: text(input.note), author, request }))
+          if (id === 'withdraw') return send(res, 200, await pf.withdrawKeepLocal(ctx, { project: str(input.project, 'project'), id: str(input.id, 'id'), reason: str(input.reason, 'reason'), author }))
+          if (id === 'propose') return send(res, 200, await pf.proposePublication(ctx, { project: str(input.project, 'project'), items: Array.isArray(input.items) ? input.items.map(String) : [], note: text(input.note), revision: text(input.revision), author, request }))
+          // One question.answer in the author's name, bound to the proposal's version; then the run resumes.
+          const ws = await workspace(str(input.workspace, 'workspace'))
+          const ref = { workflow: str(input.workflow, 'workflow'), run: str(input.run, 'run') }
+          const question = str(input.question, 'question')
+          const answer = await pf.scopeAnswerText(ws, { ...ref, question, version: text(input.version), decline: Array.isArray(input.decline) ? input.decline.map(String) : [], text: text(input.text), author })
+          if (answer.duplicate) return send(res, 200, { ok: true, duplicate: true, message: `Already answered: ${ref.workflow}/${ref.run} ${question}.`, text: answer.text })
+          const receipt = `catalog-answer-${ref.run}-${question}-${text(input.version) ?? 'words'}`
+          const r = await runOp(ws, ref, { op: 'question.answer', question, text: answer.text, from: author, receipt } as unknown as OpInput, { by: author, via: 'browser' })
+          const x = config.exec
+          const job = x && hostOf(r.record.executor) === x.executor ? await x.afterAnswer(ws, ref, question) : null
+          return send(res, 200, { ok: true, duplicate: r.duplicate ?? false, message: `Answered ${ref.workflow}/${ref.run} ${question}${job ? '; the publisher resumes' : ''}.`, text: answer.text, job })
+        }
         if (wsId === 'publication' && id === 'add' && method === 'POST') {
           const input = await body(req) as Record<string, unknown>
           return send(res, 200, await (await import('./catalogRules.ts')).publicationAdd(ctx, { id: str(input.path, 'path'), author: str(input.author, 'author') }))

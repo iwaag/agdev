@@ -749,6 +749,21 @@ lists what is public now (the catalog, the projects with their repositories), wh
 list changed, braindumps tagged for the list and not in it, projects to be published), what is
 kept private and by which sentence, and what is not decided.
 
+**Per project, what is public and why (improve_publish p3).** Below those lines, each published project
+(and the catalog) is a row that opens into what is public, selected, kept local and pending, grouped as run
+records, workflows, code and other files, each item with *Why* (the owner's sentence or answer → the
+contract's selection → the publication commit) and its request: *Keep local* (at once, through a hold; the
+owning agent then writes the `[[local]]`) or *Propose publication* (the publisher asks once on the exact
+change; the answer is given as one proposal with optional exceptions under *Waiting for you*). The reading
+distinguishes public (journaled) from selected, kept local from never decided, and previously public (in
+history, with a known public commit) from public now. For the catalog, Detail lists each rule's public form —
+present, or why not (`share: never`, it names a private project, its braindump is not in the public list) —
+with **Share: never / default**, the same as `wfe catalog rules share`: sharing a rule publishes the rule, not
+the content it governs. A row is read when opened and cached until the source, journal, holds or catalog
+change; projects with hundreds of runs take a few seconds the first time. A state that cannot be read is shown
+as unavailable with its reason. The procedure and the hold: the core's docs/external-publication.md, *Seeing
+and changing it from the Catalog page*.
+
 The owner of this core publishes `iwaag/mycatalog` with `projects.yaml`,
 `mycatalog.yaml` (its `owner` becomes the public account) and a README, and
 the braindumps and challenges its file list names. Summonplans stay internal.
@@ -949,6 +964,12 @@ words, and what of that was already said to be real. `wfe catalog why
 | `wfe catalog index put --file/--text --author [--base <commit>]` | `PUT api/catalog/index {text, author, base?}` | one commit; 409 when changed after `base` |
 | `wfe catalog index request --author` | `POST api/catalog/index/request {author}` | requests the summoner's `index` |
 | `wfe catalog publication status` | `GET api/catalog/publication` | the public paths the file list selects, grouped; the last public commit |
+| `wfe catalog publication facts <project \| mycatalog> [--runs] [--refresh]` | `GET api/catalog/publication/facts/<project>[?runs=1&refresh=1]` | improve_publish p3: per repository what is public, selected, local and pending, with grounds resolved; requests and holds |
+| | `POST api/catalog/publication/keep-local {project, repository?, path, revision?, note?, author}` | a hold first, then the owning agent's `publication-edit`; `duplicate` for the same path |
+| | `POST api/catalog/publication/propose {project, items, note?, revision?, author}` | the publisher's `publish` with the items; the same proposal while open is that run |
+| | `POST api/catalog/publication/answer {workspace, workflow, run, question, version?, decline, text?, author}` | one answer bound to `scope-proposal.json`'s version; 409 `stale-proposal`, `answered` |
+| | `POST api/catalog/publication/withdraw {project, id, reason, author}` | ends a hold; a written `[[local]]` stays |
+| `wfe catalog rules share <id> never\|default` | `POST api/catalog/rules/share {id, share, author}` | one commit of `rules.yaml` |
 | `wfe catalog publication use <folder>` | | the folder the catalog is published from |
 | `wfe catalog why <project>` | `GET api/catalog/why/<project>` | entry, braindumps, other plans |
 | `wfe catalog plan show <name>` | `GET api/catalog/plans/<name>` | |

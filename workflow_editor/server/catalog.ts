@@ -379,7 +379,7 @@ export interface CatalogView {
 }
 
 // user_catalog p8 decision 17: everything that waits for the owner, at the top of the page; the count is on the navigation.
-export interface WaitingItem { kind: 'answer' | 'links' | 'disclosure' | 'licence' | 'publisher' | 'publication'; title: string; detail?: string; href?: string; ask?: { draft: string; id: string }; n?: number | 'licence' }
+export interface WaitingItem { kind: 'answer' | 'links' | 'disclosure' | 'licence' | 'publisher' | 'publication'; title: string; detail?: string; href?: string; ask?: { draft: string; id: string }; n?: number | 'licence'; question?: import('./publicationFacts.ts').PublisherQuestion }
 export interface WaitingView { count: number; items: WaitingItem[] }
 
 // The owner's challenges as the Catalog page lists them; the challenge pages
@@ -457,15 +457,10 @@ async function waitingView(ctx: CatalogContext, o: { asked: import('./catalogDra
   for (const x of s?.disclosure ?? []) if (x.state === 'suggested' && !x.content) items.push({ kind: 'disclosure', n: x.n, title: x.follows === 'never-publish' ? `${x.project}: stated private` : `${x.project}: stated public`, detail: `from ${x.braindump}: “${x.quote}”${x.follows === 'never-publish' ? ' — kept private from now on unless you answer No' : ' — nothing follows until you answer OK'}` })
   if (s?.licence?.state === 'suggested') items.push({ kind: 'licence', n: 'licence', title: `Default licence ${s.licence.licence}`, detail: `from ${s.licence.braindump}: “${s.licence.quote}”` })
   if (o.pub?.changedSince) items.push({ kind: 'publication', title: 'The public list changed since the last publication', detail: o.pub.last ? `last published from ${o.pub.last.sourceRev.slice(0, 7)} at ${o.pub.last.at.slice(0, 10)}` : 'not published yet' })
-  // A publisher run that waits on a question: its focus card is where it is answered.
+  // A publisher run that waits on a question: answered here in one batch when it attached its scope proposal
+  // (improve_publish p3), else on its run.
   try {
-    const reg = await loadRegistry(ctx.registryFile)
-    const w = reg.workspaces.find(x => x.project === 'publisher') ?? reg.workspaces.find(x => x.id === 'publisher')
-    if (w) {
-      const { listRuns } = await import('./runs.ts')
-      const { Workspace } = await import('./workspace.ts')
-      for (const r of await listRuns(new Workspace(w as never), 'publish')) if (r.waiting?.length && r.execution !== 'completed') items.push({ kind: 'publisher', title: `The publisher asks (${r.ref})`, detail: r.title ?? '', href: `#/ws/${encodeURIComponent(w.id)}/run/${encodeURIComponent(r.workflow)}/${encodeURIComponent(r.run)}` })
-    }
+    for (const q of await (await import('./publicationFacts.ts')).publisherQuestions(ctx)) items.push({ kind: 'publisher', title: `The publisher asks (${q.workflow}/${q.run} ${q.question.id})`, detail: q.title ?? '', href: q.href, question: q })
   } catch { /* the publisher's runs cannot be read: not listed */ }
   return { count: items.length, items }
 }
